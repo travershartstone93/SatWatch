@@ -1,0 +1,474 @@
+System Outline — LiveSat S3 (esp32-LiveSat-s3.ino)
+Date: 2026-03-05
+
+1) Top-Level Runtime Model
+--------------------------
+- The app is a state machine with two major phases:
+  1. Sync/prepare phase (WiFi + SD + cache update/rebuild).
+  2. Playback phase (weather animation + zoom/terrain/clock sequence).
+- Entry points:
+  - `setup()` initializes hardware, storage, config, and sync decisions.
+  - `loop()` runs playback continuously and handles periodic update/sleep triggers.
+
+
+2) Core Data Layers (what is stored and used)
+---------------------------------------------
+- Source weather JPEG cache: `/frames/fNNN.jpg`
+- Time map for frames: `/frames/times.bin`
+- Weather cache metadata: `/frames/meta.txt`
+- Frame-dimension guard: `/frames/dim.cfg`
+- Raw playback stream: `/frames/stream.raw`
+- Raw stream metadata: `/frames/raw.meta`
+- View/bbox metadata: `/frames/view.meta`
+- Zoom snapshot metadata: `/frames/zoom.meta`
+- Radar timestamp metadata: `/frames/radar.meta`
+- Cache validation metadata: `/frames/validate.meta`
+- Runtime diagnostics log: `/diag.txt`
+- Terrain/radar assets:
+  - `/frames/terrain_day.jpg`
+  - `/frames/terrain_night.jpg`
+  - `/frames/terrain_radar_z3.jpg`
+- Derived raw zoom/terrain files are built from these JPEGs for fast stage playback.
+
+
+3) Setup Phase Stages
+---------------------
+Stage A — Hardware bring-up
+- Serial, I2C, PMIC/power key setup.
+- Display init (board-specific path).
+- SD mount and mandatory asset checks.
+- PSRAM allocation for scaled frame buffers and top/bottom bar buffers.
+
+Stage B — Configuration load
+- Loads portal/user config (WiFi slots, 12/24h, update mode, start cue, sleep mode).
+- Initializes button poll task (top button handling on separate task/core path).
+- Preloads selected start cue audio into PSRAM.
+
+Stage C — Boot classification
+- Detects wake cause:
+  - hard boot,
+  - timer wake,
+  - or regular wake.
+- Loads existing SD cache count and dimension compatibility.
+- If dimension mismatch is detected, purges incompatible frame/cache artifacts.
+
+Stage D — Sync decision trigger
+- `needSync` is computed from:
+  - timer wake,
+  - empty cache,
+  - auto-update boundary due (in auto mode),
+  - hard boot logic.
+- If WiFi connect fails during sync-needed path, portal mode is started.
+
+Stage E — Sync execution path
+- Preferred path: `syncFramesRolling()` (reuse + tail updates + rolling remap).
+- Fallback path: `downloadFrames()` full refresh.
+- After weather sync, pending zoom/terrain refresh may run.
+- Raw cache validity is enforced (`raw.meta` check; rebuild if stale).
+- Start cue is armed when boot/sync produced playable frames.
+
+
+4) Sync Layering (weather, raw cache, zoom, terrain, radar)
+------------------------------------------------------------
+This section is the core of refresh behavior. The system is designed to avoid
+full redownloads whenever possible and keep playback continuous even when source
+coverage is temporarily partial.
+
+4.1 Window model used for every sync pass
+- `targetFrameCount()` defines desired window size (dynamic by active source/cadence).
+- `fetchEnd = roundToCadence(now - lagHours)`.
+- `fetchStart = fetchEnd - (targetFrameCount-1)*cadence`.
+- Existing SD cache is loaded as `(timestamp, index)` entries from `meta.txt + times.bin`.
+- Window fit checks:
+  - `cacheMatchesWindowExactly()`
+  - `cacheMatchesWindowPrefix()`
+  - `detectForwardWindowShift()`
+  - in-window count (`recentCount`).
+
+4.2 First gate: immediate full-refresh conditions
+- If weather view/bbox signature changed (`view.meta` mismatch) -> full refresh.
+- If no cached timestamps are in the new window (`recentCount == 0`) -> full refresh.
+- If rolling/tail update cannot produce a coherent result for required path -> full refresh.
+
+4.3 Fast no-download paths (cache-current paths)
+- `latest-current` branch:
+  - cache count equals target,
+  - exact timeline match,
+  - newest cached timestamp equals `fetchEnd`.
+  - If raw cache current too: skip rolling/download entirely.
+  - If raw cache stale: rebuild raw only.
+- `exact-current` branch:
+  - full exact timeline match.
+  - Same decision: keep if raw current, otherwise raw rebuild only.
+- Result: quick boot/update path with no weather JPEG network activity.
+
+4.4 Tail-fill and shift-aware rolling paths
+- Prefix window (`cacheMatchesWindowPrefix`) -> tail-fill:
+  - reuse existing prefix frames,
+  - download only missing tail frames,
+  - write updated times/meta,
+  - then fast raw remap/rebuild.
+- Forward-shift detected (`detectForwardWindowShift > 0`) -> roll-fast:
+  - logically shift existing frames left,
+  - download only newest slots entering the window.
+- Special tail-only optimization when cache already at target count:
+  - download only the shifted tail set,
+  - move existing files in-place,
+  - avoid full `n->f` staging where possible.
+
+4.5 General rolling path (timestamp-driven assembly)
+- For each target slot timestamp:
+  - if exact timestamp exists in cache and file reusable: reuse.
+  - else download that slot.
+- Uses `/frames/nNNN.jpg` temp staging, then commit to `/frames/fNNN.jpg`.
+- Raw slot provenance is tracked (`rawSourceIdx`) so raw remap can avoid full decode work.
+
+4.6 Partial-window tolerance logic (important)
+- `partial-stable keep`:
+  - all currently cached frames are still reusable,
+  - source does not expose full target window now,
+  - system keeps current cache and avoids full-refresh loop.
+- `partial-keep`:
+  - assembled set is partial but improved/usable,
+  - commits that partial set and continues (no forced full refresh).
+- This is why cache can remain < target count intentionally without being treated
+  as failure every boot.
+
+4.7 When rolling escalates to full refresh
+- `saved < target` and partial-keep criteria not met.
+- Tail-only/tail-fill path fails to produce coherent final timeline.
+- File move/install failures that break coherence.
+- On escalate: temp files are cleared and full download path is requested.
+
+4.8 Download validation and install contract
+- Each downloaded weather frame is validated before install:
+  - HTTP/body/JPEG integrity checks,
+  - decode viability checks.
+- Missing-slot downloads can also probe nearby cadence timestamps (`0, ±1, ±2, ±3`)
+  to recover around source-side placeholder slots.
+- Minimum weather JPEG byte floor is enforced before install to reject known tiny
+  placeholder/outlier payloads that can still be structurally decodable.
+- Only validated frames are installed to `fNNN.jpg` and timestamped in `times.bin`.
+- Prevents known corrupted payloads from entering canonical weather cache path.
+
+4.9 Raw cache coupling with rolling weather cache
+- Raw playback cache (`stream.raw`) is coupled to weather frame map:
+  - `remapRawPlaybackCacheRolling(...)` if old raw is current and slot mapping known.
+  - `rebuildRawPlaybackCacheRolling(...)` as secondary fast path.
+  - `buildRawPlaybackCache()` full rebuild fallback.
+- `raw.meta` contains:
+  - version,
+  - validity bitmap,
+  - physical slot map.
+- Runtime hard guard: if raw meta says current but valid-slot count is zero
+  (`vbm=0, meta=1` condition), meta is invalidated and rebuilt.
+
+4.10 Zoom/terrain/radar refresh coupling
+- `s_zoomWeatherRefreshNeeded` is set when weather downloads occurred.
+- `s_zoomSnapshotsRefreshPending` is set when newest snapshot set is stale/missing.
+- Zoom refresh may run without weather redownload if only derived assets are stale.
+- Terrain/radar stage is refreshed in the same sync cycle (or boot-lite refresh),
+  with tolerant terrain pair handling (single-layer success can still keep stage alive).
+
+
+5) Playback Stages (loop sequence)
+----------------------------------
+Stage 1 — Main weather animation (time-based)
+- Uses valid frame index map from `stream.raw`.
+- Runs ~10s animation window with monotonic slot progression.
+- Final displayed frame is retained for freeze base.
+
+Stage 2 — Freeze + locator cue
+- Holds latest frame and runs visual locator cue before zoom stage.
+
+Stage 3 — Zoom progression
+- Shows zoom1 -> zoom2 -> zoom3 in fixed step durations.
+
+Stage 4 — Terrain/radar transition
+- Uses terrain composite stage and top-bar mode switch to radar-time context.
+
+Stage 5 — Clock sweep overlay
+- Draws large local-time overlay with sweep reveal/fade timing.
+- Returns to clean terrain base after overlay segment ends.
+
+Stage 6 — Sleep/update checks
+- Auto-update boundary check can trigger reboot/rescan.
+- Loop counter and sleep mode policy can enter sleep state.
+
+
+6) Overlay/Bar Layers (what is drawn over content)
+--------------------------------------------------
+- Top bar:
+  - WiFi glyph/name,
+  - battery/charge icon + percent,
+  - date/time + “h ago” or “min ago” context.
+- Bottom bars:
+  - location line,
+  - radar status line.
+- Bars are rendered into dedicated buffers and stamped over every presented frame.
+- Terrain stage can temporarily switch top-bar time source from frame time to radar scan time.
+
+
+7) Trigger Matrix (what causes what)
+------------------------------------
+Sync triggers
+- Timer wake.
+- Auto mode boundary due (`:00`, `:15`, `:30` depending on selected mode).
+- No valid cache/frames.
+- Explicit reboot paths.
+
+Portal trigger
+- Any required sync path that cannot get online WiFi/internet.
+
+Raw rebuild trigger
+- Missing/stale `raw.meta`.
+- Invalid stream size/slot map.
+- Zero valid slot guard.
+
+Zoom/terrain refresh triggers
+- New weather frames downloaded.
+- Missing or stale zoom/terrain assets.
+- Hard-boot “boot-lite” refresh path when cache exists.
+
+Start cue trigger
+- Armed after successful sync/boot frame readiness.
+- Played at animation start (non-blocking worker path with preloaded cue buffer).
+
+Sleep/wake triggers
+- Top button short press: sleep/wake action.
+- Top button long press: mode toggle (sleep-enabled vs always-on behavior).
+- AXP power-key short press: software reboot.
+- AXP power-key long hold: hardware power-off threshold configured to ~4s.
+
+
+8) Runtime Safety/Validation Layers
+-----------------------------------
+This section describes the full validation stack in execution order. The system
+has multiple gates by design so a single weak check does not poison playback.
+
+8.1 Transport/body integrity gate (HTTP -> RAM buffer)
+- Function: `readHttpJpegBodyToDlBuf(...)`
+- Purpose: reject malformed/partial payloads before disk write.
+- Checks:
+  - HTTP body write succeeds to fixed buffer (`s_dlBuf`).
+  - size within bounds (`DL_BUF_BYTES`).
+  - starts with SOI (`FFD8`) and contains an EOI (`FFD9`) via
+    `jpegEffectiveLength(...)`.
+- Output:
+  - returns canonical JPEG effective length, trimming trailing noise bytes.
+  - failure at this stage means frame is never installed.
+
+8.2 Decode-viability gate (RAM JPEG -> sprite)
+- Functions:
+  - `validateBufferedWeatherFrameJpeg(...)` for incoming weather frames.
+  - `decodeJpegPathToSprite(...)` for on-disk candidate checks.
+- Purpose: ensure image is decodable at expected geometry before acceptance.
+- Checks:
+  - `jpeg.openRAM` and decode success.
+  - expected width/height (with limited relaxed-height exceptions where allowed).
+  - full-frame draw coverage (`jpegDrawLooksFullFrame`) where strict path applies.
+
+8.3 Structural pixel anomaly detectors (sprite-level)
+- These run on decoded sprite pixels and detect corruption signatures:
+  - `spriteLooksCompletelyBlack()`:
+    exact-zero blank frame detection.
+  - `spriteLooksNearlyBlack()`:
+    visually-black frame detection tolerant to JPEG noise.
+  - `spriteLooksPartialDecode()`:
+    large exact-zero ratio + quadrant concentration (incomplete decode footprint).
+  - `spriteLooksHorizontallyCorrupted()`:
+    horizontal band half-empty pattern (partial read signature).
+  - `spriteLooksVerticallyCorrupted()`:
+    left/right half-empty split pattern.
+  - `spriteLooksHoldFrameBlockCorrupted()`:
+    16x16 MCU-hole/band detector (isolated block + row-band patterns).
+  - `spriteLooksCyanWhiteBlockCorrupted()`:
+    cyan/white tiled artifact detector for known corruption mode.
+  - `spriteLooksBlackSlabCorrupted()`:
+    dark slab cluster detector used in zoom/hold paths.
+- Any hard failure at this layer rejects frame install/promote.
+
+8.4 Atomic install gate (disk write correctness)
+- Function: `installValidatedWeatherJpegToPath(...)`
+- Purpose: prevent partially-written files from becoming canonical `fNNN.jpg`.
+- Flow:
+  1) write to `*.part`,
+  2) verify file head/tail against RAM buffer,
+  3) re-decode from disk and re-run structural validation (`validateStoredWeatherFramePath`),
+  4) atomic rename/copy into final path.
+- Result: if any step fails, temp file is removed and final frame is unchanged.
+
+8.5 Temporal-neighbor outlier checks (semantic + compressed-size)
+- Functions:
+  - `weatherFrameLooksCompressedSizeOutlier(...)`
+  - `weatherFrameLooksSemanticOutlier(...)`
+- Purpose: reject frames that decode but are implausible relative to adjacent time slots.
+- Size outlier:
+  - compares candidate JPEG size against neighboring frames with tight tolerance.
+- Semantic outlier:
+  - computes per-tile color signatures and cyan-tile metrics.
+  - compares candidate distance against adjacent frames.
+  - flags suspicious jumps that match known cyan corruption behavior.
+- Used in:
+  - cache repair validation,
+  - raw build/remap/rebuild gating,
+  - post-download repair flows.
+
+8.6 Cache-repair validators (post-download maintenance)
+- Functions:
+  - `validateAndRepairCachedFrames(...)`
+  - `validateAndRepairFullCacheIfNeeded(...)`
+  - `validateAndRepairCacheSlice(...)`
+- Purpose: scrub existing cached JPGs, repair any stale/poisoned files.
+- Repair strategy:
+  1) re-download exact timestamp and re-validate,
+  2) if download cannot produce valid frame, heal by nearest good neighbor copy.
+- Metadata:
+  - `CACHE_VALIDATE_META_FILE` tracks validated cache signature.
+  - if full pass has failures, validation meta is removed so pass retries later.
+
+8.7 Raw-cache admission control (critical containment layer)
+- Raw cache builders (`buildRawPlaybackCache`, rolling remap/rebuild) re-run
+  structural + semantic checks before writing each slot into `stream.raw`.
+- Any failed slot is zeroed and then candidate for gap-fill from nearest valid slot.
+- This ensures bad JPGs cannot automatically poison playback stream even if they
+  exist on SD.
+
+8.8 Playback-time guards
+- `showFrame(...)` validates stream slot mapping and read length.
+- Short/invalid stream reads invalidate slot and raw meta, forcing rebuild path.
+- Valid-frame index in loop only uses `s_streamValid` slots; empty map shows
+  explicit error (`0 frames ...`) and blocks playback rather than drawing garbage.
+
+8.9 Metadata coherency guards
+- `raw.meta`:
+  - version + validity bitmap + slot map.
+  - runtime guard rejects `meta=1` with zero valid slots (`vbm=0`).
+- `dim.cfg`:
+  - display geometry guard to avoid cross-resolution cache reuse.
+- `view.meta`:
+  - weather bbox/source signature guard; mismatch triggers full refresh.
+- `zoom.meta` / `radar.meta`:
+  - derived asset freshness and radar scan-time coherence.
+
+8.10 Failure policy and containment model
+- Policy: fail closed on questionable frames, then recover by repair or fallback.
+- Containment levels:
+  1) reject before SD install,
+  2) reject before raw-stream admission,
+  3) reject at playback slot read/validity stage.
+- Practical effect:
+  - single corrupted fetch should not persist as visible long-term artifact,
+  - and should not force whole-system failure.
+
+
+9) Known Operational Dependencies
+---------------------------------
+- Accurate “ago” values depend on valid UTC/NTP; best-effort sync and fallback clock are used.
+- Terrain/radar availability depends on external service responses.
+- Fast boot path relies on metadata consistency (`meta.txt`, `raw.meta`, `view.meta`, `dim.cfg`).
+- SD integrity is critical; corrupt writes can surface as frame anomalies or stale cache behavior.
+
+
+10) Network/Portal Control Plane
+--------------------------------
+- Portal host is always `satwatch.local` (mDNS host `satwatch`).
+- AP fallback credentials are fixed:
+  - SSID: `Sat Watch`
+  - Password: `123456789`
+- If normal WiFi cannot connect with internet, device enters captive AP portal mode
+  and displays join instructions on-screen.
+- When normal WiFi is connected, the portal server still runs and remains reachable
+  on LAN (`satwatch.local` + local IP endpoint).
+- AP+DNS captive redirect is enabled only in AP mode; in STA-connected mode, portal
+  is plain HTTP server + mDNS.
+
+
+11) User Configuration Model (Portal + NVS)
+-------------------------------------------
+- Stored in `Preferences` namespace `satwatch`.
+- WiFi credentials:
+  - 1 primary + 4 fallback networks.
+- Time format:
+  - 12-hour or 24-hour.
+- Update mode:
+  - Manual
+  - Auto (clock-boundary schedule only).
+- Auto schedule presets:
+  - every 15 minutes (`:00/:15/:30/:45`)
+  - every 30 minutes (`:00/:30`)
+  - top of hour (`:00`)
+- Preset checkbox behavior:
+  - selecting any preset forces Auto mode for that save.
+  - minutes-since-boot scan mode is intentionally not used.
+- Start cue:
+  - Off / Chime / Vibe pulse
+  - Cue file path selectable
+  - Chime volume configurable (vibe pulse fixed-volume behavior).
+- Save action:
+  - persists config, then triggers reboot.
+
+
+12) Source Selection + Dynamic Window Profile
+---------------------------------------------
+- Weather source is selected from longitude with hysteresis:
+  - GOES-West
+  - GOES-East
+  - Himawari IR (APAC fallback region)
+- Active profile drives:
+  - layer name,
+  - cadence minutes,
+  - lag hours.
+- `targetFrameCount()` is dynamic from `hoursBack/cadence`, clamped to `MAX_FRAMES`.
+- Practical result:
+  - frame count can be < 144 due source holes and validation rejection;
+  - rolling logic treats that as valid partial state when timeline anchors remain coherent.
+
+
+13) Progress Pipeline Semantics
+-------------------------------
+- Unified progress tracker spans full sync pipeline:
+  1) sync clock/network stage
+  2) cache stage (rolling or full download)
+  3) raw stage (remap/rebuild)
+  4) finalize stage (times/meta/state writes)
+  5) zoom/terrain refresh stage
+- Progress UI can only complete after all phases commit, not just JPEG network loop.
+- If progress appears to pause near completion, it usually indicates tail finalize
+  work (raw/meta/derived assets), not deadlock.
+
+
+14) Diagnostics (`/diag.txt`) Reading Guide
+-------------------------------------------
+- Core boot header:
+  - `sdCount`, `framesReady`, `frameCount`, `needSync`
+- Sync branch markers:
+  - `sync: branch=roll`
+  - `sync: branch=tail-fill`
+  - `sync: latest-current`
+  - `sync: exact-current`
+  - `sync: ... -> full-refresh`
+- Completion markers:
+  - `syncRolling=1` means rolling path completed without full refresh.
+  - `syncRolling=0` followed by `download:` means full refresh path was taken.
+  - `post-sync:` is end-of-sync state committed to runtime.
+- Important: frame count drift across cycles is expected if source window has holes
+  and validators reject bad payloads; this is not automatically a logic fault.
+
+
+KNOWN ISSUE 1 — Battery glyph flip near 99%
+-------------------------------------------
+- Symptom:
+  - At ~99% SOC, charging/full battery glyph can appear to flip intermittently.
+- Current behavior:
+  - UI uses raw AXP2101 `STATUS2` (`0x01`) charge-phase bits per render pass, and
+    that phase can oscillate near full/top-off boundaries.
+- Why it happens:
+  - Near charge-complete, PMIC legitimately transitions between charge phases
+    (top-off/done), so direct per-frame mapping produces visible icon state flips.
+- Constraint:
+  - User requirement is truthful status display; no fake/forced stable state.
+- Planned direction (not yet implemented):
+  - Keep truthful hardware-state semantics while reducing visual jitter by using a
+    power-present + phase-aware mapping with stable top-off representation, without
+    falsifying charge state.
