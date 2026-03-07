@@ -519,6 +519,7 @@ static uint32_t s_syncProgCursorUnits = 0;
 static char     s_syncProgPhaseLabel[24] = "sync";
 
 RTC_DATA_ATTR static bool s_sleepModeEnabled = true;
+RTC_DATA_ATTR static bool s_autoUpdateInSleep = true;
 #if BOARD_IS_AMOLED_206
 static I2SClass s_audioI2s;
 static es8311_handle_t s_audioCodec = nullptr;
@@ -649,6 +650,7 @@ static void loadWifiPortalConfig() {
   s_chimeVolume = 80;
   snprintf(s_startCuePath, sizeof(s_startCuePath), "%s", "/power_up.raw");
   s_sleepModeEnabled = true;
+  s_autoUpdateInSleep = true;
   s_lastSuccessfulSyncUtc = 0;
   s_lastSuccessfulScanMsValid = false;
   s_lastSuccessfulScanMs = 0;
@@ -701,6 +703,7 @@ static void loadWifiPortalConfig() {
       if (vol > 100) vol = 100;
       s_chimeVolume = (uint8_t)vol;
       s_sleepModeEnabled = prefs.getBool("slp", true);
+      s_autoUpdateInSleep = prefs.getBool("ausl", true);
       s_lastSuccessfulSyncUtc = (time_t)prefs.getULong64("lsyn", 0ULL);
     }
     prefs.end();
@@ -721,7 +724,7 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
                                  UpdateMode updateMode, uint16_t autoUpdateIntervalMin,
                                  bool autoUpdateTopOfHour,
                                  StartCueMode startCueMode, uint8_t chimeVolume,
-                                 const char* cuePath) {
+                                 const char* cuePath, bool autoUpdateInSleep) {
   if (!entries) return;
   Preferences prefs;
   if (!prefs.begin("satwatch", false)) return;
@@ -743,6 +746,7 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   prefs.putUChar("chmd", (uint8_t)startCueMode);
   prefs.putUChar("chmv", chimeVolume);
   prefs.putString("cuep", (cuePath && cuePath[0]) ? cuePath : "/power_up.raw");
+  prefs.putBool("ausl", autoUpdateInSleep);
   prefs.end();
   s_clockUse12Hour = use12Hour;
   s_updateMode = updateMode;
@@ -752,6 +756,7 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   s_chimeVolume = chimeVolume;
   snprintf(s_startCuePath, sizeof(s_startCuePath), "%s",
            (cuePath && cuePath[0]) ? cuePath : "/power_up.raw");
+  s_autoUpdateInSleep = autoUpdateInSleep;
 #if BOARD_IS_AMOLED_206
   ensureAudioCueWorker();
   preloadSelectedCueToPsram(true);
@@ -931,6 +936,11 @@ static void sendWifiPortalPage() {
   html += htmlEscape(s_startCuePath);
   html += F("'>");
   html += F("<div class='hint'>Vibe pulse uses 80 fixed volume. Chime uses the configurable volume.</div>");
+  html += F("<div class='mb-4'><label class='block text-sm font-medium text-gray-300 mb-1'>Sleep behaviour</label>");
+  html += F("<label class='flex items-center gap-2 text-sm text-gray-200'>");
+  html += F("<input type='checkbox' name='ausl' value='1'");
+  if (s_autoUpdateInSleep) html += F(" checked");
+  html += F(">Auto-update satellite frames when waking from sleep</label></div>");
   html += F("<div class='hint'>Portal AP: Sat Watch / 123456789</div>");
   html += F("<div class='hint'>Portal URL: http://satwatch.local/</div>");
   if (WiFi.status() == WL_CONNECTED) {
@@ -1032,8 +1042,9 @@ static void handleWifiPortalSave() {
   if (!cuePath.length()) {
     cuePath = (mode == START_CUE_VIBE_PULSE) ? "/230.raw" : "/power_up.raw";
   }
+  bool autoUpdateInSleep = s_wifiPortalServer.hasArg("ausl");
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
-                       (StartCueMode)mode, (uint8_t)chimeVol, cuePath.c_str());
+                       (StartCueMode)mode, (uint8_t)chimeVol, cuePath.c_str(), autoUpdateInSleep);
   s_wifiPortalServer.send(200, "text/html",
                           "<!doctype html><html><body style='font-family:Arial;background:#111827;color:#f9fafb;padding:24px;'>"
                           "<h2>Saved</h2><p>Settings stored. Rebooting now.</p></body></html>");
@@ -1692,39 +1703,22 @@ static void drawSleepModeGlyph(LGFX_Sprite& spr, int x, int y, int w, int h, boo
     0b00001111111111110000,
     0b00000011111111000000,
   };
-  static const uint32_t kWakeShades[] = {
+  // Sunglasses + U-shaped smile.
+  static const uint32_t kWakeDetail[] = {
     0b00000000000000000000,
     0b00000000000000000000,
     0b00000000000000000000,
     0b00000000000000000000,
-    0b00000000000000000000,
-    0b00111110011100111100,
-    0b01111111111111111110,
-    0b01111111111111111110,
-    0b00111110011100111100,
+    0b00011111100111111000,  // lenses: cols 3-8, gap cols 9-10, cols 11-16
+    0b00011111100111111000,
+    0b00011111100111111000,
     0b00000000000000000000,
     0b00000000000000000000,
+    0b00100000000000000100,  // smile corners (cols 2, 17)
+    0b00011000000000011000,  // smile sides (cols 3-4, 15-16)
+    0b00000111111111100000,  // smile center (cols 5-14)
     0b00000000000000000000,
     0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-  };
-  static const uint32_t kWakeMouth[] = {
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000000000000000000,
-    0b00000111111111100000,
-    0b00001100000000110000,
-    0b00000111111111100000,
     0b00000000000000000000,
     0b00000000000000000000,
   };
@@ -1737,8 +1731,7 @@ static void drawSleepModeGlyph(LGFX_Sprite& spr, int x, int y, int w, int h, boo
   int ox = x + (w - drawW) / 2;
   int oy = y + (h - drawH) / 2;
   drawMask(kWakeFace, baseH, baseW, baseH, ox, oy, scale, TFT_YELLOW);
-  drawMask(kWakeShades, baseH, baseW, baseH, ox, oy, scale, TFT_BLACK);
-  drawMask(kWakeMouth, baseH, baseW, baseH, ox, oy, scale, TFT_BLACK);
+  drawMask(kWakeDetail, baseH, baseW, baseH, ox, oy, scale, TFT_BLACK);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2508,44 +2501,56 @@ static void drawBatteryIcon(LGFX_Sprite& spr, int x, int y, int w, int h, int pc
     uint8_t powerState = (status2 == 0xFF) ? 0xFF : ((status2 >> 5) & 0x03);
     uint8_t chargerPhase = (status2 == 0xFF) ? 0xFF : (status2 & 0x07);
     bool isCharging = (powerState == 0x01) || (powerState != 0x02 && chargerPhase <= 0x03);
-    bool showChargeGlyph = isCharging && (((millis() / 400UL) & 1U) == 0U);
+    bool showChargeGlyph = isCharging;
     bool showPlugGlyph = (!isCharging && chargerPhase == 0x04);
 
-    int glyphH = innerH - 4;
-    if (glyphH < 8) glyphH = innerH;
-    int glyphW = innerW - 6;
-    if (glyphW < 10) glyphW = innerW;
-    int gx = innerX + (innerW - glyphW) / 2;
-    int gy = innerY + (innerH - glyphH) / 2;
+    auto drawBatMask = [&](const uint32_t* rows, int rowCount, int bW,
+                            int ox, int oy, int sc, uint16_t color) {
+      for (int row = 0; row < rowCount; ++row) {
+        uint32_t bits = rows[row];
+        for (int col = 0; col < bW; ++col) {
+          if ((bits >> (bW - 1 - col)) & 0x1U)
+            spr.fillRect(ox + col * sc, oy + row * sc, sc, sc, color);
+        }
+      }
+    };
 
     if (showChargeGlyph) {
-      int boxW = max(12, glyphW / 2);
-      int boxH = max(10, glyphH - 2);
-      int bx = innerX + (innerW - boxW) / 2;
-      int by = innerY + (innerH - boxH) / 2;
-      spr.fillRect(bx - 1, by - 1, boxW + 2, boxH + 2, TFT_BLACK);
-      int xL = bx + boxW * 2 / 10;
-      int xM = bx + boxW * 5 / 10;
-      int xR = bx + boxW * 8 / 10;
-      int yT = by + boxH * 1 / 10;
-      int yM = by + boxH * 5 / 10;
-      int yB = by + boxH * 9 / 10;
-      spr.fillTriangle(xM, yT, xL, yM, xM + 1, yM, TFT_YELLOW);
-      spr.fillTriangle(xM - 1, yM, xR, yM, xL + 2, yB, TFT_YELLOW);
+      // 8×8 Z-bolt: top arm tilts right, crossbar full-width, bottom arm tilts left.
+      static const uint32_t kBoltGlyph[] = {
+        0b00001111,  // ....####
+        0b00011110,  // ...####.
+        0b00111100,  // ..####..
+        0b11111110,  // #######.
+        0b00111100,  // ..####..
+        0b01111000,  // .####...
+        0b11110000,  // ####....
+        0b00000000,
+      };
+      constexpr int bW = 8, bH = 8;
+      int sc = min(max(1, innerW / bW), max(1, innerH / bH));
+      int ox = innerX + (innerW - bW * sc) / 2;
+      int oy = innerY + (innerH - bH * sc) / 2;
+      spr.fillRect(ox, oy, bW * sc, bH * sc, TFT_BLACK);
+      drawBatMask(kBoltGlyph, bH, bW, ox, oy, sc, TFT_YELLOW);
     } else if (showPlugGlyph) {
-      int bodyW2 = max(10, glyphW * 2 / 5);
-      int bodyH2 = max(10, glyphH * 2 / 5);
-      int px = innerX + (innerW - bodyW2) / 2;
-      int py = innerY + (innerH - bodyH2) / 2;
-      int prongLen = max(4, glyphW / 7);
-      int cordLen = max(4, glyphW / 8);
-      spr.fillRect(px - 1, py - 3, bodyW2 + prongLen + cordLen + 4, bodyH2 + 6, TFT_BLACK);
-      spr.drawRect(px, py, bodyW2, bodyH2, TFT_WHITE);
-      spr.drawRect(px + 1, py + 1, bodyW2 - 2, bodyH2 - 2, TFT_WHITE);
-      spr.drawLine(px + bodyW2, py + 2, px + bodyW2 + prongLen, py + 2, TFT_WHITE);
-      spr.drawLine(px + bodyW2, py + bodyH2 - 3, px + bodyW2 + prongLen, py + bodyH2 - 3, TFT_WHITE);
-      spr.drawLine(px - cordLen, py + bodyH2 / 2, px, py + bodyH2 / 2, TFT_WHITE);
-      spr.drawLine(px - cordLen, py + bodyH2 / 2 + 1, px, py + bodyH2 / 2 + 1, TFT_WHITE);
+      // 8×8 plug: two 1px prongs (cols 2, 5), wide body (cols 1-6), cord (cols 3-4)
+      static const uint32_t kPlugGlyph[] = {
+        0b00100100,  // ..#..#..  prongs
+        0b00100100,  // ..#..#..  prongs
+        0b01111110,  // .######.  body
+        0b01111110,  // .######.  body
+        0b01111110,  // .######.  body
+        0b00011000,  // ...##...  cord
+        0b00011000,  // ...##...  cord
+        0b00000000,
+      };
+      constexpr int bW = 8, bH = 8;
+      int sc = min(max(1, innerW / bW), max(1, innerH / bH));
+      int ox = innerX + (innerW - bW * sc) / 2;
+      int oy = innerY + (innerH - bH * sc) / 2;
+      spr.fillRect(ox, oy, bW * sc, bH * sc, TFT_BLACK);
+      drawBatMask(kPlugGlyph, bH, bW, ox, oy, sc, TFT_GREEN);
     }
 
     // Positive terminal nub (right side)
@@ -8147,6 +8152,7 @@ static void goToSleep(bool buttonOnly = false) {
   }
 #if BOARD_IS_AMOLED_206
   if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
+  if (s_amoledOut) s_amoledOut->displayOff();
 #else
   tft.fillScreen(TFT_BLACK);
 #endif
@@ -8154,7 +8160,7 @@ static void goToSleep(bool buttonOnly = false) {
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
 
-  if (!buttonOnly) {
+  if (!buttonOnly && s_autoUpdateInSleep) {
     uint64_t sleepUs = (uint64_t)SLEEP_HOURS * 3600ULL * 1000000ULL;
     esp_sleep_enable_timer_wakeup(sleepUs);
   }
@@ -8173,7 +8179,7 @@ static void goToSleep(bool buttonOnly = false) {
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   Serial.printf("Wake cause: %d\n", (int)wake);
 
-  if (!buttonOnly && wake == ESP_SLEEP_WAKEUP_TIMER) {
+  if (!buttonOnly && s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (connectWifiForSync(false)) {
       if (!syncFramesRolling()) {
         downloadFrames();
@@ -8186,6 +8192,7 @@ static void goToSleep(bool buttonOnly = false) {
   }
   resetTopButtonStateAfterWake(buttonOnly);
 
+  if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(0xFF);
   s_buttonSleepTransition = false;
   return;
@@ -8226,7 +8233,7 @@ static void goToSleep(bool buttonOnly = false) {
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   Serial.printf("Wake cause: %d\n", (int)wake);
 
-  if (wake == ESP_SLEEP_WAKEUP_TIMER) {
+  if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (connectWifiForSync(false)) {
       if (!syncFramesRolling()) {
         downloadFrames();
@@ -8240,6 +8247,7 @@ static void goToSleep(bool buttonOnly = false) {
   resetTopButtonStateAfterWake(false);
 
 #if BOARD_IS_AMOLED_206
+  if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(0xFF);
 #else
   tft.setBrightness(255);
