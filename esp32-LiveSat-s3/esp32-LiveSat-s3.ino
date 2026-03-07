@@ -420,7 +420,7 @@ static void selectSatelliteForLon(float lonDeg, bool force = false);
 RTC_DATA_ATTR static bool   framesReady = false;
 RTC_DATA_ATTR static int    loopsDone   = 0;
 RTC_DATA_ATTR static int    frameCount  = 0;
-RTC_DATA_ATTR static int32_t s_displayUtcOffsetSec = -4 * 3600;  // default BVI
+RTC_DATA_ATTR static int32_t s_displayUtcOffsetSec = -4 * 3600;  // initial default, overwritten by user timezone
 RTC_DATA_ATTR static bool    s_displayUtcOffsetValid = false;
 RTC_DATA_ATTR static bool    s_weatherGeoValid = false;
 RTC_DATA_ATTR static float   s_weatherCenterLat = 0.0f;
@@ -1417,7 +1417,7 @@ static void serviceWifiPortalServer() {
   if (s_wifiPortalHttpRunning) s_wifiPortalServer.handleClient();
 }
 
-static void showWifiPortalJoinInfo() {
+static void showWifiPortalJoinInfo(bool canSkip = false) {
 #if BOARD_IS_AMOLED_206
   int screenH = s_amoledOut ? s_amoledOut->height() : AMOLED_HEIGHT;
   int screenW = s_amoledOut ? s_amoledOut->width()  : AMOLED_WIDTH;
@@ -1463,6 +1463,14 @@ static void showWifiPortalJoinInfo() {
     y += 46;
     s_amoledOut->setCursor(8, y);
     s_amoledOut->print(".local");
+    if (canSkip) {
+      y += 54;
+      s_amoledOut->setTextSize(3);
+      s_amoledOut->setTextColor(0xFD20, 0x0000);  // amber
+      s_amoledOut->setCursor(8, y);
+      s_amoledOut->print("Tap to play saved frames");
+      s_amoledOut->setTextColor(0xFFFF, 0x0000);
+    }
   }
 #else
   int screenH = tft.height();
@@ -1486,11 +1494,16 @@ static void showWifiPortalJoinInfo() {
   y += 16;
   tft.setCursor(4, y);
   tft.print("Join AP then open URL");
+  if (canSkip) {
+    y += 16;
+    tft.setCursor(4, y);
+    tft.print("Press button to play saved frames");
+  }
 #endif
   serviceWifiPortalServer();
 }
 
-static void runWifiConfigPortal() {
+static void runWifiConfigPortal(bool canSkip = false) {
   loadWifiPortalConfig();
 
   WiFi.disconnect(true);
@@ -1498,10 +1511,21 @@ static void runWifiConfigPortal() {
   delay(100);
 
   startWifiPortalServer(true);
-  showWifiPortalJoinInfo();
-  for (;;) {
-    serviceWifiPortalServer();
-    delay(2);
+  showWifiPortalJoinInfo(canSkip);
+  if (canSkip) {
+    // Dismissible: tap screen or press button to play cached frames.
+    // Uses a direct poll loop (not delay()) to intercept PKEY as "skip" rather than "restart".
+    pinMode(38, INPUT_PULLUP);  // TP_INT — active-low touch interrupt
+    for (;;) {
+      serviceWifiPortalServer();
+      if (pollPortalSkip()) return;
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  } else {
+    for (;;) {
+      serviceWifiPortalServer();
+      delay(2);  // portalFriendlyDelay: PKEY → restart in no-frames case
+    }
   }
 }
 
@@ -4007,8 +4031,113 @@ static bool syncClockFromNtpBestEffort(int maxTries = 10) {
     appendDiagLog("ntp: fail t=%lld\n", (long long)nowUtc);
   } else {
     appendDiagLog("ntp: ok utc=%lld\n", (long long)nowUtc);
+    writePcf85063(nowUtc);
   }
   return ok;
+}
+
+// ── PCF85063A hardware RTC (I2C 0x51) ────────────────────────────────────
+static uint8_t pcfBcdEnc(int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+static int pcfBcdDec(uint8_t b) { return ((b >> 4) & 0x0F) * 10 + (b & 0x0F); }
+
+static bool writePcf85063(time_t t) {
+  struct tm* gmt = gmtime(&t);
+  if (!gmt) return false;
+  // Halt oscillator during write
+  Wire.beginTransmission(0x51);
+  Wire.write((uint8_t)0x00);
+  Wire.write((uint8_t)0x20);  // STOP bit
+  if (Wire.endTransmission() != 0) return false;
+  // Write seconds through years (registers 0x02-0x08)
+  Wire.beginTransmission(0x51);
+  Wire.write((uint8_t)0x02);
+  Wire.write(pcfBcdEnc(gmt->tm_sec));
+  Wire.write(pcfBcdEnc(gmt->tm_min));
+  Wire.write(pcfBcdEnc(gmt->tm_hour));
+  Wire.write(pcfBcdEnc(gmt->tm_mday));
+  Wire.write((uint8_t)gmt->tm_wday);
+  Wire.write(pcfBcdEnc(gmt->tm_mon + 1));
+  Wire.write(pcfBcdEnc((gmt->tm_year + 1900 - 2000) % 100));
+  if (Wire.endTransmission() != 0) return false;
+  // Resume oscillator
+  Wire.beginTransmission(0x51);
+  Wire.write((uint8_t)0x00);
+  Wire.write((uint8_t)0x00);
+  return Wire.endTransmission() == 0;
+}
+
+static bool readPcf85063(time_t* out) {
+  if (!out) return false;
+  Wire.beginTransmission(0x51);
+  Wire.write((uint8_t)0x02);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom((uint8_t)0x51, (uint8_t)7) < 7) return false;
+  uint8_t secRaw = Wire.read();
+  uint8_t minRaw = Wire.read();
+  uint8_t hrRaw  = Wire.read();
+  uint8_t dayRaw = Wire.read();
+  Wire.read();  // weekday — unused
+  uint8_t monRaw = Wire.read();
+  uint8_t yrRaw  = Wire.read();
+  if (secRaw & 0x80) return false;  // OS flag: oscillator stopped, time invalid
+  int sec = pcfBcdDec(secRaw & 0x7F);
+  int min = pcfBcdDec(minRaw & 0x7F);
+  int hr  = pcfBcdDec(hrRaw  & 0x3F);
+  int day = pcfBcdDec(dayRaw & 0x3F);
+  int mon = pcfBcdDec(monRaw & 0x1F);
+  int yr  = pcfBcdDec(yrRaw) + 2000;
+  if (yr < 2024 || mon < 1 || mon > 12 || day < 1 || day > 31) return false;
+  // Compute UTC epoch without relying on mktime() timezone
+  static const int kDpM[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+  int y = yr - 1970;
+  int leaps = (y + 1) / 4 - (y + 69) / 100 + (y + 369) / 400;
+  int yd = kDpM[mon - 1] + day - 1;
+  if (mon > 2 && (yr % 4 == 0) && (yr % 100 != 0 || yr % 400 == 0)) yd++;
+  time_t t = ((time_t)y * 365 + leaps + yd) * 86400
+             + hr * 3600 + min * 60 + sec;
+  if (t < 1700000000LL) return false;  // sanity: must be after Nov 2023
+  *out = t;
+  return true;
+}
+
+static bool tryApplyPcf85063Time() {
+  time_t t = 0;
+  if (!readPcf85063(&t)) return false;
+  struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+  settimeofday(&tv, nullptr);
+  appendDiagLog("rtc: pcf85063 t=%lld\n", (long long)t);
+  return true;
+}
+
+// Persist last-known UTC offset to NVS so it survives power-off
+static void saveUtcOffsetToNvs(int32_t offsetSec) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", false)) return;
+  prefs.putInt("utcoff", (int)offsetSec);
+  prefs.end();
+}
+
+static int32_t loadUtcOffsetFromNvs() {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", true)) return 0;
+  int32_t v = (int32_t)prefs.getInt("utcoff", 0);
+  prefs.end();
+  return v;
+}
+
+// Poll for a "skip" tap: touch INT pin (TP_INT = GPIO 38, active-low) or AXP2101 PKEY.
+// Used in the dismissible portal loop only — does NOT call serviceUserButtons().
+static bool pollPortalSkip() {
+  // Touch IC INT pin (GPIO 38) goes low when a touch is detected.
+  // This works even when the IC is in auto-sleep — touch wakes it and asserts INT.
+  if (digitalRead(38) == LOW) return true;
+  // AXP2101 PKEY short-press interrupt (reg 0x49 bit 2) — intercept before restart
+  uint8_t intSts = readAxp2101Register(0x49);
+  if (intSts & 0x04) {
+    writeAxp2101Register(0x49, intSts);  // clear
+    return true;
+  }
+  return false;
 }
 
 static bool topButtonPressed() {
@@ -4071,7 +4200,7 @@ static void topButtonPollTask(void*) {
 
 static void disconnectWifiAfterSync() {
   if (WiFi.status() == WL_CONNECTED) {
-    startWifiPortalServer(true);
+    startWifiPortalServer(false);
     return;
   }
   if (s_wifiPortalDnsRunning) {
@@ -4960,6 +5089,10 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
     if (label) Serial.printf("%s BLOCK-CORR\n", label);
     return false;
   }
+  if (spriteLooksBlackSlabCorrupted()) {
+    if (label) Serial.printf("%s SLAB-CORR\n", label);
+    return false;
+  }
   return true;
 }
 
@@ -5101,6 +5234,10 @@ static bool validateStoredWeatherFramePath(const char* path, const char* label) 
   }
   if (spriteLooksHoldFrameBlockCorrupted()) {
     if (label) Serial.printf("%s STORED-BLOCK\n", label);
+    return false;
+  }
+  if (spriteLooksBlackSlabCorrupted()) {
+    if (label) Serial.printf("%s STORED-SLAB\n", label);
     return false;
   }
   return true;
@@ -6691,11 +6828,11 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
             int minCh = r;
             if (g < minCh) minCh = g;
             if (b < minCh) minCh = b;
-            if (maxCh <= 8 && (maxCh - minCh) <= 3) darkish++;
+            if (maxCh <= 5 && (maxCh - minCh) <= 2) darkish++;
             total++;
           }
         }
-        if (total > 0 && ((darkish * 100) / total) >= 45) {
+        if (total > 0 && ((darkish * 100) / total) >= 50) {
           suspect[br][bc] = true;
         }
       }
@@ -6783,7 +6920,19 @@ static bool currentScaledPlaybackFrameLooksCorrupted() {
 }
 
 static bool currentScaledFreezeFrameLooksCorrupted() {
-  return currentScaledPlaybackFrameLooksCorrupted();
+  if (scaledFrameLooksFreezeBlockCorrupted()) {
+    appendDiagLog("freeze-check: freeze-block\n");
+    return true;
+  }
+  if (scaledFrameLooksHoldBlockCorrupted()) {
+    appendDiagLog("freeze-check: hold-block\n");
+    return true;
+  }
+  if (scaledFrameLooksBlackSlabCorrupted()) {
+    appendDiagLog("freeze-check: slab\n");
+    return true;
+  }
+  return false;
 }
 
 static bool tryShowCleanFreezeFrameByIdx(int idx) {
@@ -7083,8 +7232,9 @@ static void downloadFrames() {
     // Try canonical timestamp first, then -1 min, then +1 min.
     // GIBS scan boundaries often sit 1 minute before the exact :00/:10/:20 mark,
     // so a single-minute probe recovers ~95% of otherwise-missing slots.
-    static const int kGibsOffsetsSec[] = { 0, -60, 60 };
-    for (int attempt = 0; attempt < 3; ++attempt) {
+    static const int kGibsOffsetsSec[] = { 0, -60, 60, -120, 120, -180, 180 };
+    constexpr int kGibsOffsetCount = (int)(sizeof(kGibsOffsetsSec) / sizeof(kGibsOffsetsSec[0]));
+    for (int attempt = 0; attempt < kGibsOffsetCount; ++attempt) {
       time_t tTry = t + (time_t)kGibsOffsetsSec[attempt];
       if (!buildWeatherFrameUrl(url, sizeof(url), tTry,
                                 bboxWest, bboxSouth, bboxEast, bboxNorth)) continue;
@@ -7111,7 +7261,7 @@ static void downloadFrames() {
         continue;
       }
       if (!validateBufferedWeatherFrameJpeg(jpegLen, "FRAME")) {
-        if (attempt < 2) {
+        if (attempt + 1 < kGibsOffsetCount) {
           Serial.printf("[%3d/%d] %s probe%+d\n", i+1, totalFrames, timeISO,
                         kGibsOffsetsSec[attempt+1] / 60);
         }
@@ -8274,7 +8424,7 @@ void setup() {
     loopsDone   = 0;
     frameCount  = 0;
     s_timesLoaded = false;
-    s_displayUtcOffsetSec = -4 * 3600;
+    s_displayUtcOffsetSec = loadUtcOffsetFromNvs();  // restore from NVS; 0 if never synced
     s_displayUtcOffsetValid = false;
     // Keep a deterministic fallback location so pin/zoom/terrain paths still
     // work even if IP geolocation is temporarily unavailable.
@@ -8396,11 +8546,9 @@ void setup() {
   bool skipNextSyncOnce = consumeSkipNextSyncOnce();
   bool hardBootSyncDue = false;
   if (hardBoot && !skipNextSyncOnce) {
-    // Manual mode should not force a rescan on every reboot.
-    // Auto mode still rescans on configured time boundaries.
-    if (s_updateMode == UPDATE_MODE_AUTO) {
-      hardBootSyncDue = autoUpdateDueNow();
-    }
+    // Always sync on a hard boot regardless of update mode.
+    // Manual mode means no timer-wake syncs, not "ignore stale frames on reboot".
+    hardBootSyncDue = true;
   }
   bool needSync = (hardBootSyncDue || timerWake || !framesReady || frameCount == 0);
   {
@@ -8416,7 +8564,8 @@ void setup() {
     bool wifiOk = connectWifiForSync(false);
     { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("skip-sync wifiOk=%d\n", (int)wifiOk); diagF.close(); } }
     if (!wifiOk) {
-      runWifiConfigPortal();
+      tryApplyPcf85063Time();
+      runWifiConfigPortal(framesReady && frameCount > 0);
     } else {
       (void)syncClockFromNtpBestEffort(8);
       noteSuccessfulScanNow();
@@ -8446,7 +8595,8 @@ void setup() {
       noteSuccessfulScanNow();
       disconnectWifiAfterSync();
     } else {
-      runWifiConfigPortal();
+      tryApplyPcf85063Time();
+      runWifiConfigPortal(framesReady && frameCount > 0);
     }
     {
       File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
@@ -8481,7 +8631,8 @@ void setup() {
       noteSuccessfulScanNow();
       disconnectWifiAfterSync();
     } else {
-      runWifiConfigPortal();
+      tryApplyPcf85063Time();
+      runWifiConfigPortal(true);  // frames guaranteed by branch condition
     }
   }
 
@@ -9059,14 +9210,169 @@ static bool jsonExtractStringField(const String& body, const char* quotedKey, ch
   return (n > 0);
 }
 
+// Attempts Starlink dish GPS via gRPC on 192.168.100.1:9200.
+// Returns true and sets *outLat/*outLon if successful.
+// Prerequisite: enable once in Starlink app:
+//   SETTINGS → ADVANCED → DEBUG DATA → STARLINK LOCATION → "allow access on local network"
+//
+// NOTE: kReq[] must be pre-computed by connecting a laptop to Starlink and running:
+//   grpcurl -plaintext 192.168.100.1:9200 describe SpaceX.API.Device.Request
+// then encoding HTTP/2 client preface + SETTINGS + HEADERS + DATA frames offline.
+// Until that is done, this function stubs out and the BSSID path is used instead.
+static bool starlinkGeoLocate(float* outLat, float* outLon) {
+  WiFiClient tcp;
+  tcp.setTimeout(2000);
+  if (!tcp.connect(IPAddress(192, 168, 100, 1), 9200)) return false;
+  tcp.stop();
+  // kReq[] not yet computed — stub returns false so BSSID path is used.
+  // To enable: compute kReq[], send via tcp, parse HTTP/2 DATA frame response,
+  // strip 5-byte gRPC length prefix, parse protobuf location.lla.lat / .lon (sint64 ×1e-8).
+  Serial.println("starlink-geo: dish reachable but kReq[] not yet embedded — skipping");
+  return false;
+}
+
+// Scans visible WiFi APs and queries Apple's BSSID geo API.
+// Returns true and sets *outLat/*outLon if successful.
+// Works on home WiFi, iPhone hotspot, or Starlink — scans RF environment, not WAN IP.
+static bool bssidGeoLocate(float* outLat, float* outLon) {
+  // 1. Scan visible APs
+  int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
+  if (n <= 0) {
+    Serial.printf("bssid-geo: no APs found (%d)\n", n);
+    WiFi.scanDelete();
+    return false;
+  }
+  if (n > 20) n = 20;  // Apple ignores extras; clamp to 20 strongest
+
+  // 2. Build protobuf request body
+  // Schema: outer field 13 (repeated WifiAP), each containing field1=bssid string + field3=rssi int32
+  // Worst-case size: 20 APs × (1 outer tag + 1 len + 19 bssid + 1 rssi tag + 10 varint) = 640 bytes
+  uint8_t body[1024];
+  int pos = 0;
+
+  auto writeVarint = [&](uint64_t v) {
+    while (v > 0x7F) { body[pos++] = (uint8_t)((v & 0x7F) | 0x80); v >>= 7; }
+    body[pos++] = (uint8_t)v;
+  };
+
+  for (int i = 0; i < n; i++) {
+    String mac = WiFi.BSSIDstr(i);  // "aa:bb:cc:dd:ee:ff"
+    int32_t rssi = WiFi.RSSI(i);
+
+    // Build inner WifiAP sub-message
+    uint8_t ap[64]; int ap_pos = 0;
+    // field 1 = bssid (wire type 2 = length-delimited string)
+    ap[ap_pos++] = 0x0a;
+    ap[ap_pos++] = (uint8_t)mac.length();
+    memcpy(ap + ap_pos, mac.c_str(), mac.length()); ap_pos += mac.length();
+    // field 3 = rssi (wire type 0 = varint, negative encoded as 64-bit two's complement)
+    ap[ap_pos++] = 0x18;
+    uint64_t v = (uint64_t)(int64_t)rssi;
+    do {
+      ap[ap_pos++] = (uint8_t)((v & 0x7F) | (v > 0x7F ? 0x80 : 0));
+      v >>= 7;
+    } while (v);
+
+    // Wrap in outer field 13 (wire type 2)
+    writeVarint((13 << 3) | 2);
+    writeVarint(ap_pos);
+    memcpy(body + pos, ap, ap_pos); pos += ap_pos;
+  }
+  WiFi.scanDelete();
+
+  // WiFi.scanNetworks() temporarily disconnects from the AP while scanning channels.
+  // Wait for the driver to reassociate before making an HTTPS request.
+  {
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 5000) delay(100);
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("bssid-geo: WiFi lost after scan");
+      return false;
+    }
+  }
+
+  // 3. POST to Apple BSSID geo API
+  WiFiClientSecure appleClient;
+  appleClient.setInsecure();
+  HTTPClient http;
+  http.begin(appleClient, "https://gs-loc.apple.com/clls/wloc");
+  http.setTimeout(6000);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int code = http.POST(body, pos);
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("bssid-geo: HTTP-%d\n", code);
+    http.end();
+    return false;
+  }
+
+  // 4. Read response
+  WiFiClient* stream = http.getStreamPtr();
+  int rlen = http.getSize();
+  if (rlen <= 0 || rlen > 128) { http.end(); return false; }
+  uint8_t resp[128]; int ri = 0;
+  unsigned long t0 = millis();
+  while (ri < rlen && millis() - t0 < 3000) {
+    if (stream->available()) resp[ri++] = stream->read();
+  }
+  http.end();
+
+  // 5. Parse protobuf response
+  // Schema: field1 = Location { field1=lat sint64 ×1e-8, field2=lon sint64 ×1e-8 }
+  auto readVarint = [&](int& p) -> uint64_t {
+    uint64_t result = 0; int shift = 0;
+    while (p < ri) {
+      uint8_t b = resp[p++];
+      result |= (uint64_t)(b & 0x7F) << shift;
+      if (!(b & 0x80)) break;
+      shift += 7;
+    }
+    return result;
+  };
+  auto zigzag = [](uint64_t n) -> int64_t { return (int64_t)((n >> 1) ^ -(n & 1)); };
+
+  float lat = 0, lon = 0; bool gotLat = false, gotLon = false;
+  for (int p = 0; p < ri; ) {
+    uint64_t tag = readVarint(p);
+    int field = (int)(tag >> 3), wtype = (int)(tag & 7);
+    if (field == 1 && wtype == 2) {        // outer Location message
+      int mlen = (int)readVarint(p);
+      int mend = p + mlen;
+      while (p < mend) {
+        uint64_t itag = readVarint(p);
+        int ifield = (int)(itag >> 3), iwtype = (int)(itag & 7);
+        if ((ifield == 1 || ifield == 2) && iwtype == 0) {
+          float deg = (float)(zigzag(readVarint(p)) * 1e-8);
+          if (ifield == 1) { lat = deg; gotLat = true; }
+          else             { lon = deg; gotLon = true; }
+        } else if (iwtype == 0) { readVarint(p); }
+        else break;
+      }
+      p = mend;
+    } else if (wtype == 0) { readVarint(p); }
+    else if (wtype == 2)   { int l = (int)readVarint(p); p += l; }
+    else break;
+  }
+
+  if (!gotLat || !gotLon || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
+    Serial.println("bssid-geo: parse fail");
+    return false;
+  }
+  *outLat = lat; *outLon = lon;
+  Serial.printf("bssid-geo: lat=%ld lon=%ld\n",
+                (long)(lat * 10000), (long)(lon * 10000));
+  return true;
+}
+
 static void refreshDisplayLocationTimeFromIpInfo() {
   if (WiFi.status() != WL_CONNECTED) return;
 
+  // Always call ipapi.co for timezone offset and location label strings.
+  // Use its lat/lon only if both Starlink GPS and BSSID geo fail.
+  WiFiClientSecure secClient;
+  secClient.setInsecure();
   HTTPClient http;
-  WiFiClient client;
-  const char* url =
-    "http://ip-api.com/json/?fields=status,offset,city,region,regionName,countryCode,country,timezone,lat,lon";
-  if (!http.begin(client, url)) {
+  const char* url = "https://ipapi.co/json/";
+  if (!http.begin(secClient, url)) {
     Serial.println("IP info: begin failed");
     return;
   }
@@ -9079,29 +9385,47 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   }
   String body = http.getString();
   http.end();
-  if (body.indexOf("\"status\":\"success\"") < 0) {
-    Serial.println("IP info: status not success");
-    return;
-  }
 
+  // ipapi.co returns utc_offset as a string e.g. "+0500" or "-0400"
+  char utcOffsetStr[8] = {};
   int32_t offsetSec = 0;
-  if (!jsonExtractIntField(body, "\"offset\"", &offsetSec)) {
-    Serial.println("IP info: missing offset");
+  if (jsonExtractStringField(body, "\"utc_offset\"", utcOffsetStr, sizeof(utcOffsetStr))
+      && utcOffsetStr[0]) {
+    const char* p = utcOffsetStr;
+    int sign = 1;
+    if (*p == '+') { p++; }
+    else if (*p == '-') { sign = -1; p++; }
+    int hours = 0, mins = 0;
+    if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9') {
+      hours = (p[0] - '0') * 10 + (p[1] - '0'); p += 2;
+    }
+    if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9') {
+      mins = (p[0] - '0') * 10 + (p[1] - '0');
+    }
+    offsetSec = sign * (hours * 3600 + mins * 60);
+    s_displayUtcOffsetSec = offsetSec;
+    s_displayUtcOffsetValid = true;
+    saveUtcOffsetToNvs(offsetSec);
+  } else {
+    Serial.println("IP info: missing utc_offset");
     return;
   }
-  s_displayUtcOffsetSec = offsetSec;
-  s_displayUtcOffsetValid = true;
 
+  // --- Determine lat/lon: Starlink GPS → BSSID scan → ipapi.co fallback ---
   float lat = 0.0f, lon = 0.0f;
-  if (jsonExtractFloatField(body, "\"lat\"", &lat) &&
-      jsonExtractFloatField(body, "\"lon\"", &lon) &&
-      lat >= -90.0f && lat <= 90.0f &&
-      lon >= -180.0f && lon <= 180.0f) {
+  bool gotGeo = starlinkGeoLocate(&lat, &lon);
+  if (!gotGeo) gotGeo = bssidGeoLocate(&lat, &lon);
+  if (!gotGeo) {
+    gotGeo = jsonExtractFloatField(body, "\"latitude\"", &lat) &&
+             jsonExtractFloatField(body, "\"longitude\"", &lon) &&
+             lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
+    if (gotGeo) Serial.println("geo: fell back to ipapi.co lat/lon");
+  }
+
+  if (gotGeo) {
     float stableLat = roundf(lat * 100.0f) * 0.01f;
     float stableLon = roundf(lon * 100.0f) * 0.01f;
-    // IP geolocation on the same connection can drift by several kilometers.
-    // Do not invalidate the full weather cache unless the center moved enough
-    // to matter for this wide-area view.
+    // Suppress cache invalidation for small drifts (BSSID geo is accurate to tens of metres).
     if (s_weatherGeoValid) {
       float dLat = fabsf(stableLat - s_weatherCenterLat);
       float dLon = fabsf(normalizeLon180(stableLon - s_weatherCenterLon));
@@ -9120,10 +9444,11 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   }
 
   // Compact "STATE, CC" label for internal use.
+  // ipapi.co: region_code = short region code, country_code = 2-letter country
   char region[12] = {};
   char countryCode[8] = {};
-  bool haveRegion = jsonExtractStringField(body, "\"region\"", region, sizeof(region)) && region[0];
-  bool haveCountry = jsonExtractStringField(body, "\"countryCode\"", countryCode, sizeof(countryCode)) && countryCode[0];
+  bool haveRegion = jsonExtractStringField(body, "\"region_code\"", region, sizeof(region)) && region[0];
+  bool haveCountry = jsonExtractStringField(body, "\"country_code\"", countryCode, sizeof(countryCode)) && countryCode[0];
   if (haveRegion && haveCountry) {
     snprintf(s_displayLocationLabel, sizeof(s_displayLocationLabel), "%s, %s", region, countryCode);
   } else if (haveCountry) {
@@ -9133,10 +9458,11 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   }
 
   // Full "Region Name, Country" label for display.
+  // ipapi.co: region = full region name, country_name = full country name
   char regionName[40] = {};
   char countryFull[40] = {};
-  bool haveRegionName = jsonExtractStringField(body, "\"regionName\"", regionName, sizeof(regionName)) && regionName[0];
-  bool haveCountryFull = jsonExtractStringField(body, "\"country\"", countryFull, sizeof(countryFull)) && countryFull[0];
+  bool haveRegionName = jsonExtractStringField(body, "\"region\"", regionName, sizeof(regionName)) && regionName[0];
+  bool haveCountryFull = jsonExtractStringField(body, "\"country_name\"", countryFull, sizeof(countryFull)) && countryFull[0];
   if (haveRegionName && haveCountryFull) {
     snprintf(s_displayLocationFull, sizeof(s_displayLocationFull), "%s, %s", regionName, countryFull);
   } else if (haveCountryFull) {

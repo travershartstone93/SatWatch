@@ -29,9 +29,9 @@
 // =============================================================
 //  Display local time (set for installation location)
 // =============================================================
-// POSIX TZ string (BVI = Atlantic Standard Time, UTC-4 year-round)
+// POSIX TZ string — overridden at runtime by user location
 #define DISPLAY_TZ_POSIX    "AST4"
-#define DISPLAY_TZ_LABEL    "BVI"
+#define DISPLAY_TZ_LABEL    ""
 
 // =============================================================
 //  Deep sleep
