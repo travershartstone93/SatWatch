@@ -368,6 +368,7 @@ static bool spriteReady = false;
 static bool s_clockFxSpriteReady = false;
 static bool s_barSpriteReady = false;
 static bool s_mainSpritePixelsByteSwapped = false;
+static bool s_barSpritePixelsByteSwapped = false;
 static int  s_clockFxSpriteW = 0;
 static int  s_clockFxSpriteH = 0;
 static bool s_clockFxSpritePixelsByteSwapped = false;
@@ -562,6 +563,7 @@ struct ClockOverlayLayout {
 };
 static void showMessage(const char* line1, const char* line2);
 static void serviceWifiPortalServer();
+static bool connectWifiForSync(bool required, const char* statusLine);
 static bool playStartCueIfEnabled();
 #if BOARD_IS_AMOLED_206
 static void ensureAudioCueWorker();
@@ -1465,7 +1467,7 @@ static void showWifiPortalJoinInfo(bool canSkip = false) {
     s_amoledOut->print(".local");
     if (canSkip) {
       y += 54;
-      s_amoledOut->setTextSize(3);
+      s_amoledOut->setTextSize(2);
       s_amoledOut->setTextColor(0xFD20, 0x0000);  // amber
       s_amoledOut->setCursor(8, y);
       s_amoledOut->print("Tap to play saved frames");
@@ -1505,27 +1507,38 @@ static void showWifiPortalJoinInfo(bool canSkip = false) {
 
 static void runWifiConfigPortal(bool canSkip = false) {
   loadWifiPortalConfig();
+  if (canSkip) pinMode(38, INPUT_PULLUP);  // TP_INT — active-low touch interrupt
 
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_AP);
-  delay(100);
+  const uint32_t kRetryIntervalMs = 60000UL;  // re-scan for known networks every 60 s
 
-  startWifiPortalServer(true);
-  showWifiPortalJoinInfo(canSkip);
-  if (canSkip) {
-    // Dismissible: tap screen or press button to play cached frames.
-    // Uses a direct poll loop (not delay()) to intercept PKEY as "skip" rather than "restart".
-    pinMode(38, INPUT_PULLUP);  // TP_INT — active-low touch interrupt
+  for (;;) {
+    // (Re)start AP + portal — done on first entry and after every failed retry
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_AP);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    startWifiPortalServer(true);
+    showWifiPortalJoinInfo(canSkip);
+
+    uint32_t retryAt = millis() + kRetryIntervalMs;
     for (;;) {
       serviceWifiPortalServer();
-      if (pollPortalSkip()) return;
+      if (canSkip) {
+        if (pollPortalSkip()) return;  // user dismissed → play cached frames
+      } else {
+        serviceUserButtons();  // keeps PKEY → restart working in must-configure case
+      }
+      if ((int32_t)(millis() - retryAt) >= 0) break;
       vTaskDelay(pdMS_TO_TICKS(50));
     }
-  } else {
-    for (;;) {
-      serviceWifiPortalServer();
-      delay(2);  // portalFriendlyDelay: PKEY → restart in no-frames case
+
+    // Retry all known SSIDs (tears down AP temporarily)
+    appendDiagLog("portal: wifi-retry\n");
+    if (connectWifiForSync(false, "Retrying WiFi...")) {
+      // Connected — reboot so setup() runs the full sync path cleanly
+      appendDiagLog("portal: wifi-retry ok -> restart\n");
+      ESP.restart();
     }
+    // Still no WiFi — outer loop restarts AP + portal and waits again
   }
 }
 
@@ -2488,7 +2501,7 @@ static void drawBatteryIcon(LGFX_Sprite& spr, int x, int y, int w, int h, int pc
     spr.fillRect(innerX, innerY, innerW, innerH, TFT_BLACK);
 
     // Full interior fill so state is readable even with no glyph.
-    uint32_t fillColor = (pct >= 50) ? TFT_GREEN : (pct >= 20) ? TFT_YELLOW : TFT_RED;
+    uint16_t fillColor = (pct >= 50) ? TFT_GREEN : (pct >= 20) ? TFT_YELLOW : TFT_RED;
     if (fillW > 0) spr.fillRect(innerX, innerY, fillW, innerH, fillColor);
 
     uint8_t status2 = (chargeState >= 0) ? (uint8_t)chargeState : 0xFF;
@@ -2540,10 +2553,22 @@ static void drawBatteryIcon(LGFX_Sprite& spr, int x, int y, int w, int h, int pc
 }
 
 #if BOARD_IS_AMOLED_206
+// Copy s_barSprite pixel buffer to dst, byte-swapping if the sprite stores pixels
+// in swapped format. Mirrors the same correction done in copyClockFxSpriteToMainSprite()
+// so non-symmetric colors (TFT_GREEN, TFT_YELLOW, gray) appear correctly in the frame.
+static void copyBarSpriteToBuffer(uint16_t* dst, size_t npixels) {
+  const uint16_t* src = (const uint16_t*)s_barSprite.getBuffer();
+  if (s_barSpritePixelsByteSwapped) {
+    for (size_t i = 0; i < npixels; i++) dst[i] = __builtin_bswap16(src[i]);
+  } else {
+    memcpy(dst, src, npixels * 2U);
+  }
+}
+
 // Render timestamp bar text directly at display resolution.
 // Top rows use SCALED_TOP_ROW_H; bottom row uses SCALED_BAR_H.
 // into s_topBarBuf / s_botBarBuf. Avoids the 2× vertical upscale that makes bitmap
-// fonts look chunky/blocky. Colors are black+white so no byte-swap probe needed.
+// fonts look chunky/blocky.
 static void renderBarsAtScaledRes(int frameIdx) {
   if (!s_topBarBuf || !s_botBarBuf) return;
   if (frameIdx >= frameCount || !s_timesLoaded) return;
@@ -2556,6 +2581,15 @@ static void renderBarsAtScaledRes(int frameIdx) {
     s_barSprite.setPsram(psramFound());
 #endif
     s_barSpriteReady = (bool)s_barSprite.createSprite(SCALED_W, SCALED_BAR_SPRITE_H);
+    if (s_barSpriteReady) {
+      uint16_t* barProbe = (uint16_t*)s_barSprite.getBuffer();
+      if (barProbe) {
+        s_barSprite.fillScreen(0);
+        s_barSprite.drawPixel(0, 0, 0xF800);  // pure red in RGB565
+        s_barSpritePixelsByteSwapped = (barProbe[0] == 0x00F8);
+        s_barSprite.fillScreen(0);
+      }
+    }
   }
   if (!s_barSpriteReady) return;
 
@@ -2667,7 +2701,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
     int wifiIconW = max(32, (wifiIconH * 8) / 5);
     int wifiIconX = 6;
     int wifiIconY = (SCALED_TOP_ROW_H - wifiIconH) / 2;
-    bool wifiConnectedNow = s_wifiSyncInProgress && (WiFi.status() == WL_CONNECTED);
+    bool wifiConnectedNow = (s_wifiRssi < 0);  // show bars whenever we have a valid RSSI from last sync
     drawWifiIndicator(s_barSprite, wifiIconX, wifiIconY, wifiIconW, wifiIconH, (int)s_wifiRssi, wifiConnectedNow);
 
     const int wifiTextX = wifiIconX + wifiIconW + 8;
@@ -2702,7 +2736,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
     }
   }
   // Copy battery row to s_topBarBuf[0 .. SCALED_TOP_ROW_H-1]
-  memcpy(s_topBarBuf, s_barSprite.getBuffer(), (size_t)SCALED_W * SCALED_TOP_ROW_H * 2U);
+  copyBarSpriteToBuffer(s_topBarBuf, (size_t)SCALED_W * SCALED_TOP_ROW_H);
   s_barSprite.setTextColor(TFT_WHITE);
   s_barSprite.setTextWrap(false);
   s_barSprite.setTextSize(ts);
@@ -2717,8 +2751,8 @@ static void renderBarsAtScaledRes(int frameIdx) {
     s_barSprite.print(topBuf);
   }
   // Copy date/time row to s_topBarBuf[SCALED_TOP_ROW_H .. 2*SCALED_TOP_ROW_H-1]
-  memcpy(s_topBarBuf + (size_t)SCALED_W * SCALED_TOP_ROW_H, s_barSprite.getBuffer(),
-         (size_t)SCALED_W * SCALED_TOP_ROW_H * 2U);
+  copyBarSpriteToBuffer(s_topBarBuf + (size_t)SCALED_W * SCALED_TOP_ROW_H,
+                        (size_t)SCALED_W * SCALED_TOP_ROW_H);
 
   // Bottom bar: location upper line, radar lower line.
   s_barSprite.fillScreen(0x0000);
@@ -2758,7 +2792,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
     s_barSprite.setCursor(radarX, radarY);
     s_barSprite.print(radarBuf);
   }
-  memcpy(s_botBarBuf, s_barSprite.getBuffer(), (size_t)SCALED_W * SCALED_BAR_H * 2U);
+  copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
 }
 #endif  // BOARD_IS_AMOLED_206
 
@@ -4484,6 +4518,12 @@ static void buildRawPlaybackCache() {
       sf.seek(offset); sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
       continue;
     }
+    if (spriteLooksBottomBandJunkCorrupted()) {
+      Serial.printf("raw skip %d botband\n", i);
+      memset(s_frameDisplayBuf, 0, SCALED_FRAME_BYTES);
+      sf.seek(offset); sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+      continue;
+    }
     char framePath[32];
     makeFramePath('f', i, framePath, sizeof(framePath));
     if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW")) {
@@ -4760,6 +4800,11 @@ static bool rebuildRawPlaybackCacheRolling(const int* sourceIdxForSlot,
       writeZeroStreamSlot(newSf, offset);
       continue;
     }
+    if (spriteLooksBottomBandJunkCorrupted()) {
+      Serial.printf("raw roll skip %d botband\n", i);
+      writeZeroStreamSlot(newSf, offset);
+      continue;
+    }
     if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW-ROLL")) {
       Serial.printf("raw roll skip %d size\n", i);
       writeZeroStreamSlot(newSf, offset);
@@ -4937,6 +4982,10 @@ static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
       Serial.printf("raw remap skip %d cyan\n", i);
       continue;
     }
+    if (spriteLooksBottomBandJunkCorrupted()) {
+      Serial.printf("raw remap skip %d botband\n", i);
+      continue;
+    }
     char framePath[32];
     makeFramePath('f', i, framePath, sizeof(framePath));
     if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW-REMAP")) {
@@ -5093,6 +5142,10 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
     if (label) Serial.printf("%s SLAB-CORR\n", label);
     return false;
   }
+  if (spriteLooksBottomBandJunkCorrupted()) {
+    if (label) Serial.printf("%s BOTBAND-CORR\n", label);
+    return false;
+  }
   return true;
 }
 
@@ -5238,6 +5291,10 @@ static bool validateStoredWeatherFramePath(const char* path, const char* label) 
   }
   if (spriteLooksBlackSlabCorrupted()) {
     if (label) Serial.printf("%s STORED-SLAB\n", label);
+    return false;
+  }
+  if (spriteLooksBottomBandJunkCorrupted()) {
+    if (label) Serial.printf("%s STORED-BOTBAND\n", label);
     return false;
   }
   return true;
@@ -8892,7 +8949,38 @@ static bool spriteLooksHoldFrameBlockCorrupted() {
 }
 
 static bool spriteLooksBottomBandJunkCorrupted() {
-  return false;
+  const uint16_t* px = (const uint16_t*)sprite.getBuffer();
+  if (!px) return false;
+
+  // Scan the bottom third for alternating dark/noise MCU rows.
+  const int startY = DISP_H * 2 / 3;
+  const int MCU    = 8;
+  const int stepX  = 4;
+  int numMcuRows   = (DISP_H - startY) / MCU;
+  if (numMcuRows < 4) return false;
+
+  int transitions = 0;
+  int prevCls     = -1;   // -1=none, 0=dark(>65% zero), 1=light(<30% zero)
+
+  for (int mr = 0; mr < numMcuRows; mr++) {
+    int y0 = startY + mr * MCU;
+    int y1 = (y0 + MCU < DISP_H) ? (y0 + MCU) : DISP_H;
+    int zeros = 0, total = 0;
+    for (int y = y0; y < y1; y++) {
+      int row = y * DISP_W;
+      for (int x = 0; x < DISP_W; x += stepX) {
+        total++;
+        if (px[row + x] == 0) zeros++;
+      }
+    }
+    if (total == 0) continue;
+    int zeroPct = zeros * 100 / total;
+    int cls = (zeroPct > 65) ? 0 : (zeroPct < 30) ? 1 : -1;
+    if (cls < 0) continue;
+    if (prevCls >= 0 && cls != prevCls) transitions++;
+    prevCls = cls;
+  }
+  return (transitions >= 3);
 }
 
 static bool spriteLooksBlackSlabCorrupted() {
