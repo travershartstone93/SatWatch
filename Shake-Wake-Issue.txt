@@ -141,3 +141,90 @@ WoM example:     .../SensorLib/examples/QMI8658_WakeOnMotion/QMI8658_WakeOnMotio
 Board pins:      /home/whisper/.arduino15/packages/esp32/hardware/esp32/3.3.7/variants/
                    waveshare_esp32_s3_touch_amoled_206/pins_arduino.h
 Schematic dir:   /home/whisper/Desktop/LiveSat/ESP32-S3-Touch-AMOLED-2.06/Schematic/
+
+
+ROOT CAUSE ANALYSIS — 2026-03-08
+==================================
+
+FINDING: GPIO21 is shared between AMOLED_PWR_EN and QMI8658_INT1
+------------------------------------------------------------------
+pins_arduino.h defines:
+  #define AMOLED_PWR_EN  21   (line 31)
+  #define QMI8658_INT1   21   (line 51)
+
+Both macros resolve to the same physical pin.
+
+The firmware drives GPIO21 as OUTPUT HIGH at display initialization
+(LGFX::init(), esp32-LiveSat-s3.ino line 322-323):
+  pinMode(LCD_PWR, OUTPUT);
+  digitalWrite(LCD_PWR, HIGH);
+
+This pin state is never changed before entering light sleep.
+
+
+WHY THE CURRENT CODE CANNOT WORK
+----------------------------------
+configWakeOnMotion() calls enableINT(INTERRUPT_PIN_1) at line 1425 of
+SensorQMI8658.hpp, which sets CTRL1.bit3 = 1. Per the QMI8658 datasheet,
+CTRL1.bit3 = 1 puts INT1 into push-pull output mode (not open-drain).
+
+In push-pull mode, QMI8658 actively drives GPIO21 HIGH or LOW.
+But the ESP32 is simultaneously driving GPIO21 HIGH as an output.
+
+Result: two push-pull drivers fighting on the same pin. The QMI8658
+cannot toggle the line; the ESP32 holds it HIGH regardless.
+
+Additionally, the sleep-arming code reads:
+  int int1Level = digitalRead(QMI8658_INT1);  // line 8384
+
+digitalRead() on an OUTPUT pin reads the ESP32's own output register,
+not the actual pin state. It will always return the value the ESP32 last
+wrote (HIGH in this case), regardless of what QMI8658 is driving.
+The toggle logic is therefore operating on stale/wrong data.
+
+This explains:
+- "INT1 confirmed LOW" in older logs: likely reflects a moment when the
+  pin mode was different or QMI8658 was winning the bus contention.
+- Shake never wakes: QMI8658 interrupt has no effect on an actively
+  driven output pin.
+- All threshold/polarity/defaultPinValue retries failed: the failure
+  is at the electrical/GPIO-mode level, not the configuration level.
+
+Note: The CTRL9 ACK handshake concern (hypothesis A in previous section)
+is not the root cause. SensorLib does perform a proper CTRL9 done/ACK
+handshake at SensorQMI8658.hpp line 1941 (writeCommand implementation).
+ret==0 from configWakeOnMotion() is a reliable success indicator.
+
+
+SHAKE-TO-WAKE IS STILL POSSIBLE — required fix
+------------------------------------------------
+The fix is purely software. No hardware modification needed.
+
+Before entering light sleep:
+  1. Reconfigure GPIO21 as input:
+       gpio_reset_pin((gpio_num_t)QMI8658_INT1);
+       pinMode(QMI8658_INT1, INPUT_PULLUP);
+     This releases AMOLED_PWR_EN (acceptable — display is off during sleep).
+     QMI8658 push-pull output can now freely drive GPIO21.
+
+  2. Read the actual pin level — now valid because the ESP32 is no longer
+     driving the pin:
+       int int1Level = digitalRead(QMI8658_INT1);
+
+  3. Arm the opposite level as before (toggle strategy is correct):
+       gpio_wakeup_enable((gpio_num_t)QMI8658_INT1,
+           int1Level == LOW ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL);
+
+After waking from light sleep:
+  4. Restore display power:
+       pinMode(LCD_PWR, OUTPUT);
+       digitalWrite(LCD_PWR, HIGH);
+       delay(50);
+
+  5. Reinitialize the AMOLED driver (display loses state when power drops):
+       display.init();   // or equivalent lgfx re-init call
+
+Open question: How much time does AMOLED re-init add to wake latency,
+and does the display hold its register state across a brief power drop?
+This determines whether a full init() call is needed or a lighter
+"resume" sequence suffices. Needs testing.

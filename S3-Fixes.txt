@@ -66,6 +66,66 @@ Fix applied:
     dec-fail: <path> not-full   (decoded area didn't cover full frame)
 
 
+FIX 3 — Internally-corrupt JPEGs accumulating across rolling boots
+-------------------------------------------------------------------
+Symptom:
+  After a clean cache download (dec=0), corruption returned within a few
+  rolling boots: raw-build: built=77/142 dec=59 sb=0 wr=0 vr=0 fill=65.
+  All 59 failures were dec-fail: /frames/fNNN.jpg decode — the JPEG decoder
+  rejected the file contents. 65 slots were gap-filled with cloned neighbors,
+  causing visible stuck/duplicate frames in the animation.
+
+Root cause:
+  cachedFrameLooksReusable() (Fix 1B) checks SOI/EOI markers and minimum
+  size. Files with internally-corrupt JPEG data (bad Huffman tables, truncated
+  MCU stream, etc.) pass the structural check but fail the JPEG decoder during
+  raw-build. These files were retained on SD indefinitely — reused every boot,
+  gap-filled every raw-build, never evicted.
+
+  Additionally, once the raw stream was written with gap-filled slots and the
+  raw cache meta marked "current," subsequent boots took the fast path
+  (partial-window-current raw=1) or remap path (raw-remap), neither of which
+  triggered a full buildRawPlaybackCache(). The gap-filled slots were
+  permanently baked into the raw stream with no mechanism to force a rebuild.
+
+Fix applied:
+  esp32-LiveSat-s3.ino — buildRawPlaybackCache(), in the decode-failure branch:
+    char badPath[32];
+    makeFramePath('f', i, badPath, sizeof(badPath));
+    SD.remove(badPath);
+    appendDiagLog("raw-del: f%03d\n", i);
+  When the JPEG decoder rejects a cached frame during raw-build, the source
+  file is immediately deleted from SD. Next boot, cachedFrameLooksReusable()
+  sees the file is missing -> reuse-invalid -> rolling sync redownloads it.
+
+  esp32-LiveSat-s3.ino — buildRawPlaybackCache(), after meta write:
+    if (decFail > 0 && s_rawMetaVersionCurrent) {
+      SD.remove(RAW_CACHE_META_FILE);
+      s_rawMetaVersionCurrent = false;
+      appendDiagLog("raw-meta: invalidated dec=%d redownload-next-boot\n", decFail);
+    }
+  When any frames were deleted, the raw cache meta is also invalidated. This
+  prevents the fast path / remap path from reusing the gap-filled raw stream
+  next boot, and forces a full buildRawPlaybackCache() after rolling sync has
+  redownloaded the missing slots.
+
+Verification:
+  After clearing the frame cache and flashing:
+  Boot 1: raw-del: fNNN lines for each previously-corrupt frame. Raw-build
+    still shows dec=N and gap-fills, but deletes the source files and
+    invalidates raw meta (raw-meta: invalidated dec=N).
+  Boot 2: Rolling sync sees missing slots as reuse-invalid -> redownloads.
+    Full raw-build runs on fresh frames -> dec=0 fill=0.
+  Animation running clean after boot 2.
+
+Note — remaining gap in remap path:
+  The remap path (remapRawPlaybackCacheRolling) and rolling rebuild path
+  (rebuildRawPlaybackCacheRolling) have the same decode-failure handling
+  but do NOT yet include the SD.remove + meta invalidation. If corruption
+  enters through those paths, a full cache clear may still be needed to
+  recover. Adding the same fix to both rolling functions is a future task.
+
+
 RELATED INVESTIGATION
 ---------------------
 The investigation that led to these fixes also identified structural issues

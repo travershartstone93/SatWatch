@@ -4677,6 +4677,10 @@ static void buildRawPlaybackCache() {
     if (!decodeJpegFrameToSprite(i, false)) {
       Serial.printf("raw skip %d dec\n", i);
       decFail++;
+      char badPath[32];
+      makeFramePath('f', i, badPath, sizeof(badPath));
+      SD.remove(badPath);
+      appendDiagLog("raw-del: f%03d\n", i);
       memset(s_frameDisplayBuf, 0, SCALED_FRAME_BYTES);
       sf.seek(offset); sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
       continue;
@@ -4796,6 +4800,13 @@ static void buildRawPlaybackCache() {
   s_rawMetaVersionCurrent = (metaOk && validNow > 0);
   if (!s_rawMetaVersionCurrent) {
     SD.remove(RAW_CACHE_META_FILE);
+  }
+  // If any frames were decode-failed and deleted this build, invalidate the raw meta
+  // so the next boot forces a fresh raw-build after rolling sync redownloads the slots.
+  if (decFail > 0 && s_rawMetaVersionCurrent) {
+    SD.remove(RAW_CACHE_META_FILE);
+    s_rawMetaVersionCurrent = false;
+    appendDiagLog("raw-meta: invalidated dec=%d redownload-next-boot\n", decFail);
   }
 
   // Keep filtered zoom raws aligned with the current decode/corruption guards.
