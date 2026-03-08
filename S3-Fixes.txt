@@ -126,6 +126,66 @@ Note — remaining gap in remap path:
   recover. Adding the same fix to both rolling functions is a future task.
 
 
+FIX 4 — Boot loop caused by aggressive raw meta invalidation
+-------------------------------------------------------------
+Symptom:
+  Device entered infinite boot loop stuck at "building" screen. Every boot ran
+  buildRawPlaybackCache(), built=0 or built=83 with decFail > 0, immediately
+  invalidated the raw meta, which forced another full raw-build next boot.
+  Rolling sync never got to redownload missing frames because the device never
+  reached a stable state with current raw meta.
+
+  Separately: the remap path (remapRawPlaybackCacheRolling) copied old stream
+  slots by validity map without checking whether the source fNNN.jpg still
+  existed. Deleted+redownloaded frames had their old gap-fill data copied from
+  the previous raw stream instead of the fresh file being decoded.
+
+Root cause:
+  Fix 3 added meta invalidation on decFail > 0. This created a loop:
+    1. buildRawPlaybackCache: 59 files no-file, 83 decode fine.
+       built=83, gap-fill covers 59, validNow > 0 → meta written as current.
+    2. Meta invalidation fires: decFail=59 → meta removed,
+       s_rawMetaVersionCurrent=false.
+    3. Next boot: raw=0 → buildRawPlaybackCache again → same 59 no-file →
+       decFail=59 → invalidates again. Repeat forever.
+  The file deletion alone (Fix 3) is the correct eviction mechanism. Rolling
+  sync redownloads the missing slots via the reuse-invalid path, but only if
+  the raw meta is current so rolling sync runs before any rebuild is triggered.
+
+Fix applied:
+  A. esp32-LiveSat-s3.ino — buildRawPlaybackCache(), lines ~4804-4810:
+     Removed the entire meta invalidation block:
+       if (decFail > 0 && s_rawMetaVersionCurrent) {
+         SD.remove(RAW_CACHE_META_FILE);
+         s_rawMetaVersionCurrent = false;
+         appendDiagLog("raw-meta: invalidated ...");
+       }
+     Raw meta now stays current after a raw-build with some failures. Next boot
+     takes the fast/remap path. Rolling sync runs normally and redownloads
+     missing fNNN.jpg files via the existing reuse-invalid mechanism.
+
+  B. esp32-LiveSat-s3.ino — remapRawPlaybackCacheRolling(), remap copy loop
+     (~line 5128):
+     Added file-existence check before copying a slot from the old stream:
+       if (!frameFileExists(i, 'f')) continue;
+     Slots whose source fNNN.jpg was deleted fall through to the decode pass
+     instead of being copied from the gap-filled raw stream. Rolling sync
+     redownloads them before remap runs; remap then decodes the fresh file
+     directly, replacing gap-fills with real frames in a single remap cycle.
+
+Verification:
+  Boot 1 after flash (SD cleared, fresh state):
+    raw-remap: reuse=118 build=23 dec=0 sb=0 wr=0 fill=1
+    downloaded=24, anim-start reached, animation running.
+  Subsequent rolling boots stable. No "raw-meta: invalidated" lines.
+  valid=142 fc=142 across all loop iterations.
+
+Note:
+  The SD card showed vld: MISS BLOCK-CORR on both the broken and fixed boots.
+  This line predates these fixes and is unrelated to the cache loop. Origin
+  not yet identified.
+
+
 RELATED INVESTIGATION
 ---------------------
 The investigation that led to these fixes also identified structural issues

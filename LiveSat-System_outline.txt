@@ -143,7 +143,11 @@ coverage is temporarily partial.
 4.8 Download validation and install contract
 - Each downloaded weather frame is validated before install:
   - HTTP/body/JPEG integrity checks,
-  - decode viability checks.
+  - decode viability checks,
+  - structural pixel anomaly checks including black-slab detection.
+- Timestamp offset retry: `downloadFrames()` tries up to 7 offsets
+  `{0, -60, 60, -120, 120, -180, 180}` seconds when any validation step rejects
+  a frame, covering ±3 minutes around the target timestamp.
 - Missing-slot downloads can also probe nearby cadence timestamps (`0, ±1, ±2, ±3`)
   to recover around source-side placeholder slots.
 - Minimum weather JPEG byte floor is enforced before install to reject known tiny
@@ -285,7 +289,10 @@ has multiple gates by design so a single weak check does not poison playback.
   - `spriteLooksCyanWhiteBlockCorrupted()`:
     cyan/white tiled artifact detector for known corruption mode.
   - `spriteLooksBlackSlabCorrupted()`:
-    dark slab cluster detector used in zoom/hold paths.
+    dark slab cluster detector. Called during download validation
+    (`validateBufferedWeatherFrameJpeg`, `validateStoredWeatherFramePath`) AND
+    at playback time in freeze-frame checks. Detects partially-composited GIBS
+    frames with missing tile regions (black rectangles in corners/edges).
 - Any hard failure at this layer rejects frame install/promote.
 
 8.4 Atomic install gate (disk write correctness)
@@ -378,8 +385,16 @@ has multiple gates by design so a single weak check does not poison playback.
   - Password: `123456789`
 - If normal WiFi cannot connect with internet, device enters captive AP portal mode
   and displays join instructions on-screen.
+- Auto-retry loop: while the connection guide is displayed, `runWifiConfigPortal()`
+  retries `connectWifiForSync()` every 60 seconds automatically. On success it calls
+  `ESP.restart()` to re-enter normal boot/sync flow. On failure it restores AP mode
+  and continues showing the guide.
+- Tap-to-skip: when cached frames exist, GPIO 38 (TP_INT, active-low) or AXP2101
+  PKEY short press (reg 0x49 bit 2) dismisses the portal and plays cached animation
+  without network. Guide shows amber "Tap to play saved frames" prompt in this case.
 - When normal WiFi is connected, the portal server still runs and remains reachable
-  on LAN (`satwatch.local` + local IP endpoint).
+  on LAN (`satwatch.local` + local IP endpoint). AP is NOT broadcast in STA-connected
+  mode; `disconnectWifiAfterSync()` uses `startWifiPortalServer(false)`.
 - AP+DNS captive redirect is enabled only in AP mode; in STA-connected mode, portal
   is plain HTTP server + mDNS.
 
@@ -454,6 +469,38 @@ has multiple gates by design so a single weak check does not poison playback.
   - `post-sync:` is end-of-sync state committed to runtime.
 - Important: frame count drift across cycles is expected if source window has holes
   and validators reject bad payloads; this is not automatically a logic fault.
+
+
+15) Clock and Time Sources
+--------------------------
+15.1 Primary source: NTP
+- `syncClockFromNtpBestEffort()` queries `pool.ntp.org` + `time.nist.gov`.
+- On success, sets system time via `settimeofday()` and writes to PCF85063A RTC.
+
+15.2 Hardware RTC: PCF85063A
+- I2C address 0x51 (confirmed in board variant `pins_arduino.h`: `RTC_ADDRESS 0x51`).
+- Shares I2C bus with touch IC and IMU (SDA=GPIO15, SCL=GPIO14).
+- `writePcf85063(time_t)`: halts oscillator, writes BCD time to regs 0x02–0x08,
+  resumes oscillator. Called after every successful NTP sync.
+- `readPcf85063(time_t*)`: reads 7 bytes, checks OS (oscillator-stop) flag.
+  If valid, reconstructs Unix epoch and calls `settimeofday()`.
+- `tryApplyPcf85063Time()`: called before each `runWifiConfigPortal()` invocation
+  so local time is correctly set even when operating without internet.
+- Effect: after the first successful sync, the watch keeps correct time across
+  power-off cycles independent of network availability.
+
+15.3 UTC offset persistence
+- `s_displayUtcOffsetSec` is `RTC_DATA_ATTR` (survives deep sleep only, not power-off).
+- UTC offset is additionally persisted in NVS (`satwatch` namespace, key `utcoff`):
+  - Written by `refreshDisplayLocationTimeFromIpInfo()` after IP geolocation success.
+  - Restored on hard boot via `loadUtcOffsetFromNvs()` instead of a hardcoded fallback.
+- This ensures local time display is correct after power-off without internet.
+
+15.4 Priority order on boot
+  1. RTC (PCF85063A) — applied before portal if RTC OS flag is clear.
+  2. NTP (during sync phase) — overwrites RTC reading; also writes back to RTC.
+  3. NVS UTC offset — restores timezone for display even without IP geolocation.
+  4. IP geolocation (`ip-api.com`) — provides refined offset + saves to NVS.
 
 
 KNOWN ISSUE 1 — Battery glyph flip near 99%

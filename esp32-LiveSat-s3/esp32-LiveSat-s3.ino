@@ -4801,14 +4801,6 @@ static void buildRawPlaybackCache() {
   if (!s_rawMetaVersionCurrent) {
     SD.remove(RAW_CACHE_META_FILE);
   }
-  // If any frames were decode-failed and deleted this build, invalidate the raw meta
-  // so the next boot forces a fresh raw-build after rolling sync redownloads the slots.
-  if (decFail > 0 && s_rawMetaVersionCurrent) {
-    SD.remove(RAW_CACHE_META_FILE);
-    s_rawMetaVersionCurrent = false;
-    appendDiagLog("raw-meta: invalidated dec=%d redownload-next-boot\n", decFail);
-  }
-
   // Keep filtered zoom raws aligned with the current decode/corruption guards.
   // These rebuild locally from the existing zoom JPEGs and do not require WiFi.
   rebuildFilteredZoomRawsFromCache();
@@ -5133,6 +5125,7 @@ static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
     if (phys >= count || usedPhys[phys]) continue;
     char framePath[32];
     makeFramePath('f', i, framePath, sizeof(framePath));
+    if (!frameFileExists(i, 'f')) continue;  // file deleted — decode fresh in next pass
     if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW-REUSE")) {
       continue;
     }
