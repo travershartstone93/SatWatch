@@ -761,7 +761,7 @@ static void initQmiShakeToWake() {
   // defaultPinValue=1: INT1 idles HIGH (push-pull), pulses LOW on motion.
   // Pair with GPIO_INTR_LOW_LEVEL and gpio_pullup_en in goToSleep().
   // 200mg threshold — sensitive enough for wrist flick, filters table vibration.
-  int ret = s_qmi.configWakeOnMotion(200,
+  int ret = s_qmi.configWakeOnMotion(255,
                                      SensorQMI8658::ACC_ODR_LOWPOWER_128Hz,
                                      SensorQMI8658::INTERRUPT_PIN_1,
                                      1,     // idle HIGH, goes LOW on motion
@@ -8384,7 +8384,13 @@ static void goToSleep(bool buttonOnly = false) {
     // Strategy: read current INT1 level, arm the OPPOSITE level.
     // The next wrist flick toggles INT1 to the armed level → ESP32 wakes.
     gpio_num_t imuPin = (gpio_num_t)QMI8658_INT1;
-    gpio_pullup_en(imuPin);
+    // GPIO21 is shared with AMOLED_PWR_EN. Firmware holds it OUTPUT HIGH for
+    // display power — QMI8658 push-pull output cannot toggle an actively-driven
+    // output pin, and digitalRead() on an output returns the ESP32's own register,
+    // not the physical level. Release the driver so QMI8658 can freely drive the
+    // pin and digitalRead() reflects the actual state.
+    gpio_reset_pin(imuPin);
+    pinMode(QMI8658_INT1, INPUT_PULLUP);
     int int1Level = digitalRead(QMI8658_INT1);
     gpio_int_type_t wakeOn = (int1Level == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
     gpio_wakeup_enable(imuPin, wakeOn);
@@ -8414,6 +8420,11 @@ static void goToSleep(bool buttonOnly = false) {
     disconnectWifiAfterSync();
   }
   resetTopButtonStateAfterWake(buttonOnly);
+
+  // Restore AMOLED_PWR_EN strong output driver (released for QMI8658 INT1 sharing).
+  // INPUT_PULLUP kept the pin ~HIGH during sleep so display register state is intact.
+  pinMode(LCD_PWR, OUTPUT);
+  digitalWrite(LCD_PWR, HIGH);
 
   if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(0xFF);
@@ -10539,14 +10550,31 @@ void loop() {
           // partial composite at the lag boundary that passed size/decode checks
           // but has a large near-zero black region).
           if (currentScaledFreezeFrameLooksCorrupted()) {
+            // Evict the corrupt frame: delete source JPEG so rolling sync
+            // redownloads it next boot. Invalidate raw meta so raw=0 forces
+            // rolling sync + raw-build instead of the partial-window-current
+            // fast path that would otherwise skip redownload indefinitely.
+            {
+              char badPath[32];
+              makeFramePath('f', freezeFrameIdx, badPath, sizeof(badPath));
+              SD.remove(badPath);
+              appendDiagLog("raw-del: f%03d freeze-corrupt\n", freezeFrameIdx);
+            }
             bool foundClean = false;
             for (int back = 1; back <= 12 && (int)srcPos - back >= 0; ++back) {
               int backIdx = validIdx[(int)srcPos - back];
-              if (showFrame(backIdx) && !currentScaledFreezeFrameLooksCorrupted()) {
-                lastDisplayedFrameIdx = backIdx;
-                foundClean = true;
-                appendDiagLog("loop: freeze-back=%d idx=%d\n", back, backIdx);
-                break;
+              if (showFrame(backIdx)) {
+                if (!currentScaledFreezeFrameLooksCorrupted()) {
+                  lastDisplayedFrameIdx = backIdx;
+                  foundClean = true;
+                  appendDiagLog("loop: freeze-back=%d idx=%d\n", back, backIdx);
+                  break;
+                }
+                // Also corrupt — evict this one too.
+                char badPath[32];
+                makeFramePath('f', backIdx, badPath, sizeof(badPath));
+                SD.remove(badPath);
+                appendDiagLog("raw-del: f%03d freeze-corrupt\n", backIdx);
               }
             }
             if (!foundClean) {
@@ -10554,6 +10582,10 @@ void loop() {
               showFrame(freezeFrameIdx);
               appendDiagLog("loop: freeze-back-fail\n");
             }
+            // Invalidate raw meta so next boot triggers rolling sync + rebuild.
+            SD.remove(RAW_CACHE_META_FILE);
+            s_rawMetaVersionCurrent = false;
+            appendDiagLog("raw-meta: invalidated freeze-corrupt\n");
           }
         }
       } else if (lastDisplayedFrameIdx >= 0) {
