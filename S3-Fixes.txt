@@ -1,0 +1,83 @@
+S3 Firmware Fixes
+=================
+Date: 2026-03-08
+
+
+FIX 1 — Persistent bottom-band frame corruption
+-------------------------------------------------
+Symptom:
+  Frames showing horizontal scan-line corruption in the bottom ~15-20px of the
+  display. Corruption persisted across reboots. Confirmed on screenshot:
+  cloud imagery clean in upper ~85%, garbled MCU rows at bottom edge.
+
+Root cause (two layers):
+  1. spriteLooksBottomBandJunkCorrupted() required >= 3 dark/light MCU-row
+     transitions in the bottom third to flag a frame as corrupt. The actual
+     corruption pattern produces exactly 2 transitions (valid cloud -> dark
+     stripe -> lighter artifact). Threshold was off by 1, so the corrupted
+     frame passed download validation and was stored in the JPEG cache.
+
+  2. cachedFrameLooksReusable() was a pure file-existence check:
+       return frameFileExists(idx, 'f');
+     Once a bad fNNN.jpg landed on SD it was reused every boot without any
+     quality re-check, making corruption permanent until the slot was
+     overwritten by a fresh download.
+
+Fix applied:
+  A. esp32-LiveSat-s3.ino — spriteLooksBottomBandJunkCorrupted() ~line 9223:
+       if (transitions >= 3)  →  if (transitions >= 2)
+     Also added appendDiagLog("botband: tr=%d\n", transitions) so future
+     detections appear in diag.txt.
+
+  B. esp32-LiveSat-s3.ino — cachedFrameLooksReusable() lines 3924-3939:
+     Added minimum-size check (< 7000 bytes = reject) and JPEG structural
+     validity check (SOI marker 0xFF 0xD8 at start, EOI marker 0xFF 0xD9
+     at end). Catches: empty files from failed commits, GIBS 614-byte "no
+     data" placeholders, truncated JPEGs. Does not re-validate interior
+     content (full-size internally-corrupt files still pass; Change A is the
+     primary guard for those).
+
+Verification:
+  After clearing the frame cache and flashing:
+    raw-build: built=115/115 dec=0 sb=0 wr=0 vr=0 fill=0
+  All 115 downloaded frames built clean. No botband false positives.
+  vld: FRAME BLOCK-CORR x2 confirmed the block-corruption check correctly
+  rejected 2 genuinely corrupted GIBS frames at ingest.
+  Animation running clean: loop: 1/10 valid=115 fc=115.
+
+
+FIX 2 — Silent decode failures in raw-build (diagnostic logging)
+-----------------------------------------------------------------
+Symptom:
+  raw-build: dec=70 in previous boots — 70 JPEG files failing decode with
+  no explanation in diag. Root cause was old cache files from before the
+  frame-clearing fix. After clearing and fresh download: dec=0, confirming
+  the stale cache was the source.
+
+Fix applied:
+  esp32-LiveSat-s3.ino — decodeJpegPathToSprite() lines 5904-5999:
+  Added appendDiagLog at each of 6 previously-silent failure paths:
+    dec-fail: <path> no-file    (file not found)
+    dec-fail: <path> sz=N       (size 0 or > MAX_JPEG_BYTES)
+    dec-fail: <path> short=N/M  (incomplete SD read)
+    dec-fail: <path> no-eoi     (no JPEG EOI marker found)
+    dec-fail: <path> dim=WxH    (JPEG dimensions don't match expected)
+    dec-fail: <path> decode     (JPEG decoder returned false)
+    dec-fail: <path> not-full   (decoded area didn't cover full frame)
+
+
+RELATED INVESTIGATION
+---------------------
+The investigation that led to these fixes also identified structural issues
+in the cache pipeline documented in:
+  /home/whisper/Desktop/LiveSat/Frame_Cache_Findings.txt
+  /home/whisper/Desktop/LiveSat/Investigation-rolling-report.txt
+
+Key findings (not yet fixed, for future reference):
+  - commitTempFrames() is non-transactional: removes all final 'f' files
+    before promoting temp 'n' files. Mid-commit failure can leave cache
+    in a partially-destroyed state.
+  - Partial-keep/trim branches allow cache to remain below target frame
+    count across many boots without forcing recovery.
+  - Semantic outlier validation is weakest when cache is most degraded
+    (loses reference context when neighbors are invalid).

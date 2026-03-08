@@ -1,0 +1,90 @@
+Rolling / Persistent Corruption Investigation
+Date: 2026-03-08
+Scope: No code changes. Deep analysis of `esp32-LiveSat-s3_update/esp32-LiveSat-s3.ino` against provided boot log.
+
+PASS 1
+- The provided log shows a two-stage raw rebuild in a single boot:
+  - `raw-build: built=0/142 dec=142 ...`
+  - later `raw-build: built=65/142 dec=70 ... fill=77`
+- This matches control flow in code:
+  - rolling branch (`sync: branch=roll ... raw=0`) can call `buildRawPlaybackCache()` inside `syncFramesRolling()`.
+  - setup later runs another rebuild when raw meta is still stale.
+- Interpretation:
+  - Stage A failed wholesale decode at rebuild time.
+  - Stage B partially recovered but required heavy gap-fill (`fill=77`), so many slots are synthetic clones, not fresh true frames.
+- Persistence driver:
+  - rolling reuse admission is existence-only (`cachedFrameLooksReusable()` checks file presence only), so bad `fNNN.jpg` files are repeatedly reused.
+
+PASS 2
+- Core issue is lifecycle inconsistency, not one isolated detector:
+  1) New downloads are validated before install.
+  2) Reuse path does not enforce equivalent quality gates on already-cached frames.
+  3) Gap-fill converts decode failures into “playable” slots, masking degradation.
+- The same log supports this chain:
+  - `reused=141 downloaded=1` means almost the entire set came from old cache state.
+  - `built=0/142 dec=142` indicates the first rebuild point was unhealthy.
+  - `built=65 ... fill=77` indicates fallback continuity logic dominated output quality.
+- Why corruption appears persistent:
+  - underfilled windows are explicitly allowed by policy (`partial-keep` style exits),
+  - reuse-by-existence keeps polluted source files alive,
+  - gap-fill preserves playback continuity but also preserves temporal artifacts.
+- Why updates feel long/unstable:
+  - multiple heavy rebuild attempts can happen in one boot,
+  - expensive rebuild/fill work occurs after sync phases, so UI can appear “done” while backend work is still running.
+
+PASS 3 Findings:
+- Cache update pipeline is currently biased toward preserving partial sets, not restoring full healthy sets:
+  - the rolling path has explicit partial-preserve exits (`partial-stable`, `partial-reuse-trim`, `partial-keep`), so once cache shrinks it can remain shrunk for long periods.
+  - this matches repeated `cc<target` behavior over many boots.
+
+- Rolling reuse admission is weaker than ingest admission:
+  - reuse path admits frames via `cachedFrameLooksReusable()` (existence check only),
+  - while new downloads pass decode/validator install path.
+  - net effect: old bad `fNNN.jpg` files can survive indefinitely while only a few tail frames are replaced.
+
+- Temporal fallback in downloader can hide source misses while introducing timeline skew:
+  - `downloadFrameToPathAtBbox()` may accept `t ± 60s` and `t ± cadence` candidates to fill the slot,
+  - but slot timestamp remains the target slot time.
+  - this can reduce hard misses but can also produce visual jump/duplicate behavior that looks like corruption during playback.
+
+- Raw-cache invalidation is tightly coupled to `frameCount` and exact stream length:
+  - `rawCacheMetaVersionIsCurrent()` requires `stream.raw` size to exactly equal `frameCount * SCALED_FRAME_BYTES`,
+  - remap paths can change logical mapping/count context and then hit stale-meta rebuild loops.
+  - this contributes directly to long update cycles and post-100% stalls.
+
+- Commit step is non-transactional and can poison future rolling passes:
+  - `commitTempFrames()` removes all finals first, then promotes temp files.
+  - any mid-commit failure can leave cache in a reduced/inconsistent state, after which rolling logic repeatedly operates on degraded input.
+
+- Existing repair framework is not in the active fast path:
+  - full/slice validate-repair helpers exist, but the main rolling update path does not rely on them for reuse admission.
+  - practical result: corruption control is strongest at ingress and weaker during long-running steady-state operation.
+
+PASS 4 Findings:
+- Tie-off 1 — where corruption enters and why it persists:
+  - Ingress path validates decode/basic corruption before install, but rolling reuse still admits by file existence only.
+  - Therefore the unresolved persistence is not one-time download failure alone; it is primarily a reuse-policy problem in the cache update pipeline.
+
+- Tie-off 2 — why cache update duration explodes intermittently:
+  - The pipeline can execute multiple heavy stages in one boot (`rolling -> raw rebuild -> setup raw stale check -> possible second raw rebuild`).
+  - Progress budgeting assumes one normal pass; when extra rebuild/fallback paths trigger, user sees near-100% stall while additional unbudgeted heavy work continues.
+
+- Tie-off 3 — why frame count ratchets down over cycles:
+  - Rolling logic explicitly allows partial-window keep/trim outcomes, then installs reduced sets as current cache state.
+  - Once below target, the pipeline can keep operating on reduced windows for many cycles instead of forcing deterministic recovery to target count.
+
+- Tie-off 4 — why “clean transport” does not equal “clean timeline”:
+  - Downloader fallback can accept neighbor timestamps (`±60s`, `±cadence`) for a target slot.
+  - This reduces misses but can create temporal slot/content mismatch (visual jump/duplication), which users perceive as corruption even if JPEG decoding succeeds.
+
+- Tie-off 5 — validator coverage gap during degraded windows:
+  - Semantic outlier checks depend on valid neighbors; in sparse/degraded caches, those checks often lose reference context and become less effective.
+  - In practical terms, the exact state where validation is most needed is also where current neighbor-based rejection is weakest.
+
+- Tie-off 6 — non-transactional commit remains a structural risk:
+  - `commitTempFrames()` removes all final frames first, then promotes temp files.
+  - Any mid-commit failure can leave cache partially rebuilt and immediately feed degraded data into subsequent rolling/rebuild decisions.
+
+- Tie-off 7 — unresolved but bounded unknown:
+  - The specific `built=0/142 dec=142` first-pass event is consistent with an unhealthy intermediate cache state at rebuild time (missing/invalid finals or decode-incompatible payload set).
+  - Code-level evidence strongly points to cache lifecycle inconsistency (not display path) as root class; exact per-file failure mode for that first pass requires per-index decode logging at rebuild time.

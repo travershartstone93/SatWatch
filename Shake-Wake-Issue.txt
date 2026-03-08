@@ -1,0 +1,143 @@
+SHAKE-TO-WAKE DEBUGGING LOG
+============================
+Device: Waveshare ESP32-S3-Touch-AMOLED-2.06
+IMU:    QMI8658C at I2C 0x6B, INT1 = GPIO21
+Sleep:  esp_light_sleep_start() — level-triggered GPIO wakeup only
+        (edge-triggered not supported by esp_sleep_enable_gpio_wakeup)
+Library: SensorLib by Lewis He
+         /home/whisper/Arduino/libraries/SensorLib/src/SensorQMI8658.hpp
+
+
+CONFIRMED FACTS
+---------------
+- Only INT1 (GPIO21) is defined on this board. INT2 is not connected/defined.
+- QMI8658 WoM interrupt is NOT a stable latch. Official SensorLib example comment:
+  "When the QMI8658 is configured as Wom, the interrupt level is arbitrary,
+   not absolute high or low, and it is in the jump transition state."
+  Example uses: attachInterrupt(pin, fn, CHANGE)
+- ESP32 light sleep gpio_wakeup_enable() only supports GPIO_INTR_LOW_LEVEL or
+  GPIO_INTR_HIGH_LEVEL. Edge-triggered wakeup is NOT available for light sleep.
+- Diag confirmed: INT1 reads LOW at all times before sleep, even immediately
+  after two s_qmi.update() calls (which read STATUS_INT + STATUS0 + STATUS1).
+
+DIAGNOSTIC LOG (from device, shake-to-wake enabled)
+----------------------------------------------------
+qmi: INT1 level before sleep=0
+qmi: INT1 stuck LOW - shake-wake skipped     <- from update()-based clear attempt
+... (repeats every loop cycle)
+
+After toggle-based approach was flashed:
+  Expected: "qmi: shake-wake armed INT1=0 wakeOn=HIGH"
+  Result:   Device does not wake when shaken.
+
+
+APPROACHES TRIED (all failed)
+------------------------------
+
+1. configMotion() + enableMotionDetect() + GPIO_INTR_LOW_LEVEL
+   - Result: woke immediately
+   - Cause: any-motion interrupt is active-HIGH, polarity was wrong
+             (INT1 LOW = idle, so LOW trigger fired instantly)
+
+2. configMotion() + enableMotionDetect() + GPIO_INTR_HIGH_LEVEL
+   - Result: never woke on shake
+   - Cause: any-motion interrupt likely pulses too briefly for level detection;
+             device probably in light sleep before pulse arrives
+
+3. configWakeOnMotion(250mg, INTERRUPT_PIN_1, defaultPinValue=0) + GPIO_INTR_HIGH_LEVEL
+   - Result: never woke on shake
+   - Cause: same pulse-brevity issue, or WoM already fired once (button tap)
+             and toggled to HIGH then back to LOW before we entered sleep
+
+4. configWakeOnMotion(100mg, INTERRUPT_PIN_1, defaultPinValue=1) + GPIO_INTR_LOW_LEVEL
+   - Result: woke immediately again
+   - Cause: WoM had already fired once (button-press vibration at 100mg threshold),
+             pin toggled from initial HIGH → LOW, then we armed LOW → immediate fire
+   - getStatusRegister() (reads only STATUS1 / 0x2F) does NOT clear WoM latch
+   - Replaced with s_qmi.update() (reads STATUS_INT 0x2D + STATUS0 + STATUS1)
+     but INT1 remained LOW regardless — WoM pin is a toggle, not a latch
+
+5. configWakeOnMotion(200mg, INTERRUPT_PIN_1, defaultPinValue=1) + toggle strategy
+   - Current implementation
+   - Read digitalRead(QMI8658_INT1) before sleep
+   - Arm OPPOSITE level: if INT1=LOW arm HIGH, if INT1=HIGH arm LOW
+   - Logic: next shake toggles pin to armed level → ESP32 wakes
+   - Result: INT1=0 confirmed (expected after first toggle from button-press),
+             armed HIGH, but shaking does NOT wake the device
+
+
+CURRENT CODE STATE
+------------------
+initQmiShakeToWake() in esp32-LiveSat-s3.ino (~line 755):
+  s_qmi.begin(Wire, QMI8658_ADDRESS, SDA, SCL)
+  s_qmi.configWakeOnMotion(200, ACC_ODR_LOWPOWER_128Hz, INTERRUPT_PIN_1, 1, 0x20)
+    defaultPinValue=1: pin idles HIGH, toggles LOW on first motion event
+
+goToSleep() AMOLED path (~line 8357):
+  gpio_pullup_en(imuPin)
+  int1Level = digitalRead(QMI8658_INT1)
+  wakeOn = (int1Level == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL
+  gpio_wakeup_enable(imuPin, wakeOn)
+  // next WoM toggle fires → ESP32 catches level change → wakes
+
+NVS key: "stwk" (bool), portal checkbox in Sleep section
+
+
+OPEN QUESTIONS / HYPOTHESES
+----------------------------
+A. Is configWakeOnMotion() actually taking effect on the chip?
+   - We log "qmi: shake-to-wake WoM init ok" if ret==0, but ret==0 doesn't
+     guarantee the CTRL9 command (CTRL_CMD_WRITE_WOM_SETTING = 0x08) completed
+     correctly. CTRL9 protocol requires STATUS_INT.CTRL9_CMD_DONE to be set.
+   - Suggested test: after configWakeOnMotion(), call s_qmi.dumpCtrlRegister()
+     and log the output to verify CTRL1, CTRL7, CTRL8, CTRL9, CAL1_L/H values.
+
+B. Does the WoM toggle only fire ONCE and then stop?
+   - If WoM fires once (button press), pin goes LOW, and subsequent shaking
+     does NOT fire further events — WoM may require re-arm/re-config per event.
+   - Suggested test: monitor INT1 level over time with digitalRead in loop().
+
+C. Is GPIO21 actually the physical INT1 pin of the QMI8658 on this board?
+   - pins_arduino.h defines QMI8658_INT1 = 21, but schematic not verified.
+   - Suggested test: check Schematic/ directory in ESP32-S3-Touch-AMOLED-2.06/
+
+D. Is Wire re-initialization causing issues?
+   - Wire.begin(SDA, SCL) is called in setup() before s_qmi.begin(Wire, addr, SDA, SCL).
+   - s_qmi.begin() internally calls Wire.begin() again. Second call is normally
+     safe on ESP32 but worth verifying.
+
+E. Is 200mg threshold too high for this device/user?
+   - A wrist flick should generate 2-5g peak, well above 200mg.
+   - But if WoM isn't firing at all (hypothesis A or B), threshold is irrelevant.
+
+
+SUGGESTED NEXT STEPS
+--------------------
+1. Add register readback after configWakeOnMotion() — call s_qmi.dumpCtrlRegister()
+   and log output to verify the chip actually received the WoM configuration.
+
+2. Add a live INT1 monitor: in loop(), log digitalRead(QMI8658_INT1) every second
+   while shake-to-wake is enabled. Shake device and observe if it ever changes.
+   If it never changes → WoM is not firing → init/config issue.
+   If it toggles → WoM IS firing → level arming logic issue.
+
+3. Check the schematic in:
+   /home/whisper/Desktop/LiveSat/ESP32-S3-Touch-AMOLED-2.06/Schematic/
+   Verify that QMI8658 INT1 pin is connected to ESP32 GPIO21.
+
+4. Try configWakeOnMotion() defaults (no arguments) to use INT2 pattern, then
+   reroute to INT1 — in case INTERRUPT_PIN_1 encoding in configWakeOnMotion
+   has a bug and INT2 is actually wired somewhere.
+
+5. Try lower-level approach: configure QMI8658 WoM manually via direct register
+   writes instead of SensorLib, following QMI8658 datasheet exactly.
+
+
+RELEVANT FILE PATHS
+-------------------
+Main firmware:   /home/whisper/Desktop/LiveSat/esp32-LiveSat-s3/esp32-LiveSat-s3.ino
+SensorLib:       /home/whisper/Arduino/libraries/SensorLib/src/SensorQMI8658.hpp
+WoM example:     .../SensorLib/examples/QMI8658_WakeOnMotion/QMI8658_WakeOnMotion.ino
+Board pins:      /home/whisper/.arduino15/packages/esp32/hardware/esp32/3.3.7/variants/
+                   waveshare_esp32_s3_touch_amoled_206/pins_arduino.h
+Schematic dir:   /home/whisper/Desktop/LiveSat/ESP32-S3-Touch-AMOLED-2.06/Schematic/

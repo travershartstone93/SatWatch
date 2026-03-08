@@ -44,6 +44,7 @@
 #include <esp_timer.h>
 #include <driver/gpio.h>   // gpio_wakeup_enable()
 #include <esp_wifi.h>      // esp_wifi_set_protocol()
+#include "SensorQMI8658.hpp"
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
 #include <Arduino_GFX_Library.h>
 #endif
@@ -477,16 +478,22 @@ static WifiConfigEntry s_wifiConfig[WIFI_CONFIG_SLOTS];
 static bool s_wifiConfigLoaded = false;
 static bool s_clockUse12Hour = true;
 enum UpdateMode : uint8_t {
-  UPDATE_MODE_MANUAL = 0,
-  UPDATE_MODE_AUTO = 1,
+  UPDATE_MODE_MANUAL    = 0,
+  UPDATE_MODE_AUTO      = 1,
+  UPDATE_MODE_SCHEDULED = 2,
 };
 enum StartCueMode : uint8_t {
-  START_CUE_OFF = 0,
-  START_CUE_CHIME = 1,
+  START_CUE_OFF        = 0,
+  START_CUE_CHIME      = 1,  // Chime 1 -> /power_up.raw
   START_CUE_VIBE_PULSE = 2,
+  START_CUE_CHIME2     = 3,  // Chime 2 -> /chime2.raw (reserved for future use)
+  START_CUE_CHIME3     = 4,  // Chime 3 -> /chime3.raw (reserved for future use)
 };
 static constexpr size_t START_CUE_PATH_MAX = 96;
 static constexpr size_t START_CUE_MAX_BYTES = 1024 * 1024;
+static constexpr int MAX_SCHED_UPDATES = 8;
+static uint8_t  s_scheduledUpdateCount = 0;
+static uint16_t s_scheduledUpdateMinutes[MAX_SCHED_UPDATES] = {};
 static UpdateMode s_updateMode = UPDATE_MODE_MANUAL;
 static uint16_t s_autoUpdateIntervalMin = 60;
 static bool s_autoUpdateTopOfHour = false;
@@ -520,6 +527,10 @@ static char     s_syncProgPhaseLabel[24] = "sync";
 
 RTC_DATA_ATTR static bool s_sleepModeEnabled = true;
 RTC_DATA_ATTR static bool s_autoUpdateInSleep = true;
+static int s_loopsBeforeSleep = LOOPS_BEFORE_SLEEP;
+static bool s_shakeToWakeEnabled = false;
+static SensorQMI8658 s_qmi;
+static bool s_qmiInitialized = false;
 #if BOARD_IS_AMOLED_206
 static I2SClass s_audioI2s;
 static es8311_handle_t s_audioCodec = nullptr;
@@ -651,6 +662,8 @@ static void loadWifiPortalConfig() {
   snprintf(s_startCuePath, sizeof(s_startCuePath), "%s", "/power_up.raw");
   s_sleepModeEnabled = true;
   s_autoUpdateInSleep = true;
+  s_loopsBeforeSleep = LOOPS_BEFORE_SLEEP;
+  s_shakeToWakeEnabled = false;
   s_lastSuccessfulSyncUtc = 0;
   s_lastSuccessfulScanMsValid = false;
   s_lastSuccessfulScanMs = 0;
@@ -668,7 +681,7 @@ static void loadWifiPortalConfig() {
       }
       s_clockUse12Hour = prefs.getBool("t12", true);
       int updateMode = prefs.getUChar("updm", (uint8_t)UPDATE_MODE_MANUAL);
-      if (updateMode < UPDATE_MODE_MANUAL || updateMode > UPDATE_MODE_AUTO) updateMode = UPDATE_MODE_MANUAL;
+      if (updateMode < UPDATE_MODE_MANUAL || updateMode > UPDATE_MODE_SCHEDULED) updateMode = UPDATE_MODE_MANUAL;
       s_updateMode = (UpdateMode)updateMode;
       int updateMins = prefs.getUShort("updi", 60);
       s_autoUpdateTopOfHour = prefs.getBool("upth", false);
@@ -681,29 +694,38 @@ static void loadWifiPortalConfig() {
         updateMins = 60;
       }
       s_autoUpdateIntervalMin = (uint16_t)updateMins;
+      // load scheduled times
+      char schedStr[64] = {};
+      prefs.getString("scht", schedStr, sizeof(schedStr));
+      s_scheduledUpdateCount = 0;
+      char* tok = strtok(schedStr, ",");
+      while (tok && s_scheduledUpdateCount < MAX_SCHED_UPDATES) {
+        int v = atoi(tok);
+        if (v >= 0 && v < 1440) s_scheduledUpdateMinutes[s_scheduledUpdateCount++] = (uint16_t)v;
+        tok = strtok(nullptr, ",");
+      }
       if (prefs.isKey("chmd")) {
         int mode = prefs.getUChar("chmd", (uint8_t)START_CUE_OFF);
-        if (mode < START_CUE_OFF || mode > START_CUE_VIBE_PULSE) mode = START_CUE_OFF;
+        if (mode < START_CUE_OFF || mode > START_CUE_CHIME3) mode = START_CUE_OFF;
         s_startCueMode = (StartCueMode)mode;
       } else {
         s_startCueMode = prefs.getBool("chm", true) ? START_CUE_CHIME : START_CUE_OFF;
       }
-      if (prefs.isKey("cuep")) {
-        prefs.getString("cuep", s_startCuePath, sizeof(s_startCuePath));
-      } else if (s_startCueMode == START_CUE_VIBE_PULSE) {
-        snprintf(s_startCuePath, sizeof(s_startCuePath), "%s", "/230.raw");
-      } else {
-        snprintf(s_startCuePath, sizeof(s_startCuePath), "%s", "/power_up.raw");
-      }
-      if (s_startCuePath[0] == '\0') {
-        snprintf(s_startCuePath, sizeof(s_startCuePath), "%s", "/power_up.raw");
-      }
+      // Path is always derived from mode; manual cuep is no longer used.
+      const char* modePath = cuePathForMode(s_startCueMode);
+      snprintf(s_startCuePath, sizeof(s_startCuePath), "%s",
+               (modePath && modePath[0]) ? modePath : "/power_up.raw");
       int vol = prefs.getUChar("chmv", 80);
       if (vol < 0) vol = 0;
       if (vol > 100) vol = 100;
       s_chimeVolume = (uint8_t)vol;
       s_sleepModeEnabled = prefs.getBool("slp", true);
       s_autoUpdateInSleep = prefs.getBool("ausl", true);
+      int lbsl = prefs.getInt("lbsl", LOOPS_BEFORE_SLEEP);
+      if (lbsl < 1) lbsl = 1;
+      if (lbsl > 99) lbsl = 99;
+      s_loopsBeforeSleep = lbsl;
+      s_shakeToWakeEnabled = prefs.getBool("stwk", false);
       s_lastSuccessfulSyncUtc = (time_t)prefs.getULong64("lsyn", 0ULL);
     }
     prefs.end();
@@ -720,11 +742,45 @@ static void saveSleepModePreference(bool enabled) {
   prefs.end();
 }
 
+static const char* cuePathForMode(StartCueMode mode) {
+  switch (mode) {
+    case START_CUE_CHIME:      return "/power_up.raw";
+    case START_CUE_VIBE_PULSE: return "/230.raw";
+    case START_CUE_CHIME2:     return "/chime2.raw";
+    case START_CUE_CHIME3:     return "/chime3.raw";
+    default:                   return "";
+  }
+}
+
+static void initQmiShakeToWake() {
+  if (!s_qmi.begin(Wire, QMI8658_ADDRESS, SDA, SCL)) {
+    appendDiagLog("qmi: init fail\n");
+    return;
+  }
+  // WoM hardware path: resets sensor, arms dedicated threshold comparator.
+  // defaultPinValue=1: INT1 idles HIGH (push-pull), pulses LOW on motion.
+  // Pair with GPIO_INTR_LOW_LEVEL and gpio_pullup_en in goToSleep().
+  // 200mg threshold — sensitive enough for wrist flick, filters table vibration.
+  int ret = s_qmi.configWakeOnMotion(200,
+                                     SensorQMI8658::ACC_ODR_LOWPOWER_128Hz,
+                                     SensorQMI8658::INTERRUPT_PIN_1,
+                                     1,     // idle HIGH, goes LOW on motion
+                                     0x20); // 32-sample blanking (~250ms)
+  if (ret != 0) {
+    appendDiagLog("qmi: WoM init fail %d\n", ret);
+    return;
+  }
+  s_qmiInitialized = true;
+  appendDiagLog("qmi: shake-to-wake WoM init ok INT1=GPIO%d\n", QMI8658_INT1);
+}
+
 static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
                                  UpdateMode updateMode, uint16_t autoUpdateIntervalMin,
                                  bool autoUpdateTopOfHour,
                                  StartCueMode startCueMode, uint8_t chimeVolume,
-                                 const char* cuePath, bool autoUpdateInSleep) {
+                                 bool autoUpdateInSleep,
+                                 uint8_t schedCount, const uint16_t* schedMinutes,
+                                 int loopsBeforeSleep, bool shakeToWake) {
   if (!entries) return;
   Preferences prefs;
   if (!prefs.begin("satwatch", false)) return;
@@ -745,8 +801,21 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   prefs.putBool("chm", startCueMode == START_CUE_CHIME);
   prefs.putUChar("chmd", (uint8_t)startCueMode);
   prefs.putUChar("chmv", chimeVolume);
-  prefs.putString("cuep", (cuePath && cuePath[0]) ? cuePath : "/power_up.raw");
+  const char* derivedPath = cuePathForMode(startCueMode);
+  prefs.putString("cuep", (derivedPath && derivedPath[0]) ? derivedPath : "/power_up.raw");
   prefs.putBool("ausl", autoUpdateInSleep);
+  prefs.putInt("lbsl", loopsBeforeSleep);
+  prefs.putBool("stwk", shakeToWake);
+  // build and save scheduled times string
+  {
+    char schedStr[64] = {};
+    int pos = 0;
+    for (int i = 0; i < schedCount && i < MAX_SCHED_UPDATES; i++) {
+      if (pos > 0 && pos < (int)sizeof(schedStr) - 1) schedStr[pos++] = ',';
+      pos += snprintf(schedStr + pos, sizeof(schedStr) - pos, "%u", schedMinutes[i]);
+    }
+    prefs.putString("scht", schedStr);
+  }
   prefs.end();
   s_clockUse12Hour = use12Hour;
   s_updateMode = updateMode;
@@ -755,8 +824,13 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   s_startCueMode = startCueMode;
   s_chimeVolume = chimeVolume;
   snprintf(s_startCuePath, sizeof(s_startCuePath), "%s",
-           (cuePath && cuePath[0]) ? cuePath : "/power_up.raw");
+           (derivedPath && derivedPath[0]) ? derivedPath : "/power_up.raw");
   s_autoUpdateInSleep = autoUpdateInSleep;
+  s_loopsBeforeSleep = loopsBeforeSleep;
+  s_shakeToWakeEnabled = shakeToWake;
+  if (shakeToWake && !s_qmiInitialized) initQmiShakeToWake();
+  s_scheduledUpdateCount = schedCount;
+  for (int i = 0; i < schedCount; i++) s_scheduledUpdateMinutes[i] = schedMinutes[i];
 #if BOARD_IS_AMOLED_206
   ensureAudioCueWorker();
   preloadSelectedCueToPsram(true);
@@ -796,6 +870,24 @@ static void noteSuccessfulScanNow() {
 }
 
 static bool autoUpdateDueNow() {
+  if (s_updateMode == UPDATE_MODE_SCHEDULED) {
+    if (s_scheduledUpdateCount == 0) return false;
+    time_t nowUtc = time(nullptr);
+    if (nowUtc <= 0) return false;
+    time_t localNow = nowUtc + (time_t)(s_displayUtcOffsetValid ? s_displayUtcOffsetSec : (-4 * 3600));
+    int minuteOfDay = (int)((localNow % 86400) / 60);
+    if (minuteOfDay < 0) minuteOfDay += 1440;
+    bool matched = false;
+    for (int i = 0; i < s_scheduledUpdateCount; i++) {
+      if (minuteOfDay == (int)s_scheduledUpdateMinutes[i]) { matched = true; break; }
+    }
+    if (!matched) return false;
+    // Only fire once per minute bucket
+    int64_t currentBucket = (int64_t)localNow / 60LL;
+    if (s_lastSuccessfulSyncUtc <= 0) return true;
+    time_t lastLocal = s_lastSuccessfulSyncUtc + (time_t)(s_displayUtcOffsetValid ? s_displayUtcOffsetSec : (-4 * 3600));
+    return currentBucket != (int64_t)lastLocal / 60LL;
+  }
   if (s_updateMode != UPDATE_MODE_AUTO) return false;
   time_t nowUtc = time(nullptr);
   if (nowUtc <= 0) return false;
@@ -921,26 +1013,47 @@ static void sendWifiPortalPage() {
   html += F("Top of the hour</label>");
   html += F("<div class='hint'>Auto update uses real local clock boundaries only (:00, :15, :30), not minutes-since-boot.</div>");
   html += F("<div class='hint'>Any schedule checkbox forces Auto mode for this save.</div>");
+  html += F("<hr style='border-color:#374151;margin:14px 0;'>");
+  html += F("<div style='font-size:14px;margin-bottom:6px;font-weight:600;'>Update at local time</div>");
+  html += F("<div id='sched-times-container'></div>");
+  html += F("<button type='button' id='add-sched-btn' onclick='addSchedTime()' style='width:auto;padding:6px 14px;font-size:13px;margin-top:6px;background:#374151;'>+ Add update time</button>");
+  html += F("<div class='hint'>Times use local clock. Scheduling specific times disables the interval options above (and vice-versa).</div>");
+  // Emit hidden inputs with saved scheduled times so JS can read them on load
+  for (int i = 0; i < s_scheduledUpdateCount; i++) {
+    html += F("<input type='hidden' class='sched-preload' value='");
+    html += String(s_scheduledUpdateMinutes[i]);
+    html += F("'>");
+  }
   html += F("<label style='margin-top:12px;'>Start Cue</label><select name='cuemode'>");
   html += F("<option value='0'");
   if (s_startCueMode == START_CUE_OFF) html += F(" selected");
   html += F(">Off</option><option value='1'");
   if (s_startCueMode == START_CUE_CHIME) html += F(" selected");
-  html += F(">Chime</option><option value='2'");
+  html += F(">Chime 1</option><option value='3'");
+  if (s_startCueMode == START_CUE_CHIME2) html += F(" selected");
+  html += F(">Chime 2</option><option value='4'");
+  if (s_startCueMode == START_CUE_CHIME3) html += F(" selected");
+  html += F(">Chime 3</option><option value='2'");
   if (s_startCueMode == START_CUE_VIBE_PULSE) html += F(" selected");
   html += F(">Vibe pulse</option></select>");
   html += F("<label>Chime Volume (0-100)</label><input type='text' name='chimevol' value='");
   html += String((unsigned)s_chimeVolume);
   html += F("'>");
-  html += F("<label>Cue File Path</label><input type='text' name='cuepath' value='");
-  html += htmlEscape(s_startCuePath);
-  html += F("'>");
-  html += F("<div class='hint'>Vibe pulse uses 80 fixed volume. Chime uses the configurable volume.</div>");
+  html += F("<div class='hint'>Chime 1 = power_up.raw &nbsp;|&nbsp; Chime 2 = chime2.raw &nbsp;|&nbsp; Chime 3 = chime3.raw &nbsp;|&nbsp; Vibe pulse uses fixed volume 80.</div>");
   html += F("<div class='mb-4'><label class='block text-sm font-medium text-gray-300 mb-1'>Sleep behaviour</label>");
   html += F("<label class='flex items-center gap-2 text-sm text-gray-200'>");
   html += F("<input type='checkbox' name='ausl' value='1'");
   if (s_autoUpdateInSleep) html += F(" checked");
-  html += F(">Auto-update satellite frames when waking from sleep</label></div>");
+  html += F(">Wake device from sleep on auto update</label>");
+  html += F("<div style='margin-top:8px'><label class='text-sm text-gray-200'>Animation loops before sleep: ");
+  html += F("<input type='number' name='lbsl' min='1' max='99' style='width:4em' value='");
+  html += String(s_loopsBeforeSleep);
+  html += F("'></label></div>");
+  html += F("<div style='margin-top:8px'><label class='flex items-center gap-2 text-sm text-gray-200'>");
+  html += F("<input type='checkbox' name='stwk' value='1'");
+  if (s_shakeToWakeEnabled) html += F(" checked");
+  html += F(">Shake to wake (wrist flick wakes from sleep)</label></div>");
+  html += F("</div>");
   html += F("<div class='hint'>Portal AP: Sat Watch / 123456789</div>");
   html += F("<div class='hint'>Portal URL: http://satwatch.local/</div>");
   if (WiFi.status() == WL_CONNECTED) {
@@ -950,27 +1063,73 @@ static void sendWifiPortalPage() {
   }
   html += F("</div><button type='submit'>Save and Reboot</button></form>");
   html += F("<script>"
-            "function syncUpdateModeLock(){"
+            "var s_rowCount=0;"
+            "function minToHMAmpm(m){"
+              "var h=Math.floor(m/60),mn=m%60,ap='AM';"
+              "if(h===0){h=12;}else if(h===12){ap='PM';}else if(h>12){h-=12;ap='PM';}"
+              "return {h:h,m:mn,ap:ap};"
+            "}"
+            "function addSchedTime(minsVal){"
+              "var idx=s_rowCount++;"
+              "var container=document.getElementById('sched-times-container');"
+              "if(!container)return;"
+              "var hv=12,mv=0,pv='AM';"
+              "if(minsVal!==undefined&&minsVal!==null&&minsVal!==''){"
+                "var hma=minToHMAmpm(parseInt(minsVal));"
+                "hv=hma.h;mv=hma.m;pv=hma.ap;"
+              "}"
+              "var row=document.createElement('div');"
+              "row.className='sched-row';"
+              "row.style.cssText='display:flex;align-items:center;gap:8px;margin-bottom:6px;';"
+              "row.innerHTML="
+                "'<input class=\"sh\" name=\"uth_'+idx+'\" type=\"number\" min=\"1\" max=\"12\" value=\"'+hv+'\" style=\"width:60px;\">'"
+                "+'<span>:</span>'"
+                "+'<input class=\"sm\" name=\"utm_'+idx+'\" type=\"number\" min=\"0\" max=\"59\" value=\"'+(mv<10?'0':'')+mv+'\" style=\"width:60px;\">'"
+                "+'<label style=\"display:flex;align-items:center;gap:4px;font-weight:normal;\"><input class=\"sp\" type=\"checkbox\" name=\"utp_'+idx+'\" value=\"1\" style=\"width:auto;\"'+(pv==='PM'?' checked':'')+'>PM</label>'"
+                "+'<button type=\"button\" onclick=\"this.closest(\\'.sched-row\\').remove();syncSchedLock();\" style=\"width:auto;padding:4px 10px;font-size:13px;background:#7f1d1d;\">&#10005;</button>';"
+              "var inputs=row.querySelectorAll('input');"
+              "inputs.forEach(function(el){el.addEventListener('change',syncSchedLock);});"
+              "container.appendChild(row);"
+              "syncSchedLock();"
+            "}"
+            "function syncSchedLock(){"
               "var mode=document.querySelector(\"select[name='upmode']\");"
               "var half=document.querySelector(\"input[name='uphalf']\");"
               "var qtr=document.querySelector(\"input[name='upqtr']\");"
               "var top=document.querySelector(\"input[name='upth']\");"
               "if(!mode||!half||!qtr||!top)return;"
-              "var lock=(half.checked||qtr.checked||top.checked);"
-              "if(lock){mode.value='1';mode.disabled=true;}"
-              "else{mode.disabled=false;}"
+              "var rows=document.querySelectorAll('.sched-row');"
+              "var hasSched=false;"
+              "rows.forEach(function(r){"
+                "var h=r.querySelector('.sh').value,m=r.querySelector('.sm').value;"
+                "if(h!==''||m!=='')hasSched=true;"
+              "});"
+              "var hasInterval=(half.checked||qtr.checked||top.checked);"
+              "[half,qtr,top].forEach(function(el){el.disabled=hasSched;});"
+              "if(hasSched){mode.value='1';mode.disabled=true;}"
+              "else if(!hasInterval){mode.disabled=false;}"
+              "var addBtn=document.getElementById('add-sched-btn');"
+              "var schedArea=document.getElementById('sched-times-container');"
+              "var lock=hasInterval;"
+              "if(schedArea){schedArea.style.opacity=lock?'0.4':'';schedArea.style.pointerEvents=lock?'none':'';}"
+              "if(addBtn)addBtn.disabled=lock;"
             "}"
             "function bindUpdatePresetHooks(){"
               "var half=document.querySelector(\"input[name='uphalf']\");"
               "var qtr=document.querySelector(\"input[name='upqtr']\");"
               "var top=document.querySelector(\"input[name='upth']\");"
               "if(!half||!qtr||!top)return;"
-              "half.addEventListener('change',function(){if(half.checked)qtr.checked=false;syncUpdateModeLock();});"
-              "qtr.addEventListener('change',function(){if(qtr.checked)half.checked=false;syncUpdateModeLock();});"
-              "top.addEventListener('change',syncUpdateModeLock);"
-              "syncUpdateModeLock();"
+              "half.addEventListener('change',function(){if(half.checked)qtr.checked=false;syncSchedLock();});"
+              "qtr.addEventListener('change',function(){if(qtr.checked)half.checked=false;syncSchedLock();});"
+              "top.addEventListener('change',syncSchedLock);"
+              "syncSchedLock();"
             "}"
-            "document.addEventListener('DOMContentLoaded',function(){bindUpdatePresetHooks();loadDiag();});"
+            "document.addEventListener('DOMContentLoaded',function(){"
+              "bindUpdatePresetHooks();"
+              "var preloads=document.querySelectorAll('.sched-preload');"
+              "preloads.forEach(function(el){addSchedTime(el.value);});"
+              "loadDiag();"
+            "});"
             "function loadDiag(){"
               "var b=document.getElementById('diagbox');"
               "if(b)b.textContent='(loading...)';"
@@ -1017,34 +1176,55 @@ static void handleWifiPortalSave() {
   bool upTopHour = s_wifiPortalServer.hasArg("upth");
   bool upHalfHour = s_wifiPortalServer.hasArg("uphalf");
   bool upQuarterHour = s_wifiPortalServer.hasArg("upqtr");
-  if (upHalfHour || upQuarterHour || upTopHour) upMode = UPDATE_MODE_AUTO;
-  if (upMode < UPDATE_MODE_MANUAL || upMode > UPDATE_MODE_AUTO) upMode = UPDATE_MODE_MANUAL;
-  if (upQuarterHour) {
-    upMins = 15;
-    upTopHour = false;
-  } else if (upHalfHour) {
-    upMins = 30;
-    upTopHour = false;
-  } else if (upTopHour) {
+  // Parse scheduled times from form (rows named uth_N, utm_N, utp_N)
+  uint16_t schedMins[MAX_SCHED_UPDATES] = {};
+  uint8_t  schedCount = 0;
+  for (int i = 0; i < MAX_SCHED_UPDATES; i++) {
+    String hStr = s_wifiPortalServer.arg(String("uth_") + i);
+    String mStr = s_wifiPortalServer.arg(String("utm_") + i);
+    if (!hStr.length()) break;  // rows are dense from 0
+    int h = hStr.toInt(), m = mStr.toInt();
+    bool pm = s_wifiPortalServer.hasArg(String("utp_") + i);
+    if (h < 1 || h > 12 || m < 0 || m > 59) continue;
+    if (h == 12) h = 0;
+    if (pm) h += 12;
+    schedMins[schedCount++] = (uint16_t)(h * 60 + m);
+  }
+  // Conflict resolution: scheduled times take priority over interval
+  if (schedCount > 0) {
+    upMode = UPDATE_MODE_SCHEDULED;
     upMins = 60;
-  } else if (upMode == UPDATE_MODE_AUTO) {
-    // Default auto schedule with no preset selected.
-    upMins = 60;
-    upTopHour = true;
+    upTopHour = false;
+  } else {
+    if (upHalfHour || upQuarterHour || upTopHour) upMode = UPDATE_MODE_AUTO;
+    if (upMode < UPDATE_MODE_MANUAL || upMode > UPDATE_MODE_SCHEDULED) upMode = UPDATE_MODE_MANUAL;
+    if (upQuarterHour) {
+      upMins = 15;
+      upTopHour = false;
+    } else if (upHalfHour) {
+      upMins = 30;
+      upTopHour = false;
+    } else if (upTopHour) {
+      upMins = 60;
+    } else if (upMode == UPDATE_MODE_AUTO) {
+      // Default auto schedule with no preset selected.
+      upMins = 60;
+      upTopHour = true;
+    }
   }
   int mode = s_wifiPortalServer.arg("cuemode").toInt();
-  if (mode < START_CUE_OFF || mode > START_CUE_VIBE_PULSE) mode = START_CUE_OFF;
+  if (mode < START_CUE_OFF || mode > START_CUE_CHIME3) mode = START_CUE_OFF;
   int chimeVol = s_wifiPortalServer.arg("chimevol").toInt();
   if (chimeVol < 0) chimeVol = 0;
   if (chimeVol > 100) chimeVol = 100;
-  String cuePath = s_wifiPortalServer.arg("cuepath");
-  cuePath.trim();
-  if (!cuePath.length()) {
-    cuePath = (mode == START_CUE_VIBE_PULSE) ? "/230.raw" : "/power_up.raw";
-  }
   bool autoUpdateInSleep = s_wifiPortalServer.hasArg("ausl");
+  int loopsBeforeSleep = s_wifiPortalServer.arg("lbsl").toInt();
+  if (loopsBeforeSleep < 1) loopsBeforeSleep = 1;
+  if (loopsBeforeSleep > 99) loopsBeforeSleep = 99;
+  bool shakeToWake = s_wifiPortalServer.hasArg("stwk");
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
-                       (StartCueMode)mode, (uint8_t)chimeVol, cuePath.c_str(), autoUpdateInSleep);
+                       (StartCueMode)mode, (uint8_t)chimeVol, autoUpdateInSleep,
+                       schedCount, schedMins, loopsBeforeSleep, shakeToWake);
   s_wifiPortalServer.send(200, "text/html",
                           "<!doctype html><html><body style='font-family:Arial;background:#111827;color:#f9fafb;padding:24px;'>"
                           "<h2>Saved</h2><p>Settings stored. Rebooting now.</p></body></html>");
@@ -1197,10 +1377,8 @@ static bool playRawCueFromBuffer(const uint8_t* data, size_t len, uint8_t volume
 
 static bool resolveSelectedCuePathAndVolume(char* outPath, size_t outPathLen, uint8_t* outVolume) {
   if (s_startCueMode == START_CUE_OFF) return false;
-  const char* selectedPath = s_startCuePath;
-  if (!selectedPath || !selectedPath[0]) {
-    selectedPath = (s_startCueMode == START_CUE_VIBE_PULSE) ? "/230.raw" : "/power_up.raw";
-  }
+  const char* selectedPath = cuePathForMode(s_startCueMode);
+  if (!selectedPath || !selectedPath[0]) selectedPath = "/power_up.raw";
   if (outPath && outPathLen > 0) {
     snprintf(outPath, outPathLen, "%s", selectedPath);
   }
@@ -3525,7 +3703,6 @@ static bool buildFilteredZoomRawFromJpeg(const char* jpegPath, const char* rawPa
   if (spriteLooksPartialDecode()) return false;
   if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) return false;
   if (spriteLooksHoldFrameBlockCorrupted()) return false;
-  if (spriteLooksBlackSlabCorrupted()) return false;
 
   applyGentleLowPassOnSprite();
 
@@ -3747,7 +3924,19 @@ static bool frameFileExists(int idx, char prefix = 'f') {
 static bool cachedFrameLooksReusable(int idx) {
   if (idx < 0 || idx >= MAX_FRAMES) return false;
   if (idx >= frameCount) return false;
-  return frameFileExists(idx, 'f');
+  if (!frameFileExists(idx, 'f')) return false;
+  char path[32];
+  makeFramePath('f', idx, path, sizeof(path));
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  size_t sz = f.size();
+  if (sz < 7000) { f.close(); return false; }  // 7000 = MIN_WEATHER_JPEG_BYTES
+  uint8_t hdr[2], tail[2];
+  f.readBytes((char*)hdr, 2);
+  f.seek(sz - 2);
+  f.readBytes((char*)tail, 2);
+  f.close();
+  return (hdr[0] == 0xFF && hdr[1] == 0xD8 && tail[0] == 0xFF && tail[1] == 0xD9);
 }
 
 static void removeFrameFilesByPrefix(char prefix) {
@@ -4027,12 +4216,12 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
 
     if (WiFi.status() != WL_CONNECTED) {
       Serial.printf("\nWiFi fail: %s\n", s_wifiConfig[slot].ssid);
-      appendDiagLog("wifi: fail ssid=%s slot=%d\n", s_wifiConfig[slot].ssid, slot);
+      appendDiagLog("wifi: fail ssid=%s slot=%d millis=%lu ms\n", s_wifiConfig[slot].ssid, slot, millis());
       continue;
     }
     if (!wifiHasInternetConnectivity()) {
       Serial.printf("WiFi no internet: %s\n", s_wifiConfig[slot].ssid);
-      appendDiagLog("wifi: no-internet ssid=%s slot=%d\n", s_wifiConfig[slot].ssid, slot);
+      appendDiagLog("wifi: no-internet ssid=%s slot=%d millis=%lu ms\n", s_wifiConfig[slot].ssid, slot, millis());
       WiFi.disconnect(true);
       continue;
     }
@@ -4040,17 +4229,17 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
     Serial.printf("\nWiFi: %s (%s)\n",
                   WiFi.localIP().toString().c_str(),
                   s_wifiConfig[slot].ssid);
-    appendDiagLog("wifi: ok ssid=%s ip=%s rssi=%d\n",
+    appendDiagLog("wifi: ok ssid=%s ip=%s rssi=%d millis=%lu ms\n",
                   s_wifiConfig[slot].ssid,
                   WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI());
+                  WiFi.RSSI(), millis());
     refreshCachedWifiDisplayState();
     s_wifiSyncInProgress = false;
     return true;
   }
 
   Serial.println("\nWiFi failed");
-  appendDiagLog("wifi: all-slots-failed\n");
+  appendDiagLog("wifi: all-slots-failed millis=%lu ms\n", millis());
   s_wifiSyncInProgress = false;
   return false;
 }
@@ -4067,9 +4256,9 @@ static bool syncClockFromNtpBestEffort(int maxTries = 10) {
   bool ok = (nowUtc > 1700000000);
   if (!ok) {
     Serial.println("ntp best-effort sync pending");
-    appendDiagLog("ntp: fail t=%lld\n", (long long)nowUtc);
+    appendDiagLog("ntp: fail t=%lld millis=%lu ms\n", (long long)nowUtc, millis());
   } else {
-    appendDiagLog("ntp: ok utc=%lld\n", (long long)nowUtc);
+    appendDiagLog("ntp: ok utc=%lld millis=%lu ms\n", (long long)nowUtc, millis());
     writePcf85063(nowUtc);
   }
   return ok;
@@ -5062,8 +5251,8 @@ static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
 
   Serial.printf("raw remap reuse=%d build=%d dec=%d sb=%d wr=%d fill=%d\n",
                 reused, built, decFail, sourceBlack, wrFail, filled);
-  appendDiagLog("raw-remap: reuse=%d build=%d dec=%d sb=%d wr=%d fill=%d\n",
-                reused, built, decFail, sourceBlack, wrFail, filled);
+  appendDiagLog("raw-remap: reuse=%d build=%d dec=%d sb=%d wr=%d fill=%d millis=%lu ms\n",
+                reused, built, decFail, sourceBlack, wrFail, filled, millis());
   return true;
 }
 
@@ -5124,31 +5313,27 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
   g_drawTarget = prevTarget;
 
   if (!ok || !jpegDrawLooksFullFrame()) {
-    if (label) Serial.printf("%s DEC-VERIFY\n", label);
+    if (label) { Serial.printf("%s DEC-VERIFY\n", label); appendDiagLog("vld: %s DEC-VERIFY\n", label); }
     return false;
   }
   if (spriteLooksCompletelyBlack()) {
-    if (label) Serial.printf("%s SRC-BLACK\n", label);
+    if (label) { Serial.printf("%s SRC-BLACK\n", label); appendDiagLog("vld: %s SRC-BLACK\n", label); }
     return false;
   }
   if (spriteLooksPartialDecode()) {
-    if (label) Serial.printf("%s PARTIAL\n", label);
+    if (label) { Serial.printf("%s PARTIAL\n", label); appendDiagLog("vld: %s PARTIAL\n", label); }
     return false;
   }
   if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) {
-    if (label) Serial.printf("%s LINE-CORR\n", label);
+    if (label) { Serial.printf("%s LINE-CORR\n", label); appendDiagLog("vld: %s LINE-CORR\n", label); }
     return false;
   }
   if (spriteLooksHoldFrameBlockCorrupted()) {
-    if (label) Serial.printf("%s BLOCK-CORR\n", label);
-    return false;
-  }
-  if (spriteLooksBlackSlabCorrupted()) {
-    if (label) Serial.printf("%s SLAB-CORR\n", label);
+    if (label) { Serial.printf("%s BLOCK-CORR\n", label); appendDiagLog("vld: %s BLOCK-CORR\n", label); }
     return false;
   }
   if (spriteLooksBottomBandJunkCorrupted()) {
-    if (label) Serial.printf("%s BOTBAND-CORR\n", label);
+    if (label) { Serial.printf("%s BOTBAND-CORR\n", label); appendDiagLog("vld: %s BOTBAND-CORR\n", label); }
     return false;
   }
   return true;
@@ -5294,10 +5479,6 @@ static bool validateStoredWeatherFramePath(const char* path, const char* label) 
     if (label) Serial.printf("%s STORED-BLOCK\n", label);
     return false;
   }
-  if (spriteLooksBlackSlabCorrupted()) {
-    if (label) Serial.printf("%s STORED-SLAB\n", label);
-    return false;
-  }
   if (spriteLooksBottomBandJunkCorrupted()) {
     if (label) Serial.printf("%s STORED-BOTBAND\n", label);
     return false;
@@ -5429,7 +5610,8 @@ static bool weatherFrameLooksSemanticOutlier(int idx, const char* candidatePath,
 
 static bool installValidatedWeatherJpegToPath(const char* finalPath,
                                               size_t jpegLen,
-                                              const char* label = nullptr) {
+                                              const char* label = nullptr,
+                                              bool skipStoredValidate = false) {
   if (!finalPath || jpegLen == 0 || jpegLen > DL_BUF_BYTES) return false;
 
   char tmpPath[64];
@@ -5451,7 +5633,7 @@ static bool installValidatedWeatherJpegToPath(const char* finalPath,
     return false;
   }
 
-  if (!validateStoredWeatherFramePath(tmpPath, label)) {
+  if (!skipStoredValidate && !validateStoredWeatherFramePath(tmpPath, label)) {
     SD.remove(tmpPath);
     return false;
   }
@@ -5732,9 +5914,13 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
   if (!path || !ensureSprite()) return false;
 
   File f = SD.open(path, FILE_READ);
-  if (!f) return false;
+  if (!f) {
+    appendDiagLog("dec-fail: %s no-file\n", path);
+    return false;
+  }
   size_t size = f.size();
   if (size == 0 || size > MAX_JPEG_BYTES) {
+    appendDiagLog("dec-fail: %s sz=%u\n", path, (unsigned)size);
     Serial.printf("jpeg skip %s %u>%u\n",
                   path, (unsigned)size, (unsigned)MAX_JPEG_BYTES);
     f.close();
@@ -5743,9 +5929,15 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
 
   size_t got = f.readBytes((char*)s_dlBuf, size);
   f.close();
-  if (got < size) return false;
+  if (got < size) {
+    appendDiagLog("dec-fail: %s short=%u/%u\n", path, (unsigned)got, (unsigned)size);
+    return false;
+  }
   size_t jpegLen = jpegEffectiveLength(s_dlBuf, got);
-  if (jpegLen == 0) return false;
+  if (jpegLen == 0) {
+    appendDiagLog("dec-fail: %s no-eoi\n", path);
+    return false;
+  }
 
   sprite.fillScreen(TFT_BLACK);
   g_drawTarget = &sprite;
@@ -5779,6 +5971,9 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
     if (decodeOpt >= 0) {
       jpeg.setPixelType(RGB565_BIG_ENDIAN);
       ok = jpeg.decode(0, 0, decodeOpt);
+      if (!ok) appendDiagLog("dec-fail: %s decode\n", path);
+    } else {
+      appendDiagLog("dec-fail: %s dim=%dx%d\n", path, jw, jh);
     }
     jpeg.close();
   }
@@ -5799,6 +5994,7 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
       }
     } else {
       ok = jpegDrawLooksFullFrame();
+      if (!ok) appendDiagLog("dec-fail: %s not-full\n", path);
     }
   }
   return ok;
@@ -6088,11 +6284,6 @@ static bool installValidatedZoomSnapshotAtBbox(HTTPClient& http,
     valid = false;
     Serial.println("zoom rej blk");
   }
-  if (valid && spriteLooksBlackSlabCorrupted()) {
-    valid = false;
-    Serial.println("zoom rej slab");
-  }
-
   if (!valid) {
     SD.remove(tmpPath);
     Serial.println("zoom rej bad");
@@ -6641,8 +6832,7 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
     }
     return false;
   }
-  if (!isTerrainStage &&
-      (spriteLooksHoldFrameBlockCorrupted() || spriteLooksBlackSlabCorrupted())) {
+  if (!isTerrainStage && spriteLooksHoldFrameBlockCorrupted()) {
     // If a cached zoom raw is visually bad, don't reload the same raw again.
     // Purge/rebuild once from the JPEG, then fall back to direct JPEG decode.
     bool recovered = false;
@@ -6656,12 +6846,7 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
       recovered = decodeJpegPathToSprite(path);
     }
     if (!recovered) return false;
-    if (spriteLooksHoldFrameBlockCorrupted() || spriteLooksBlackSlabCorrupted()) {
-      // The display-time block detector is intentionally conservative, but on
-      // deeper zoom stages it can false-positive on legitimate dark/ocean-heavy
-      // crops. At this point we've already purged the cached raw and retried a
-      // fresh decode, so keep the frame instead of collapsing the whole zoom
-      // sequence.
+    if (spriteLooksHoldFrameBlockCorrupted()) {
       Serial.printf("zoom disp warn blk %s\n", path);
     }
   }
@@ -6900,6 +7085,21 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
       }
     }
 
+    // If ≥60% of tiles are dark this is nighttime imagery — skip slab detection.
+    {
+      int darkTiles = 0;
+      int totalTiles = 0;
+      for (int br = 0; br < rows && br < 24; ++br)
+        for (int bc = 0; bc < cols && bc < 24; ++bc) {
+          if (suspect[br][bc]) darkTiles++;
+          totalTiles++;
+        }
+      if (totalTiles > 0 && darkTiles * 100 / totalTiles >= 60) {
+        Serial.printf("scaled slab skip: darkTiles=%d/%d\n", darkTiles, totalTiles);
+        return false;
+      }
+    }
+
     bool seen[24][24] = {};
     int qx[24 * 24];
     int qy[24 * 24];
@@ -6977,8 +7177,7 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
 
 static bool currentScaledPlaybackFrameLooksCorrupted() {
   return scaledFrameLooksFreezeBlockCorrupted() ||
-         scaledFrameLooksHoldBlockCorrupted() ||
-         scaledFrameLooksBlackSlabCorrupted();
+         scaledFrameLooksHoldBlockCorrupted();
 }
 
 static bool currentScaledFreezeFrameLooksCorrupted() {
@@ -6988,10 +7187,6 @@ static bool currentScaledFreezeFrameLooksCorrupted() {
   }
   if (scaledFrameLooksHoldBlockCorrupted()) {
     appendDiagLog("freeze-check: hold-block\n");
-    return true;
-  }
-  if (scaledFrameLooksBlackSlabCorrupted()) {
-    appendDiagLog("freeze-check: slab\n");
     return true;
   }
   return false;
@@ -7192,7 +7387,7 @@ static void refreshZoomSnapshotsForLatestFrame() {
     }
     zoomsRefreshedOk = installed;
     if (refreshWeatherZooms) {
-      appendDiagLog("zoom: weather %s\n", zoomsRefreshedOk ? "ok" : "fail");
+      appendDiagLog("zoom: weather %s millis=%lu ms\n", zoomsRefreshedOk ? "ok" : "fail", millis());
     }
   }
   if (refreshWeatherZooms && zoomsRefreshedOk) {
@@ -7222,7 +7417,7 @@ static void refreshZoomSnapshotsForLatestFrame() {
     float tw, ts, te, tn;
     computeBboxFromCenterKm(centerLat, centerLon, finalWKm, finalHKm, &tw, &ts, &te, &tn);
     bool terrainSnapOk = downloadTerrainSnapshotToPathAtBbox(http, client, newestUtc, tw, ts, te, tn);
-    appendDiagLog("terrain-snap: %s\n", terrainSnapOk ? "ok" : "fail");
+    appendDiagLog("terrain-snap: %s millis=%lu ms\n", terrainSnapOk ? "ok" : "fail", millis());
     if (terrainSnapOk) {
       SD.remove(ZOOM_TERRAIN_DAY_RAW);    // invalidate raws; rebuild at playback
       SD.remove(ZOOM_TERRAIN_NIGHT_RAW);
@@ -7260,9 +7455,9 @@ static void downloadFrames() {
   Serial.printf("heap %u fetch %d src=%s cad=%d lag=%d\n",
                 (unsigned)ESP.getFreeHeap(),
                 totalFrames, s_activeWeatherSource, cadenceMin, lagHours);
-  appendDiagLog("download: start total=%d end=%lld cad=%d lag=%d src=%s heap=%u\n",
+  appendDiagLog("download: start total=%d end=%lld cad=%d lag=%d src=%s heap=%u millis=%lu ms\n",
                 totalFrames, (long long)fetchEnd, cadenceMin, lagHours,
-                s_activeWeatherSource, (unsigned)ESP.getFreeHeap());
+                s_activeWeatherSource, (unsigned)ESP.getFreeHeap(), millis());
 
   // One persistent SSL connection for all frames.
   WiFiClientSecure client;
@@ -7294,7 +7489,7 @@ static void downloadFrames() {
     // Try canonical timestamp first, then -1 min, then +1 min.
     // GIBS scan boundaries often sit 1 minute before the exact :00/:10/:20 mark,
     // so a single-minute probe recovers ~95% of otherwise-missing slots.
-    static const int kGibsOffsetsSec[] = { 0, -60, 60, -120, 120, -180, 180 };
+    static const int kGibsOffsetsSec[] = { 0, -60, 60 };
     constexpr int kGibsOffsetCount = (int)(sizeof(kGibsOffsetsSec) / sizeof(kGibsOffsetsSec[0]));
     for (int attempt = 0; attempt < kGibsOffsetCount; ++attempt) {
       time_t tTry = t + (time_t)kGibsOffsetsSec[attempt];
@@ -7387,9 +7582,13 @@ static void downloadFrames() {
   }
 
   Serial.printf("dl done %d/%d\n", saved, totalFrames);
-  appendDiagLog("download: done saved=%d miss=%d total=%d\n", saved, totalFrames - saved, totalFrames);
+  appendDiagLog("download: done saved=%d miss=%d total=%d millis=%lu ms\n", saved, totalFrames - saved, totalFrames, millis());
 
-  buildRawPlaybackCache();
+  // NOTE: raw build intentionally deferred to setup(); calling here races with
+  // cache-meta commit and always results in dec=frameCount failures (all frames
+  // fail to JPEG-decode because the index reflects old state). setup() re-triggers
+  // the build whenever raw meta is stale, so this call is redundant and wasteful.
+  // buildRawPlaybackCache();  ← removed
 }
 
 // Returns true if rolling sync handled the refresh path itself.
@@ -7403,7 +7602,7 @@ static bool syncFramesRolling() {
   while (!getLocalTime(&ti, 1000) && tries++ < 20) {}
   time_t now = time(nullptr);
   Serial.printf("UTC: %s\n", ctime(&now));
-  appendDiagLog("sync: ntp utc=%lld\n", (long long)now);
+  appendDiagLog("sync: ntp utc=%lld millis=%lu ms\n", (long long)now, millis());
   refreshDisplayLocationTimeFromIpInfo();
   if (syncProgressIsActive()) syncProgressCompletePhase(); // sync phase
 
@@ -7718,6 +7917,7 @@ static bool syncFramesRolling() {
   int saved = 0;
   int reused = 0;
   int downloaded = 0;
+  int dlFail = 0;
   uint8_t downloadedMask[MAX_FRAMES] = {};
   for (int i = 0; i < MAX_FRAMES; i++) rawSourceIdx[i] = -1;
 
@@ -7966,6 +8166,7 @@ static bool syncFramesRolling() {
         downloaded++;
       } else {
         SD.remove(tmpPath);
+        dlFail++;
       }
     }
   }
@@ -8022,14 +8223,17 @@ static bool syncFramesRolling() {
     if (!rebuiltFast) {
       buildRawPlaybackCache();
     }
-    appendDiagLog("sync: roll partial-reuse-trim saved=%d total=%d reused=%d downloaded=%d rebuiltFast=%d\n",
-                  saved, totalFrames, reused, downloaded, (int)rebuiltFast);
+    time_t tailGap = (saved > 0) ? (fetchEnd - newTimes[saved - 1]) : 0;
+    appendDiagLog("sync: roll partial-reuse-trim saved=%d total=%d reused=%d downloaded=%d dlFail=%d tailGap=%llds rebuiltFast=%d\n",
+                  saved, totalFrames, reused, downloaded, dlFail, (long long)tailGap, (int)rebuiltFast);
     return true;
   }
 
-  if (saved < totalFrames && saved > 0 && saved >= cacheCount) {
+  if (saved < totalFrames && saved > 0 && saved >= cacheCount - 10) {
     // Partial roll update: keep whatever could be assembled this pass instead of
     // escalating to a full-refresh loop (some sources routinely expose < target).
+    // Allow up to 10 frames of shrinkage from the old cache (≈100 min of GIBS lag
+    // tolerance) before giving up and triggering a full-refresh.
     if (!commitTempFrames(newTimes, saved)) {
       appendDiagLog("sync: roll partial-commit-fail saved=%d total=%d reused=%d downloaded=%d keep=1\n",
                     saved, totalFrames, reused, downloaded);
@@ -8055,8 +8259,9 @@ static bool syncFramesRolling() {
     if (!rebuiltFast) {
       buildRawPlaybackCache();
     }
-    appendDiagLog("sync: roll partial-keep saved=%d total=%d reused=%d downloaded=%d rebuiltFast=%d\n",
-                  saved, totalFrames, reused, downloaded, (int)rebuiltFast);
+    appendDiagLog("sync: roll partial-keep saved=%d total=%d reused=%d downloaded=%d "
+                  "shrink=%d rebuiltFast=%d\n",
+                  saved, totalFrames, reused, downloaded, cacheCount - saved, (int)rebuiltFast);
     return true;
   }
 
@@ -8118,8 +8323,8 @@ static bool syncFramesRolling() {
   if (!rebuiltFast) {
     buildRawPlaybackCache();
   }
-  appendDiagLog("sync: roll done saved=%d reused=%d downloaded=%d rebuiltFast=%d zoomRefresh=%d\n",
-                saved, reused, downloaded, (int)rebuiltFast, (int)s_zoomSnapshotsRefreshPending);
+  appendDiagLog("sync: roll done saved=%d reused=%d downloaded=%d rebuiltFast=%d zoomRefresh=%d millis=%lu ms\n",
+                saved, reused, downloaded, (int)rebuiltFast, (int)s_zoomSnapshotsRefreshPending, millis());
   return true;
 }
 
@@ -8169,6 +8374,19 @@ static void goToSleep(bool buttonOnly = false) {
   gpio_num_t bootPin = (gpio_num_t)BOOT_BTN_GPIO;
   gpio_pullup_en(bootPin);
   gpio_wakeup_enable(bootPin, GPIO_INTR_LOW_LEVEL);
+  if (s_shakeToWakeEnabled && s_qmiInitialized) {
+    // QMI8658 WoM interrupt TOGGLES on each event — it does not latch high or low.
+    // Level is arbitrary ("jump transition state" per the official example).
+    // Strategy: read current INT1 level, arm the OPPOSITE level.
+    // The next wrist flick toggles INT1 to the armed level → ESP32 wakes.
+    gpio_num_t imuPin = (gpio_num_t)QMI8658_INT1;
+    gpio_pullup_en(imuPin);
+    int int1Level = digitalRead(QMI8658_INT1);
+    gpio_int_type_t wakeOn = (int1Level == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
+    gpio_wakeup_enable(imuPin, wakeOn);
+    appendDiagLog("qmi: shake-wake armed INT1=%d wakeOn=%s\n",
+                  int1Level, wakeOn == GPIO_INTR_HIGH_LEVEL ? "HIGH" : "LOW");
+  }
   esp_sleep_enable_gpio_wakeup();
 
   esp_err_t sleepErr = esp_light_sleep_start();
@@ -8178,6 +8396,7 @@ static void goToSleep(bool buttonOnly = false) {
 
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   Serial.printf("Wake cause: %d\n", (int)wake);
+  // No post-wake IMU clear needed — WoM pin already toggled to wake level.
 
   if (!buttonOnly && s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (connectWifiForSync(false)) {
@@ -8384,6 +8603,10 @@ void setup() {
   while (!Serial && millis() < 5000) delay(10);  // wait for USB host to open port
   delay(500);
   Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
+  loadWifiPortalConfig();  // needed before QMI decision below
+  if (s_shakeToWakeEnabled) {
+    initQmiShakeToWake();
+  }
   configureAxp2101PowerKey();
   Serial.printf("reset reason: %d\n", (int)esp_reset_reason());
   Serial.printf("free heap: %u\n", (unsigned)ESP.getFreeHeap());
@@ -8535,6 +8758,7 @@ void setup() {
     if (diagF) {
       int8_t batPct = readAxp2101BatPct();
       int chargeState = readAxp2101ChargeState();
+      diagF.printf("boot: millis=%lu ms\n", millis());
       diagF.printf("sdCount=%d framesReady=%d frameCount=%d\n", sdCount, (int)framesReady, frameCount);
       diagF.printf("bat=%d%% chargeState=0x%02X resetReason=%d\n",
                    (int)batPct, (unsigned)(chargeState < 0 ? 0xFF : chargeState),
@@ -8703,6 +8927,7 @@ void setup() {
 
   if (framesReady && frameCount > 0 && !rawCacheMetaVersionIsCurrent()) {
     Serial.println("raw meta stale -> rebuild");
+    showMessage("Building...", "Preparing frames");
     buildRawPlaybackCache();
   }
 
@@ -8713,6 +8938,7 @@ void setup() {
     if (!s_streamReady || !s_streamFile) {
       appendDiagLog("setup: stream open failed after sync -> rebuild raw\n");
       invalidateRawCacheMetaState();
+      showMessage("Building...", "Preparing frames");
       buildRawPlaybackCache();
       ensureStreamOpen();
       appendDiagLog("setup: stream ready after rebuild=%d\n",
@@ -8968,7 +9194,7 @@ static bool spriteLooksBottomBandJunkCorrupted() {
   if (numMcuRows < 4) return false;
 
   int transitions = 0;
-  int prevCls     = -1;   // -1=none, 0=dark(>65% zero), 1=light(<30% zero)
+  int prevCls     = -1;   // -1=none, 0=dark(>65% near-black), 1=light(<30% near-black)
 
   for (int mr = 0; mr < numMcuRows; mr++) {
     int y0 = startY + mr * MCU;
@@ -8978,7 +9204,13 @@ static bool spriteLooksBottomBandJunkCorrupted() {
       int row = y * DISP_W;
       for (int x = 0; x < DISP_W; x += stepX) {
         total++;
-        if (px[row + x] == 0) zeros++;
+        uint16_t p = px[row + x];
+        if (s_mainSpritePixelsByteSwapped) p = __builtin_bswap16(p);
+        // Use low-luminance threshold instead of exact zero: JPEG quantization
+        // produces dark-gray (non-zero) values in black/near-black regions, and
+        // byte-swapped pixels are never exactly zero unless the native value is too.
+        int lum = (((p >> 11) & 0x1F) * 3 + ((p >> 5) & 0x3F) + (p & 0x1F) * 2) / 6;
+        if (lum <= 4) zeros++;
       }
     }
     if (total == 0) continue;
@@ -8988,7 +9220,12 @@ static bool spriteLooksBottomBandJunkCorrupted() {
     if (prevCls >= 0 && cls != prevCls) transitions++;
     prevCls = cls;
   }
-  return (transitions >= 3);
+  if (transitions >= 2) {
+    appendDiagLog("botband: tr=%d\n", transitions);
+    Serial.printf("botband transitions=%d\n", transitions);
+    return true;
+  }
+  return false;
 }
 
 static bool spriteLooksBlackSlabCorrupted() {
@@ -9034,6 +9271,20 @@ static bool spriteLooksBlackSlabCorrupted() {
     }
   }
 
+  // If ≥60% of tiles are dark the frame is nighttime (ocean/space/land all dark).
+  // Slab detection is meaningless when darkness is the expected background — skip it.
+  {
+    int darkTiles = 0;
+    for (int br = 0; br < ROWS; ++br)
+      for (int bc = 0; bc < COLS; ++bc)
+        if (suspect[br][bc]) darkTiles++;
+    if (darkTiles * 100 / (ROWS * COLS) >= 60) {
+      Serial.printf("slab skip: darkTiles=%d/%d\n", darkTiles, ROWS * COLS);
+      appendDiagLog("slab: skip darkTiles=%d/%d\n", darkTiles, ROWS * COLS);
+      return false;
+    }
+  }
+
   bool seen[ROWS][COLS] = {};
   int qx[ROWS * COLS];
   int qy[ROWS * COLS];
@@ -9065,8 +9316,9 @@ static bool spriteLooksBlackSlabCorrupted() {
           }
         }
       }
-      if (comp >= 4) {
+      if (comp >= 20) {
         Serial.printf("slab comp=%d\n", comp);
+        appendDiagLog("slab: comp=%d\n", comp);
         return true;
       }
     }
@@ -9105,8 +9357,10 @@ static bool spriteLooksBlackSlabCorrupted() {
   const int leftDark = regionDarkPct(0, DISP_W / 5, y0, y1);
   const int rightDark = regionDarkPct(DISP_W - (DISP_W / 5), DISP_W, y0, y1);
   const int midDark = regionDarkPct(DISP_W / 3, (DISP_W * 2) / 3, y0, y1);
+  appendDiagLog("slab: darkPct l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
   if ((leftDark >= 45 && midDark <= 18) || (rightDark >= 45 && midDark <= 18)) {
     Serial.printf("slab mass l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
+    appendDiagLog("slab: mass l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
     return true;
   }
 
@@ -9131,8 +9385,10 @@ static bool spriteLooksBlackSlabCorrupted() {
   }
   int leftPct = (leftTotal > 0) ? (leftHits * 100 / leftTotal) : 0;
   int rightPct = (rightTotal > 0) ? (rightHits * 100 / rightTotal) : 0;
+  appendDiagLog("slab: edgePct l=%d r=%d\n", leftPct, rightPct);
   if ((leftPct >= 55 && rightPct <= 15) || (rightPct >= 55 && leftPct <= 15)) {
     Serial.printf("slab edge l=%d r=%d\n", leftPct, rightPct);
+    appendDiagLog("slab: edge l=%d r=%d\n", leftPct, rightPct);
     return true;
   }
 
@@ -9151,6 +9407,7 @@ static bool spriteLooksBlackSlabCorrupted() {
     }
     if (count >= 6 && bestRun >= 4) {
       Serial.printf("slab col=%d cnt=%d run=%d\n", bc, count, bestRun);
+      appendDiagLog("slab: col=%d cnt=%d run=%d\n", bc, count, bestRun);
       return true;
     }
   }
@@ -9170,6 +9427,7 @@ static bool spriteLooksBlackSlabCorrupted() {
     }
     if (count >= 6 && bestRun >= 4) {
       Serial.printf("slab row=%d cnt=%d run=%d\n", br, count, bestRun);
+      appendDiagLog("slab: row=%d cnt=%d run=%d\n", br, count, bestRun);
       return true;
     }
   }
@@ -9581,10 +9839,10 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   Serial.printf("wx src=%s layer=%s cad=%d lag=%d\n",
                 s_activeWeatherSource, s_activeGibsLayer,
                 activeCadenceMin(), activeLagHours());
-  appendDiagLog("ip-geo: off=%ld loc=%s lat=%.4f lon=%.4f src=%s cad=%d g=%d\n",
+  appendDiagLog("ip-geo: off=%ld loc=%s lat=%.4f lon=%.4f src=%s cad=%d g=%d millis=%lu ms\n",
                 (long)s_displayUtcOffsetSec, s_displayLocationLabel,
                 (double)s_weatherCenterLat, (double)s_weatherCenterLon,
-                s_activeWeatherSource, activeCadenceMin(), (int)s_weatherGeoValid);
+                s_activeWeatherSource, activeCadenceMin(), (int)s_weatherGeoValid, millis());
 }
 
 static void formatDisplayLocalClockNow(char* out, size_t len) {
@@ -10239,6 +10497,12 @@ void loop() {
 
   bool startCueArmed = s_startCuePending;
 
+  static bool s_animStartLogged = false;
+  if (!s_animStartLogged) {
+    s_animStartLogged = true;
+    appendDiagLog("anim-start: millis=%lu ms\n", millis());
+  }
+
   uint32_t loopStartMs = millis();
   bool preFreezeShown = false;
   int lastDisplayedFrameIdx = -1;
@@ -10373,16 +10637,18 @@ void loop() {
   runCurrentTimeSweepOverlaySegment(newestIdx, baseForClockOverlay);
 
   loopsDone++;
-  Serial.printf("loop %d/%d v=%d t=%u+%u+%u\n",
-                loopsDone, LOOPS_BEFORE_SLEEP,
-                validCount,
-                (unsigned)animationDurationMs,
-                (unsigned)(latestFrameHoldMs + (3U * zoomPreviewStepMs) + terrainTransitionMs),
-                (unsigned)clockOverlayMs);
-  appendDiagLog("loop: %d/%d valid=%d fc=%d newest=%d\n",
-                loopsDone, LOOPS_BEFORE_SLEEP, validCount, frameCount, newestIdx);
+  uint32_t loopElapsedMs = millis() - loopStartMs;
+  uint32_t loopExpectedMs = animationDurationMs + latestFrameHoldMs
+                            + (3U * zoomPreviewStepMs) + terrainTransitionMs + clockOverlayMs;
+  int32_t loopDriftMs = (int32_t)loopElapsedMs - (int32_t)loopExpectedMs;
+  Serial.printf("loop %d/%d v=%d elapsed=%ums expected=%ums drift=%dms\n",
+                loopsDone, s_loopsBeforeSleep,
+                validCount, loopElapsedMs, loopExpectedMs, loopDriftMs);
+  appendDiagLog("loop: %d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d ms\n",
+                loopsDone, s_loopsBeforeSleep, validCount, frameCount, newestIdx,
+                loopElapsedMs, loopExpectedMs, loopDriftMs);
 
-  if (s_sleepModeEnabled && loopsDone >= LOOPS_BEFORE_SLEEP) {
+  if (s_sleepModeEnabled && loopsDone >= s_loopsBeforeSleep) {
     loopsDone = 0;
     goToSleep(false);
     return;

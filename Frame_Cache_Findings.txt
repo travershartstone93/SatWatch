@@ -1,0 +1,132 @@
+Frame Cache Findings (Synthesis)
+Date: 2026-03-08
+Source: Consolidated from PASS 1–PASS 4 in `Investigation-rolling-report.txt`
+Scope: Final conclusions on persistent corrupted frames + slow/unstable cache update behavior.
+
+==================================================
+FINAL FINDINGS (HIGH CONFIDENCE)
+==================================================
+
+1) Reuse policy is the main persistence mechanism
+- New downloads are validated before install.
+- Rolling reuse path still accepts cached frames by existence-only.
+- Result: once a bad `fNNN.jpg` lands on SD, it can survive many cycles even if new ingress validation is strong.
+
+2) Pipeline favors continuity over integrity
+- Raw gap-fill marks failed/missing slots as playable by cloning neighbors.
+- This keeps animation running but hides degraded source quality and preserves artifacts/stutter patterns.
+
+3) Partial-window policies make degradation sticky
+- Rolling logic includes explicit partial keep/trim outcomes.
+- Once cache drops below target, it can remain underfilled across boots instead of deterministically recovering to target.
+
+4) Raw-cache lifecycle mismatch drives long update times
+- Raw validity is tightly coupled to `frameCount` and exact `stream.raw` size.
+- Remap/rebuild/metadata interactions can repeatedly invalidate raw cache and force heavy rebuilds.
+- This explains long “100% but still busy” behavior.
+
+5) Multi-stage rebuilds can happen in one boot
+- Real observed sequence: rolling pass triggers rebuild, then setup triggers another rebuild if raw still stale.
+- This amplifies runtime and user-visible stalls.
+
+6) Downloader fallback improves fill rate but can skew timeline
+- Slot fallback to neighboring timestamps (`±60s`, `±cadence`) can fill missing frames.
+- But slot content may no longer match slot timestamp exactly, causing visible temporal jumps/duplicates.
+
+7) Commit path is structurally fragile
+- Final frame set is removed before temp set is fully promoted.
+- Mid-commit failure can leave cache partially degraded and feed bad state into next rolling cycle.
+
+==================================================
+WHAT THIS RULES OUT
+==================================================
+
+- This is not primarily a display-transfer artifact issue.
+- This is not primarily a “night frames are dark” false-positive issue.
+- Root class is cache/update lifecycle inconsistency, not one single detector threshold.
+
+==================================================
+UNRESOLVED BUT BOUNDED QUESTION
+==================================================
+
+- The exact per-file reason for the observed `built=0/142 dec=142` first rebuild event is still unproven from current logs alone.
+- Most likely class: rebuild attempted against unhealthy intermediate frame set.
+- Needs per-index rebuild decode logging to fully close.
+
+==================================================
+RECOMMENDED PRINTS TO DIAG.TXT
+==================================================
+
+Goal: Add targeted `diag.txt` lines that close the remaining blind spots without flooding logs.
+
+1) Reuse admission decision (per slot)
+- Where: rolling reuse branches before accepting a cached `fNNN.jpg` as reusable.
+- Print: `slot`, `srcIdx`, `fileSize`, `reused=1/0`, `rejectReason`.
+- Why: proves whether bad files are being admitted by existence-only logic.
+
+2) Per-index decode failure cause during raw build
+- Where: raw build loops (full/rolling/remap), right at each reject gate.
+- Print: `idx`, first failing gate (`DEC`, `BLACK`, `PARTIAL`, `LINE`, `BLOCK`, `CYAN`, `BOTBAND`, `SIZE`, `SEM`).
+- Why: closes the open question behind `built=0/... dec=...` events.
+
+3) Raw rebuild stage boundaries + duration
+- Where: entry/exit of each raw path (`buildRawPlaybackCache`, rolling remap, rolling rebuild).
+- Print: `phaseStartMs`, `phaseEndMs`, `durationMs`, `count`, `built/reused/filled`.
+- Why: explains long 100% stalls by identifying exact expensive stage.
+
+4) Raw meta invalidation reason
+- Where: every `rawCacheMetaVersionIsCurrent()` false return path.
+- Print: `reasonCode` (`META_MISSING`, `VER_MISMATCH`, `BITMAP_SHORT`, `SLOTMAP_SHORT`, `NO_VALID`, `SIZE_MISMATCH`) plus expected/actual where applicable.
+- Why: shows why raw becomes stale across boots.
+
+5) Stream size vs frameCount at every sync commit
+- Where: immediately after cache commit and after any raw remap/rebuild.
+- Print: `frameCount`, `expectedStreamBytes`, `actualStreamBytes`, `rawMetaCurrent`.
+- Why: confirms/disproves stream-length mismatch loops.
+
+6) Commit transaction integrity
+- Where: `commitTempFrames()` before delete, after each move, and on failure.
+- Print: `oldFinalCount`, `tempCount`, `movedCount`, `firstFailedIdx`, `rollbackApplied=1/0`.
+- Why: catches destructive mid-commit states that poison later cycles.
+
+7) Partial-window keep/trim rationale
+- Where: each partial exit branch.
+- Print: `branchName`, `saved`, `target`, `reused`, `downloaded`, `dlFail`, `tailGapSec`, `shrink`.
+- Why: makes “why did it keep partial?” explicit for each boot.
+
+8) Fallback timestamp-content mapping
+- Where: any successful fallback fetch (`±60s`, `±cadence`).
+- Print: `slotTargetUtc`, `contentUtc`, `offsetSec`, `installedPath`.
+- Why: confirms timeline skew source for jump/duplicate artifacts.
+
+9) Validation context quality
+- Where: semantic outlier check calls.
+- Print: `idx`, `refIdxA`, `refIdxB`, `refsValid=1/0`, `distanceA/B`, `decision`.
+- Why: proves when neighbor-based validation is operating with weak context.
+
+10) Boot-time heavy-path summary (single line)
+- Where: end of setup sync section.
+- Print: `rolled=1/0`, `fullDownload=1/0`, `rawRebuildCount`, `rawRemapCount`, `zoomRefresh=1/0`, `terrainRefresh=1/0`, `bootSyncMs`.
+- Why: fast triage line for field logs without scrolling.
+
+11) Cache health snapshot after sync (single line)
+- Where: post-sync after all rebuild/remap/fill operations.
+- Print: `frameCount`, `validSlots`, `gapFilledSlots`, `sourceBlackCount`, `oldestUtc`, `newestUtc`.
+- Why: confirms whether cache is healthy or merely playable.
+
+12) One-shot corruption evidence capture
+- Where: first time a frame fails runtime read/show in loop.
+- Print: `idx`, `slotMap`, `seekOk`, `readBytes`, plus a one-time `dumpFlag`.
+- Why: captures failure details without repeated spam.
+
+==================================================
+CONCLUSION
+==================================================
+
+The persistent corruption issue is a pipeline architecture problem:
+- strict validation at ingest,
+- weak validation at reuse,
+- continuity-first fallback (gap-fill/partial-keep),
+- and rebuild/metadata coupling that can re-enter expensive recovery paths.
+
+In short: the system is currently optimized to “always show something” rather than “only keep known-good source frames,” and that tradeoff is the direct cause of both persistent bad frames and unstable/long cache update cycles.
