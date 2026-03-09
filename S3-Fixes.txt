@@ -1533,3 +1533,117 @@ Key findings (not yet fixed, for future reference):
     count across many boots without forcing recovery.
   - Semantic outlier validation is weakest when cache is most degraded
     (loses reference context when neighbors are invalid).
+
+
+FIX 7 — Corrupt JPEGs reused indefinitely by remap/rebuild rolling sync paths
+------------------------------------------------------------------------------
+Symptom:
+  After a resetReason=11 (USB reset / first boot after flash), 56 frames showed
+  `no-eoi` decode failures. On subsequent boots the same files kept failing —
+  diag showed `raw-remap: reuse=87 build=0 dec=56` with no `raw-del` lines.
+  Clearing frames and rebooting resolved the issue, confirming stale corrupt
+  files on SD were the source rather than fresh download errors.
+
+Root cause:
+  `buildRawPlaybackCache()` already deleted corrupt source JPEGs on decode
+  failure and invalidated raw meta.  But `remapRawPlaybackCacheRolling()` and
+  `rebuildRawPlaybackCacheRolling()` both detected decode failures and
+  incremented decFail yet did NOT delete the corrupt files and did NOT
+  invalidate raw meta.
+
+  Rolling sync's reuse-invalid logic only re-downloads files that are MISSING
+  from SD.  Corrupt files that remain on disk are treated as valid and reused
+  without re-download, creating a permanent reuse loop across boots.
+
+Fix applied:
+  esp32-LiveSat-s3.ino
+
+  1. remapRawPlaybackCacheRolling() — decode fail block:
+       { char badPath[32]; makeFramePath('f', i, badPath, sizeof(badPath)); SD.remove(badPath); }
+       appendDiagLog("raw-del: f%03d remap-dec\n", i);
+
+  2. rebuildRawPlaybackCacheRolling() — decode fail block:
+       { char badPath[32]; makeFramePath('f', i, badPath, sizeof(badPath)); SD.remove(badPath); }
+       appendDiagLog("raw-del: f%03d roll-dec\n", i);
+
+  3. End of remapRawPlaybackCacheRolling() — after summary appendDiagLog:
+       if (decFail > 0) {
+         SD.remove(RAW_CACHE_META_FILE);
+         s_rawMetaVersionCurrent = false;
+         appendDiagLog("raw-meta: invalidated remap-dec=%d redownload-next-boot\n", decFail);
+       }
+
+  4. End of rebuildRawPlaybackCacheRolling() — same pattern:
+       if (decFail > 0) {
+         SD.remove(RAW_CACHE_META_FILE);
+         s_rawMetaVersionCurrent = false;
+         appendDiagLog("raw-meta: invalidated roll-dec=%d redownload-next-boot\n", decFail);
+       }
+
+  Effect: corrupt files are deleted on first encounter in any cache path →
+  rolling sync treats them as missing → fresh download on next boot →
+  decode succeeds → clean stream.raw written.
+
+Verification:
+  After fix, clearing frames + reboot resulted in clean download with no
+  decode failures. Corrupt frame loop broken.
+
+
+FIX 8 — SD FAT corruption from ESP.restart() without SD_MMC.end()
+------------------------------------------------------------------
+Symptom:
+  After auto-update reboot (autoUpdateDueNow() in loop(), resetReason=3),
+  22 JPEG files had "no-eoi" and 56 more had internal JPEG decode failures
+  across diverse frame indices (not just lag boundary). Boot log showed:
+    raw-remap: dec=22 (no-eoi) → deleted
+    raw-build: built=60/141 dec=78 fill=81
+  Animation ran but with 81 gap-filled slots and bottom-looking corruption
+  (actually repeated frames from gap-fill covering 43+ consecutive slots).
+
+Root cause:
+  ESP.restart() was called at 5 sites in the firmware with NO prior call to
+  SD_MMC.end(). FatFS maintains an in-memory sector cache for the FAT
+  allocation table. SD_MMC.end() calls sdcard_unmount() → ff_disk_ioctl(CTRL_SYNC)
+  which commits all dirty sectors to the physical card. Without this, the FAT
+  allocation chains written during the current boot's file operations are not
+  committed before reset. After reboot, SD_MMC.begin() reads the stale FAT
+  from disk, causing files to appear with wrong data, truncated content, or
+  corrupt JPEG streams.
+
+  The auto-update path in loop() (line ~10663) was the primary offender — it
+  ran every N minutes, restarting the device each time without flushing the SD.
+  Any frames written during the preceding sync session were left with unflushed
+  FAT entries, becoming corrupt on the next boot.
+
+  The 5 restart sites without SD_MMC.end():
+    Line ~1262: settings saved via portal
+    Line ~1297: clear-frames via portal
+    Line ~1760: portal WiFi-retry success
+    Line ~8669: AXP2101 PKEY short press
+    Line ~10667: autoUpdateDueNow() in loop()
+
+Fix applied:
+  Added SD_MMC.end() immediately before ESP.restart() at all 5 sites.
+  Example (auto-update in loop):
+    if (autoUpdateDueNow()) {
+      showMessage("Auto update", "Rebooting to rescan");
+      delay(300);
+      SD_MMC.end();    // ← ADDED: flush FAT to SD before reset
+      ESP.restart();
+    }
+
+  SD was already properly ended before light sleep (line 8505) — that call
+  was correct and unchanged. Only the restart paths were missing it.
+
+Recovery from this incident:
+  Boot with corruption: remap deleted 22 no-eoi files, build deleted 56 more
+  (78 total). Next boot: rolling sync sees 78 missing slots as reuse-invalid
+  → redownloads → clean remap → animation restored.
+
+Verification:
+  After fix: next auto-update reboot should produce dec=0 fill=0 in
+  subsequent boot's raw-build or remap pass.
+
+Rule:
+  ALWAYS call SD_MMC.end() before ESP.restart(). FatFS does not auto-flush
+  on reset. Missing SD_MMC.end() = filesystem corruption on next mount.

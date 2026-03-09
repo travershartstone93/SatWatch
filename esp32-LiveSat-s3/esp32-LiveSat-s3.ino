@@ -529,6 +529,8 @@ RTC_DATA_ATTR static bool s_sleepModeEnabled = true;
 RTC_DATA_ATTR static bool s_autoUpdateInSleep = true;
 static int s_loopsBeforeSleep = LOOPS_BEFORE_SLEEP;
 static bool s_shakeToWakeEnabled = false;
+static uint16_t s_shakeEntryIgnoreMs = 2000;  // ignore WoM for this long after entering sleep (settle window)
+static uint16_t s_shakeConfirmMs     = 600;   // after settle: require 2nd WoM event within this window (0=any single event wakes)
 static SensorQMI8658 s_qmi;
 static bool s_qmiInitialized = false;
 #if BOARD_IS_AMOLED_206
@@ -726,6 +728,16 @@ static void loadWifiPortalConfig() {
       if (lbsl > 99) lbsl = 99;
       s_loopsBeforeSleep = lbsl;
       s_shakeToWakeEnabled = prefs.getBool("stwk", false);
+      {
+        int setms = prefs.getInt("stwksetms", 2000);
+        if (setms < 0) setms = 0;
+        if (setms > 5000) setms = 5000;
+        s_shakeEntryIgnoreMs = (uint16_t)setms;
+        int dbms = prefs.getInt("stwkdbms", 600);
+        if (dbms < 0) dbms = 0;
+        if (dbms > 2000) dbms = 2000;
+        s_shakeConfirmMs = (uint16_t)dbms;
+      }
       s_lastSuccessfulSyncUtc = (time_t)prefs.getULong64("lsyn", 0ULL);
     }
     prefs.end();
@@ -780,7 +792,8 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
                                  StartCueMode startCueMode, uint8_t chimeVolume,
                                  bool autoUpdateInSleep,
                                  uint8_t schedCount, const uint16_t* schedMinutes,
-                                 int loopsBeforeSleep, bool shakeToWake) {
+                                 int loopsBeforeSleep, bool shakeToWake,
+                                 int shakeEntryIgnoreMs, int shakeConfirmMs) {
   if (!entries) return;
   Preferences prefs;
   if (!prefs.begin("satwatch", false)) return;
@@ -806,6 +819,8 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   prefs.putBool("ausl", autoUpdateInSleep);
   prefs.putInt("lbsl", loopsBeforeSleep);
   prefs.putBool("stwk", shakeToWake);
+  prefs.putInt("stwksetms", shakeEntryIgnoreMs);
+  prefs.putInt("stwkdbms", shakeConfirmMs);
   // build and save scheduled times string
   {
     char schedStr[64] = {};
@@ -828,7 +843,9 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   s_autoUpdateInSleep = autoUpdateInSleep;
   s_loopsBeforeSleep = loopsBeforeSleep;
   s_shakeToWakeEnabled = shakeToWake;
-  if (shakeToWake && !s_qmiInitialized) initQmiShakeToWake();
+  s_shakeEntryIgnoreMs = (uint16_t)shakeEntryIgnoreMs;
+  s_shakeConfirmMs = (uint16_t)shakeConfirmMs;
+  if (shakeToWake && !s_qmiInitialized && s_sleepModeEnabled) initQmiShakeToWake();
   s_scheduledUpdateCount = schedCount;
   for (int i = 0; i < schedCount; i++) s_scheduledUpdateMinutes[i] = schedMinutes[i];
 #if BOARD_IS_AMOLED_206
@@ -1053,6 +1070,12 @@ static void sendWifiPortalPage() {
   html += F("<input type='checkbox' name='stwk' value='1'");
   if (s_shakeToWakeEnabled) html += F(" checked");
   html += F(">Shake to wake (wrist flick wakes from sleep)</label></div>");
+  html += F("<div style='margin-top:8px'><label class='text-sm text-gray-200'>Shake settle delay (ms): <input type='number' name='stwksetms' min='0' max='5000' style='width:5em' value='");
+  html += String((unsigned)s_shakeEntryIgnoreMs);
+  html += F("'></label><div class='hint'>Ignore motion for this long after pressing sleep (filters arm-settling). Default 2000 ms.</div></div>");
+  html += F("<div style='margin-top:8px'><label class='text-sm text-gray-200'>Shake confirm window (ms): <input type='number' name='stwkdbms' min='0' max='2000' style='width:5em' value='");
+  html += String((unsigned)s_shakeConfirmMs);
+  html += F("'></label><div class='hint'>After the settle delay: require a 2nd motion event within this window. Filters single bumps/knocks. Default 600 ms. 0 = any single motion wakes.</div></div>");
   html += F("</div>");
   html += F("<div class='hint'>Portal AP: Sat Watch / 123456789</div>");
   html += F("<div class='hint'>Portal URL: http://satwatch.local/</div>");
@@ -1222,13 +1245,21 @@ static void handleWifiPortalSave() {
   if (loopsBeforeSleep < 1) loopsBeforeSleep = 1;
   if (loopsBeforeSleep > 99) loopsBeforeSleep = 99;
   bool shakeToWake = s_wifiPortalServer.hasArg("stwk");
+  int shakeEntryIgnoreMs = s_wifiPortalServer.arg("stwksetms").toInt();
+  if (shakeEntryIgnoreMs < 0) shakeEntryIgnoreMs = 0;
+  if (shakeEntryIgnoreMs > 5000) shakeEntryIgnoreMs = 5000;
+  int shakeConfirmMs = s_wifiPortalServer.arg("stwkdbms").toInt();
+  if (shakeConfirmMs < 0) shakeConfirmMs = 0;
+  if (shakeConfirmMs > 2000) shakeConfirmMs = 2000;
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
                        (StartCueMode)mode, (uint8_t)chimeVol, autoUpdateInSleep,
-                       schedCount, schedMins, loopsBeforeSleep, shakeToWake);
+                       schedCount, schedMins, loopsBeforeSleep, shakeToWake,
+                       shakeEntryIgnoreMs, shakeConfirmMs);
   s_wifiPortalServer.send(200, "text/html",
                           "<!doctype html><html><body style='font-family:Arial;background:#111827;color:#f9fafb;padding:24px;'>"
                           "<h2>Saved</h2><p>Settings stored. Rebooting now.</p></body></html>");
   delay(600);
+  SD_MMC.end();
   ESP.restart();
 }
 
@@ -1263,6 +1294,7 @@ static void handleClearFrames() {
     "<p>Frame cache invalidated. Rebooting now to re-download all frames.</p>"
     "</body></html>");
   delay(600);
+  SD_MMC.end();
   ESP.restart();
 }
 
@@ -1725,6 +1757,7 @@ static void runWifiConfigPortal(bool canSkip = false) {
     if (connectWifiForSync(false, "Retrying WiFi...")) {
       // Connected — reboot so setup() runs the full sync path cleanly
       appendDiagLog("portal: wifi-retry ok -> restart\n");
+      SD_MMC.end();
       ESP.restart();
     }
     // Still no WiFi — outer loop restarts AP + portal and waits again
@@ -4138,18 +4171,33 @@ static void installCacheStateFromEntries(const CacheEntry* entries, int count) {
 }
 
 static bool commitTempFrames(const time_t* times, int count) {
-  removeFrameFilesByPrefix('f');
-
+  // Interleaved per-slot commit: remove-old + rename-new for each slot
+  // instead of batching 144 removes then 141 renames.
   for (int i = 0; i < count; i++) {
-    if (!moveTempFrameToFinal(i)) {
-      Serial.printf("tmp->f fail %d\n", i);
-      return false;
+    char fPath[32], nPath[32];
+    makeFramePath('f', i, fPath, sizeof(fPath));
+    makeFramePath('n', i, nPath, sizeof(nPath));
+    SD.remove(fPath);
+    if (!SD.rename(nPath, fPath)) {
+      if (!copyFrameFile(nPath, fPath)) {
+        Serial.printf("tmp->f fail %d\n", i);
+        return false;
+      }
+      SD.remove(nPath);
     }
+    if ((i & 15) == 15) delay(1);  // pace every 16 slots for SD controller
   }
 
-  removeFrameFilesByPrefix('n');
+  // Cleanup stale f-files beyond new count + leftover n-files
+  for (int i = count; i < MAX_FRAMES; i++) {
+    char path[32];
+    makeFramePath('f', i, path, sizeof(path));
+    SD.remove(path);
+    makeFramePath('n', i, path, sizeof(path));
+    SD.remove(path);
+  }
 
-  SD.remove(TIMES_FILE);  // FILE_WRITE may append; timestamps must be exact
+  SD.remove(TIMES_FILE);
   File tf = SD.open(TIMES_FILE, FILE_WRITE);
   if (!tf) return false;
   size_t want = (size_t)count * sizeof(time_t);
@@ -4160,6 +4208,23 @@ static bool commitTempFrames(const time_t* times, int count) {
   installCacheState(times, count);
   writeCurrentWeatherViewMeta();
   return true;
+}
+
+static int verifyCommittedFrameIntegrity(int count) {
+  int corrupt = 0;
+  for (int i = 0; i < count; i++) {
+    if (!cachedFrameLooksReusable(i)) {
+      char path[32];
+      makeFramePath('f', i, path, sizeof(path));
+      SD.remove(path);
+      appendDiagLog("post-commit: corrupt idx=%d\n", i);
+      corrupt++;
+    }
+  }
+  if (corrupt > 0) {
+    appendDiagLog("post-commit: %d/%d frames corrupt\n", corrupt, count);
+  }
+  return corrupt;
 }
 
 static bool writeTimesAndInstallCacheState(const time_t* times, int count) {
@@ -4722,6 +4787,12 @@ static void buildRawPlaybackCache() {
       sf.seek(offset); sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
       continue;
     }
+    if (spriteLooksBlackSlabCorrupted()) {
+      Serial.printf("raw skip %d slab\n", i);
+      memset(s_frameDisplayBuf, 0, SCALED_FRAME_BYTES);
+      sf.seek(offset); sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+      continue;
+    }
     char framePath[32];
     makeFramePath('f', i, framePath, sizeof(framePath));
     if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW")) {
@@ -4737,6 +4808,12 @@ static void buildRawPlaybackCache() {
       continue;
     }
     scaleSpriteTo410x360(s_frameDisplayBuf);
+    if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) {
+      Serial.printf("raw skip %d scaled-blk\n", i);
+      memset(s_frameDisplayBuf, 0, SCALED_FRAME_BYTES);
+      sf.seek(offset); sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+      continue;
+    }
 
     // Write this frame's pre-scaled pixels at its fixed offset in the stream
     sf.seek(offset);
@@ -4968,6 +5045,8 @@ static bool rebuildRawPlaybackCacheRolling(const int* sourceIdxForSlot,
     if (!decodeJpegFrameToSprite(i, false)) {
       Serial.printf("raw roll skip %d dec\n", i);
       decFail++;
+      { char badPath[32]; makeFramePath('f', i, badPath, sizeof(badPath)); SD.remove(badPath); }
+      appendDiagLog("raw-del: f%03d roll-dec\n", i);
       writeZeroStreamSlot(newSf, offset);
       continue;
     }
@@ -5002,6 +5081,11 @@ static bool rebuildRawPlaybackCacheRolling(const int* sourceIdxForSlot,
       writeZeroStreamSlot(newSf, offset);
       continue;
     }
+    if (spriteLooksBlackSlabCorrupted()) {
+      Serial.printf("raw roll skip %d slab\n", i);
+      writeZeroStreamSlot(newSf, offset);
+      continue;
+    }
     if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW-ROLL")) {
       Serial.printf("raw roll skip %d size\n", i);
       writeZeroStreamSlot(newSf, offset);
@@ -5013,6 +5097,11 @@ static bool rebuildRawPlaybackCacheRolling(const int* sourceIdxForSlot,
       continue;
     }
     scaleSpriteTo410x360(s_frameDisplayBuf);
+    if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) {
+      Serial.printf("raw roll skip %d scaled-blk\n", i);
+      writeZeroStreamSlot(newSf, offset);
+      continue;
+    }
     if (!newSf.seek(offset) ||
         newSf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES) != SCALED_FRAME_BYTES) {
       Serial.printf("raw roll wr fail %d\n", i);
@@ -5086,6 +5175,11 @@ static bool rebuildRawPlaybackCacheRolling(const int* sourceIdxForSlot,
                 copied, built, decFail, sourceBlack, wrFail, filled);
   appendDiagLog("raw-roll: copy=%d build=%d dec=%d sb=%d wr=%d fill=%d\n",
                 copied, built, decFail, sourceBlack, wrFail, filled);
+  if (decFail > 0) {
+    SD.remove(RAW_CACHE_META_FILE);
+    s_rawMetaVersionCurrent = false;
+    appendDiagLog("raw-meta: invalidated roll-dec=%d redownload-next-boot\n", decFail);
+  }
   return true;
 }
 
@@ -5157,6 +5251,8 @@ static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
     if (!decodeJpegFrameToSprite(i, false)) {
       Serial.printf("raw remap skip %d dec\n", i);
       decFail++;
+      { char badPath[32]; makeFramePath('f', i, badPath, sizeof(badPath)); SD.remove(badPath); }
+      appendDiagLog("raw-del: f%03d remap-dec\n", i);
       continue;
     }
     if (spriteLooksCompletelyBlack()) {
@@ -5184,6 +5280,10 @@ static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
       Serial.printf("raw remap skip %d botband\n", i);
       continue;
     }
+    if (spriteLooksBlackSlabCorrupted()) {
+      Serial.printf("raw remap skip %d slab\n", i);
+      continue;
+    }
     char framePath[32];
     makeFramePath('f', i, framePath, sizeof(framePath));
     if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW-REMAP")) {
@@ -5195,6 +5295,10 @@ static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
       continue;
     }
     scaleSpriteTo410x360(s_frameDisplayBuf);
+    if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) {
+      Serial.printf("raw remap skip %d scaled-blk\n", i);
+      continue;
+    }
     uint32_t offset = (uint32_t)phys * (uint32_t)SCALED_FRAME_BYTES;
     if (!sf.seek(offset) ||
         sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES) != SCALED_FRAME_BYTES) {
@@ -5257,6 +5361,11 @@ static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
                 reused, built, decFail, sourceBlack, wrFail, filled);
   appendDiagLog("raw-remap: reuse=%d build=%d dec=%d sb=%d wr=%d fill=%d millis=%lu ms\n",
                 reused, built, decFail, sourceBlack, wrFail, filled, millis());
+  if (decFail > 0) {
+    SD.remove(RAW_CACHE_META_FILE);
+    s_rawMetaVersionCurrent = false;
+    appendDiagLog("raw-meta: invalidated remap-dec=%d redownload-next-boot\n", decFail);
+  }
   return true;
 }
 
@@ -5336,8 +5445,16 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
     if (label) { Serial.printf("%s BLOCK-CORR\n", label); appendDiagLog("vld: %s BLOCK-CORR\n", label); }
     return false;
   }
+  if (spriteLooksCyanWhiteBlockCorrupted()) {
+    if (label) { Serial.printf("%s CYAN-CORR\n", label); appendDiagLog("vld: %s CYAN-CORR\n", label); }
+    return false;
+  }
   if (spriteLooksBottomBandJunkCorrupted()) {
     if (label) { Serial.printf("%s BOTBAND-CORR\n", label); appendDiagLog("vld: %s BOTBAND-CORR\n", label); }
+    return false;
+  }
+  if (spriteLooksBlackSlabCorrupted()) {
+    if (label) { Serial.printf("%s SLAB-CORR\n", label); appendDiagLog("vld: %s SLAB-CORR\n", label); }
     return false;
   }
   return true;
@@ -5483,8 +5600,16 @@ static bool validateStoredWeatherFramePath(const char* path, const char* label) 
     if (label) Serial.printf("%s STORED-BLOCK\n", label);
     return false;
   }
+  if (spriteLooksCyanWhiteBlockCorrupted()) {
+    if (label) Serial.printf("%s STORED-CYAN\n", label);
+    return false;
+  }
   if (spriteLooksBottomBandJunkCorrupted()) {
     if (label) Serial.printf("%s STORED-BOTBAND\n", label);
+    return false;
+  }
+  if (spriteLooksBlackSlabCorrupted()) {
+    if (label) Serial.printf("%s STORED-SLAB\n", label);
     return false;
   }
   return true;
@@ -5823,6 +5948,117 @@ static bool validateAndRepairCacheSlice(int cacheCount) {
   return validateAndRepairCachedFrames(mask, cacheCount, 1);
 }
 
+// ─────────────────────────────────────────────────────────────
+//  GIBS DescribeDomains — query exact available timestamps
+// ─────────────────────────────────────────────────────────────
+#define MAX_GIBS_AVAIL 160
+static time_t s_gibsAvailTimes[MAX_GIBS_AVAIL];
+static int s_gibsAvailCount = 0;
+
+static time_t parseISOToUtcEpoch(const char* p) {
+  int Y, M, D, h, m, s;
+  if (sscanf(p, "%d-%d-%dT%d:%d:%d", &Y, &M, &D, &h, &m, &s) != 6) return 0;
+  if (Y < 2024 || M < 1 || M > 12 || D < 1 || D > 31) return 0;
+  static const int kDpM[12] = {0,31,59,90,120,151,181,212,243,273,304,334};
+  int y = Y - 1970;
+  int leaps = (y + 1) / 4 - (y + 69) / 100 + (y + 369) / 400;
+  int yd = kDpM[M - 1] + D - 1;
+  if (M > 2 && (Y % 4 == 0) && (Y % 100 != 0 || Y % 400 == 0)) yd++;
+  return ((time_t)y * 365 + leaps + yd) * 86400 + h * 3600 + m * 60 + s;
+}
+
+static time_t snapToNearestGibsTime(time_t t, int maxOffsetSec) {
+  if (s_gibsAvailCount == 0) return 0;
+  int lo = 0, hi = s_gibsAvailCount - 1;
+  while (lo < hi) {
+    int mid = (lo + hi) / 2;
+    if (s_gibsAvailTimes[mid] < t) lo = mid + 1;
+    else hi = mid;
+  }
+  time_t best = 0;
+  long bestDist = (long)maxOffsetSec + 1;
+  for (int i = (lo > 0 ? lo - 1 : 0); i <= lo && i < s_gibsAvailCount; i++) {
+    long dist = labs((long)(s_gibsAvailTimes[i] - t));
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = s_gibsAvailTimes[i];
+    }
+  }
+  return (bestDist <= maxOffsetSec) ? best : 0;
+}
+
+static bool fetchGibsAvailableTimes(WiFiClientSecure& client,
+                                    time_t rangeStart, time_t rangeEnd) {
+  s_gibsAvailCount = 0;
+  char startISO[32], endISO[32];
+  toISO(rangeStart, startISO, sizeof(startISO));
+  toISO(rangeEnd, endISO, sizeof(endISO));
+
+  char url[256];
+  snprintf(url, sizeof(url),
+    "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/wmts.cgi"
+    "?SERVICE=WMTS&REQUEST=DescribeDomains&Version=1.0.0"
+    "&Layer=%s&TileMatrixSet=500m&Time=%s/%s",
+    s_activeGibsLayer, startISO, endISO);
+
+  HTTPClient http;
+  http.begin(client, url);
+  http.setTimeout(10000);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    Serial.printf("DescribeDomains HTTP-%d\n", code);
+    return false;
+  }
+
+  int contentLen = http.getSize();
+  if (contentLen <= 0 || contentLen > (int)(DL_BUF_BYTES - 1)) {
+    http.end();
+    return false;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  size_t rd = stream->readBytes((char*)s_dlBuf, contentLen);
+  http.end();
+  if ((int)rd != contentLen) return false;
+  s_dlBuf[rd] = 0;
+
+  const char* domStart = strstr((char*)s_dlBuf, "<Domain>");
+  const char* domEnd = strstr((char*)s_dlBuf, "</Domain>");
+  if (!domStart || !domEnd) return false;
+  domStart += 8;
+
+  const char* p = domStart;
+  while (p < domEnd && s_gibsAvailCount < MAX_GIBS_AVAIL) {
+    const char* comma = (const char*)memchr(p, ',', domEnd - p);
+    if (!comma) comma = domEnd;
+
+    const char* slash1 = (const char*)memchr(p, '/', comma - p);
+    if (!slash1) { p = comma + 1; continue; }
+    const char* slash2 = (const char*)memchr(slash1 + 1, '/', comma - slash1 - 1);
+    if (!slash2) { p = comma + 1; continue; }
+
+    char buf[32];
+    int len = min((int)(slash1 - p), 31);
+    memcpy(buf, p, len); buf[len] = 0;
+    time_t tStart = parseISOToUtcEpoch(buf);
+
+    len = min((int)(slash2 - slash1 - 1), 31);
+    memcpy(buf, slash1 + 1, len); buf[len] = 0;
+    time_t tEnd = parseISOToUtcEpoch(buf);
+
+    if (tStart > 0 && tEnd >= tStart) {
+      for (time_t tt = tStart; tt <= tEnd && s_gibsAvailCount < MAX_GIBS_AVAIL; tt += 600) {
+        s_gibsAvailTimes[s_gibsAvailCount++] = tt;
+      }
+    }
+    p = comma + 1;
+  }
+
+  Serial.printf("GIBS avail: %d times\n", s_gibsAvailCount);
+  appendDiagLog("gibs: describeDomains count=%d\n", s_gibsAvailCount);
+  return s_gibsAvailCount > 0;
+}
+
 static bool downloadFrameToPathAtBbox(HTTPClient& http,
                                       WiFiClientSecure& client,
                                       time_t t,
@@ -5837,17 +6073,26 @@ static bool downloadFrameToPathAtBbox(HTTPClient& http,
   char url[512];
   size_t jpegLen = 0;
 
-  // Primary timestamp first, then ±1 min probe (GIBS scan boundaries sit
-  // ~1 minute before the exact :00/:10/:20 cadence mark, recovering ~95% of
-  // otherwise-missing slots), then cadence-step fallbacks as last resort.
+  // If GIBS available times are loaded, snap directly to the nearest known
+  // timestamp instead of blind-probing 7 offsets.  Falls back to the old
+  // offset logic when DescribeDomains wasn't fetched.
   const int cadenceSec = max(60, activeCadenceMin() * 60);
+  time_t snappedTime = snapToNearestGibsTime(t, 2 * cadenceSec);
+
   const time_t secondOffsets[] = {0, -60, 60,
                                   -(time_t)cadenceSec,   (time_t)cadenceSec,
                                   -2*(time_t)cadenceSec, 2*(time_t)cadenceSec};
-  const int stepCount = validateWeatherFrame ? 7 : 1;
+  int stepCount;
+  if (snappedTime > 0) {
+    stepCount = 1;
+  } else if (s_gibsAvailCount > 0) {
+    return false;  // avail times loaded but nothing near this slot
+  } else {
+    stepCount = validateWeatherFrame ? 7 : 1;
+  }
 
   for (int si = 0; si < stepCount; ++si) {
-    time_t candT = t + secondOffsets[si];
+    time_t candT = (snappedTime > 0) ? snappedTime : (t + secondOffsets[si]);
     if (candT <= 0) continue;
     toISO(candT, timeISO, sizeof(timeISO));
 
@@ -7089,7 +7334,7 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
       }
     }
 
-    // If ≥60% of tiles are dark this is nighttime imagery — skip slab detection.
+    // If ≥35% of tiles are dark this is nighttime/terminator imagery — skip slab detection.
     {
       int darkTiles = 0;
       int totalTiles = 0;
@@ -7098,7 +7343,7 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
           if (suspect[br][bc]) darkTiles++;
           totalTiles++;
         }
-      if (totalTiles > 0 && darkTiles * 100 / totalTiles >= 60) {
+      if (totalTiles > 0 && darkTiles * 100 / totalTiles >= 20) {
         Serial.printf("scaled slab skip: darkTiles=%d/%d\n", darkTiles, totalTiles);
         return false;
       }
@@ -7135,7 +7380,7 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
             }
           }
         }
-        if (comp >= 6) {
+        if (comp >= 12) {
           Serial.printf("scaled slab comp=%d\n", comp);
           return true;
         }
@@ -7161,7 +7406,7 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
         int minCh = r;
         if (g < minCh) minCh = g;
         if (b < minCh) minCh = b;
-        if (maxCh <= 8 && (maxCh - minCh) <= 3) dark++;
+        if (maxCh <= 5 && (maxCh - minCh) <= 3) dark++;
         total++;
       }
     }
@@ -7172,7 +7417,7 @@ static bool scaledFrameLooksBlackSlabCorrupted() {
   int leftDark = regionDarkPct(0, edgeW);
   int rightDark = regionDarkPct(SCALED_W - edgeW, SCALED_W);
   int midDark = regionDarkPct(SCALED_W / 3, (SCALED_W * 2) / 3);
-  if ((leftDark >= 45 && midDark <= 18) || (rightDark >= 45 && midDark <= 18)) {
+  if ((leftDark >= 70 && midDark <= 18) || (rightDark >= 70 && midDark <= 18)) {
     Serial.printf("scaled slab l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
     return true;
   }
@@ -7469,6 +7714,9 @@ static void downloadFrames() {
   HTTPClient http;
   http.setReuse(true);   // keep-alive — avoids SSL handshake on every frame
 
+  time_t fetchStart = fetchEnd - (time_t)((totalFrames - 1) * cadenceMin * 60);
+  fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
+
   int saved = 0;
   uint8_t downloadedMask[MAX_FRAMES] = {};
   char url[512];
@@ -7490,13 +7738,19 @@ static void downloadFrames() {
     size_t total = 0;
     size_t jpegLen = 0;
     bool fetchedOk = false;
-    // Try canonical timestamp first, then -1 min, then +1 min.
-    // GIBS scan boundaries often sit 1 minute before the exact :00/:10/:20 mark,
-    // so a single-minute probe recovers ~95% of otherwise-missing slots.
+    // If GIBS available times loaded, snap directly; else probe ±1 min.
+    time_t snapped = snapToNearestGibsTime(t, 2 * cadenceMin * 60);
     static const int kGibsOffsetsSec[] = { 0, -60, 60 };
-    constexpr int kGibsOffsetCount = (int)(sizeof(kGibsOffsetsSec) / sizeof(kGibsOffsetsSec[0]));
+    int kGibsOffsetCount;
+    if (snapped > 0) {
+      kGibsOffsetCount = 1;
+    } else if (s_gibsAvailCount > 0) {
+      continue;  // avail times loaded, no data for this slot
+    } else {
+      kGibsOffsetCount = (int)(sizeof(kGibsOffsetsSec) / sizeof(kGibsOffsetsSec[0]));
+    }
     for (int attempt = 0; attempt < kGibsOffsetCount; ++attempt) {
-      time_t tTry = t + (time_t)kGibsOffsetsSec[attempt];
+      time_t tTry = (snapped > 0) ? snapped : (t + (time_t)kGibsOffsetsSec[attempt]);
       if (!buildWeatherFrameUrl(url, sizeof(url), tTry,
                                 bboxWest, bboxSouth, bboxEast, bboxNorth)) continue;
       http.begin(client, url);
@@ -7916,6 +8170,8 @@ static bool syncFramesRolling() {
   HTTPClient http;
   http.setReuse(true);
 
+  fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
+
   time_t newTimes[MAX_FRAMES] = {};
   int rawSourceIdx[MAX_FRAMES];
   int saved = 0;
@@ -8141,10 +8397,8 @@ static bool syncFramesRolling() {
 
       int hit = findCacheEntryByTime(cache, cacheCount, t);
       if (hit >= 0) {
-        char srcPath[32];
-        makeFramePath('f', cache[hit].idx, srcPath, sizeof(srcPath));
         bool reuseOk = cachedFrameLooksReusable(cache[hit].idx);
-        if (reuseOk && copyFrameFile(srcPath, tmpPath)) {
+        if (reuseOk && moveFrameFileToTemp(cache[hit].idx, saved)) {
           cache[hit].used = true;
           rawSourceIdx[saved] = cache[hit].idx;
           newTimes[saved++] = t;
@@ -8155,7 +8409,7 @@ static bool syncFramesRolling() {
           appendDiagLog("sync: roll reuse-invalid idx=%d slot=%d -> redownload\n",
                         cache[hit].idx, slot);
         } else {
-          appendDiagLog("sync: roll reuse-copy-fail idx=%d slot=%d -> redownload\n",
+          appendDiagLog("sync: roll reuse-move-fail idx=%d slot=%d -> redownload\n",
                         cache[hit].idx, slot);
         }
         SD.remove(tmpPath);
@@ -8208,6 +8462,16 @@ static bool syncFramesRolling() {
       removeFrameFilesByPrefix('n');
       return true;
     }
+    {
+      int postCorrupt = verifyCommittedFrameIntegrity(saved);
+      if (postCorrupt > 0) {
+        appendDiagLog("sync: roll partial-reuse post-commit-corrupt=%d/%d -> full-refresh\n",
+                      postCorrupt, saved);
+        removeFrameFilesByPrefix('n');
+        deleteFramesDir();
+        return false;
+      }
+    }
     if (syncProgressIsActive()) {
       syncProgressCompletePhase(); // cache
       syncProgressBeginPhase("finalize", 4);
@@ -8243,6 +8507,16 @@ static bool syncFramesRolling() {
                     saved, totalFrames, reused, downloaded);
       removeFrameFilesByPrefix('n');
       return true;
+    }
+    {
+      int postCorrupt = verifyCommittedFrameIntegrity(saved);
+      if (postCorrupt > 0) {
+        appendDiagLog("sync: roll partial post-commit-corrupt=%d/%d -> full-refresh\n",
+                      postCorrupt, saved);
+        removeFrameFilesByPrefix('n');
+        deleteFramesDir();
+        return false;
+      }
     }
     if (syncProgressIsActive()) {
       syncProgressCompletePhase(); // cache
@@ -8305,6 +8579,17 @@ static bool syncFramesRolling() {
     return true;
   }
 
+  {
+    int postCorrupt = verifyCommittedFrameIntegrity(saved);
+    if (postCorrupt > 0) {
+      appendDiagLog("sync: roll post-commit-corrupt=%d/%d -> full-refresh\n",
+                    postCorrupt, saved);
+      removeFrameFilesByPrefix('n');
+      deleteFramesDir();
+      return false;
+    }
+  }
+
   Serial.printf("roll done r=%d d=%d s=%d\n",
                 reused, downloaded, saved);
   if (syncProgressIsActive()) {
@@ -8339,6 +8624,16 @@ static void goToSleep(bool buttonOnly = false) {
   Serial.printf("Sleeping %d h...\n", SLEEP_HOURS);
   s_buttonSleepTransition = true;
   closeStream();
+
+  // Mute amp before sleep to prevent wake-pop. The I2S clock stops during
+  // light sleep; with amp enabled the bias collapse on wake injects a pop.
+  // Clearing s_audioPathPrimed forces a clean re-prime (silence→enable→settle)
+  // on the next cue after wake.
+  if (s_audioReady) {
+    es8311_voice_mute(s_audioCodec, true);
+    digitalWrite(46, LOW);
+    s_audioPathPrimed = false;
+  }
 
   // Dim backlight before sleep
   if (buttonOnly) {
@@ -8378,7 +8673,7 @@ static void goToSleep(bool buttonOnly = false) {
   gpio_num_t bootPin = (gpio_num_t)BOOT_BTN_GPIO;
   gpio_pullup_en(bootPin);
   gpio_wakeup_enable(bootPin, GPIO_INTR_LOW_LEVEL);
-  if (s_shakeToWakeEnabled && s_qmiInitialized) {
+  if (s_shakeToWakeEnabled && s_qmiInitialized && s_sleepModeEnabled) {
     // QMI8658 WoM interrupt TOGGLES on each event — it does not latch high or low.
     // Level is arbitrary ("jump transition state" per the official example).
     // Strategy: read current INT1 level, arm the OPPOSITE level.
@@ -8399,14 +8694,75 @@ static void goToSleep(bool buttonOnly = false) {
   }
   esp_sleep_enable_gpio_wakeup();
 
-  esp_err_t sleepErr = esp_light_sleep_start();
-  if (sleepErr != ESP_OK) {
-    Serial.printf("Light sleep failed (%d)\n", (int)sleepErr);
-  }
+  // Flush and unmount SD before the SDMMC clock stops during light sleep.
+  // Stopping the clock with the filesystem still mounted can leave the FAT
+  // dirty, causing large runs of files to return wrong sector data on wake.
+  SD_MMC.end();
 
-  esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
-  Serial.printf("Wake cause: %d\n", (int)wake);
-  // No post-wake IMU clear needed — WoM pin already toggled to wake level.
+  // Record when we enter sleep so we can measure elapsed time on WoM wake.
+  // esp_timer_get_time() continues counting through light sleep via the RTC.
+  uint64_t sleepEntryUs = esp_timer_get_time();
+
+  esp_sleep_wakeup_cause_t wake;
+  do {
+    esp_err_t sleepErr = esp_light_sleep_start();
+    if (sleepErr != ESP_OK) {
+      Serial.printf("Light sleep failed (%d)\n", (int)sleepErr);
+    }
+    wake = esp_sleep_get_wakeup_cause();
+    Serial.printf("Wake cause: %d\n", (int)wake);
+
+    // Shake settle window: ignore WoM wakes that happen within
+    // s_shakeEntryIgnoreMs of entering sleep. Pressing the sleep button
+    // always involves arm motion — without this window the device wakes
+    // immediately from that settling motion. After the window any single
+    // wrist flick wakes normally. Button press (topButtonPressed()) always
+    // bypasses this regardless of timing.
+    bool isShakeWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && !topButtonPressed();
+    if (isShakeWake && s_shakeToWakeEnabled && s_qmiInitialized) {
+      int int1Now = digitalRead(QMI8658_INT1);
+      gpio_int_type_t reArmOn = (int1Now == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
+
+      // Layer 1 — settle window: ignore motion within s_shakeEntryIgnoreMs of
+      // entering sleep (covers arm-settling from the button press).
+      uint64_t elapsedMs = (esp_timer_get_time() - sleepEntryUs) / 1000ULL;
+      if (s_shakeEntryIgnoreMs > 0 && elapsedMs < (uint64_t)s_shakeEntryIgnoreMs) {
+        Serial.printf("qmi: shake ignored settle-window elapsed=%llums\n", elapsedMs);
+        gpio_wakeup_enable((gpio_num_t)QMI8658_INT1, reArmOn);
+        esp_sleep_enable_gpio_wakeup();
+        continue;
+      }
+
+      // Layer 2 — confirm window: require a 2nd WoM event (INT1 re-toggle)
+      // within s_shakeConfirmMs. An elbow bump is a single transient and
+      // never produces a 2nd event. A deliberate raise-to-wake motion lasts
+      // >250 ms (the hardware blanking period) and reliably fires twice.
+      // s_shakeConfirmMs=0 skips this and wakes on any single event.
+      if (s_shakeConfirmMs > 0) {
+        bool confirmed = false;
+        uint32_t deadline = (uint32_t)(esp_timer_get_time() / 1000ULL) + s_shakeConfirmMs;
+        while ((int32_t)(deadline - (uint32_t)(esp_timer_get_time() / 1000ULL)) > 0) {
+          if (digitalRead(QMI8658_INT1) != int1Now) {
+            confirmed = true;
+            break;
+          }
+          delay(5);
+        }
+        if (!confirmed) {
+          Serial.println("qmi: shake no-confirm re-arm");
+          gpio_wakeup_enable((gpio_num_t)QMI8658_INT1, reArmOn);
+          esp_sleep_enable_gpio_wakeup();
+          continue;
+        }
+      }
+    }
+    break;  // real wake — fall through to post-wake handling
+  } while (true);
+
+  // Remount SD before any file operations (logs, sync, playback).
+  if (!SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED)) {
+    SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+  }
 
   if (!buttonOnly && s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (connectWifiForSync(false)) {
@@ -8502,6 +8858,7 @@ static void serviceUserButtons() {
     if (irq2 > 0) {
       writeAxp2101Register(0x49, (uint8_t)irq2);
       if (irq2 & 0x08) {  // PKEY short press
+        SD_MMC.end();
         ESP.restart();
       }
     }
@@ -8540,6 +8897,10 @@ static void serviceUserButtons() {
       (uint32_t)(now - pressStartMs) >= TOP_BTN_LONG_PRESS_MS) {
     s_sleepModeEnabled = !s_sleepModeEnabled;
     saveSleepModePreference(s_sleepModeEnabled);
+    // Init WoM when toggling INTO sleep mode; it was skipped at boot in always-on mode.
+    if (s_sleepModeEnabled && s_shakeToWakeEnabled && !s_qmiInitialized) {
+      initQmiShakeToWake();
+    }
     longHandled = true;
     suppressUntilMs = now + TOP_BTN_SUPPRESS_MS;
   } else if (releasePending) {
@@ -8619,7 +8980,7 @@ void setup() {
   delay(500);
   Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
   loadWifiPortalConfig();  // needed before QMI decision below
-  if (s_shakeToWakeEnabled) {
+  if (s_shakeToWakeEnabled && s_sleepModeEnabled) {
     initQmiShakeToWake();
   }
   configureAxp2101PowerKey();
@@ -9286,14 +9647,15 @@ static bool spriteLooksBlackSlabCorrupted() {
     }
   }
 
-  // If ≥60% of tiles are dark the frame is nighttime (ocean/space/land all dark).
-  // Slab detection is meaningless when darkness is the expected background — skip it.
+  // If ≥35% of tiles are dark the frame likely contains a day/night terminator
+  // (GeoColor twilight) or is fully nighttime.  Slab detection fires on the
+  // natural dark-left / bright-right pattern of terminator frames, so skip it.
   {
     int darkTiles = 0;
     for (int br = 0; br < ROWS; ++br)
       for (int bc = 0; bc < COLS; ++bc)
         if (suspect[br][bc]) darkTiles++;
-    if (darkTiles * 100 / (ROWS * COLS) >= 60) {
+    if (darkTiles * 100 / (ROWS * COLS) >= 20) {
       Serial.printf("slab skip: darkTiles=%d/%d\n", darkTiles, ROWS * COLS);
       appendDiagLog("slab: skip darkTiles=%d/%d\n", darkTiles, ROWS * COLS);
       return false;
@@ -9331,7 +9693,7 @@ static bool spriteLooksBlackSlabCorrupted() {
           }
         }
       }
-      if (comp >= 20) {
+      if (comp >= 50) {
         Serial.printf("slab comp=%d\n", comp);
         appendDiagLog("slab: comp=%d\n", comp);
         return true;
@@ -9360,7 +9722,7 @@ static bool spriteLooksBlackSlabCorrupted() {
         int minCh = r;
         if (g < minCh) minCh = g;
         if (b < minCh) minCh = b;
-        if (maxCh <= 8 && (maxCh - minCh) <= 3) dark++;
+        if (maxCh <= 5 && (maxCh - minCh) <= 3) dark++;
         total++;
       }
     }
@@ -9373,7 +9735,7 @@ static bool spriteLooksBlackSlabCorrupted() {
   const int rightDark = regionDarkPct(DISP_W - (DISP_W / 5), DISP_W, y0, y1);
   const int midDark = regionDarkPct(DISP_W / 3, (DISP_W * 2) / 3, y0, y1);
   appendDiagLog("slab: darkPct l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
-  if ((leftDark >= 45 && midDark <= 18) || (rightDark >= 45 && midDark <= 18)) {
+  if ((leftDark >= 70 && midDark <= 18) || (rightDark >= 70 && midDark <= 18)) {
     Serial.printf("slab mass l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
     appendDiagLog("slab: mass l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
     return true;
@@ -9401,7 +9763,7 @@ static bool spriteLooksBlackSlabCorrupted() {
   int leftPct = (leftTotal > 0) ? (leftHits * 100 / leftTotal) : 0;
   int rightPct = (rightTotal > 0) ? (rightHits * 100 / rightTotal) : 0;
   appendDiagLog("slab: edgePct l=%d r=%d\n", leftPct, rightPct);
-  if ((leftPct >= 55 && rightPct <= 15) || (rightPct >= 55 && leftPct <= 15)) {
+  if ((leftPct >= 75 && rightPct <= 15) || (rightPct >= 75 && leftPct <= 15)) {
     Serial.printf("slab edge l=%d r=%d\n", leftPct, rightPct);
     appendDiagLog("slab: edge l=%d r=%d\n", leftPct, rightPct);
     return true;
@@ -9420,7 +9782,7 @@ static bool spriteLooksBlackSlabCorrupted() {
         run = 0;
       }
     }
-    if (count >= 6 && bestRun >= 4) {
+    if (count >= 9 && bestRun >= 7) {
       Serial.printf("slab col=%d cnt=%d run=%d\n", bc, count, bestRun);
       appendDiagLog("slab: col=%d cnt=%d run=%d\n", bc, count, bestRun);
       return true;
@@ -9440,7 +9802,7 @@ static bool spriteLooksBlackSlabCorrupted() {
         run = 0;
       }
     }
-    if (count >= 6 && bestRun >= 4) {
+    if (count >= 12 && bestRun >= 8) {
       Serial.printf("slab row=%d cnt=%d run=%d\n", br, count, bestRun);
       appendDiagLog("slab: row=%d cnt=%d run=%d\n", br, count, bestRun);
       return true;
@@ -10495,6 +10857,7 @@ void loop() {
   if (autoUpdateDueNow()) {
     showMessage("Auto update", "Rebooting to rescan");
     delay(300);
+    SD_MMC.end();
     ESP.restart();
   }
 
@@ -10559,6 +10922,8 @@ void loop() {
               makeFramePath('f', freezeFrameIdx, badPath, sizeof(badPath));
               SD.remove(badPath);
               appendDiagLog("raw-del: f%03d freeze-corrupt\n", freezeFrameIdx);
+              // Remove from in-RAM valid set so this session never re-selects it.
+              if (freezeFrameIdx < MAX_FRAMES) s_streamValid[freezeFrameIdx] = 0;
             }
             bool foundClean = false;
             for (int back = 1; back <= 12 && (int)srcPos - back >= 0; ++back) {
@@ -10575,6 +10940,7 @@ void loop() {
                 makeFramePath('f', backIdx, badPath, sizeof(badPath));
                 SD.remove(badPath);
                 appendDiagLog("raw-del: f%03d freeze-corrupt\n", backIdx);
+                if (backIdx < MAX_FRAMES) s_streamValid[backIdx] = 0;
               }
             }
             if (!foundClean) {
@@ -10586,6 +10952,9 @@ void loop() {
             SD.remove(RAW_CACHE_META_FILE);
             s_rawMetaVersionCurrent = false;
             appendDiagLog("raw-meta: invalidated freeze-corrupt\n");
+            // Force valid-frame index rebuild next loop so evicted frames
+            // are excluded for the remainder of this session.
+            invalidateValidIdxCache();
           }
         }
       } else if (lastDisplayedFrameIdx >= 0) {
