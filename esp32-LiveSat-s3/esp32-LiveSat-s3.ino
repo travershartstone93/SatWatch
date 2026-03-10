@@ -166,6 +166,13 @@ static NullSerialSink s_nullSerial;
 #define WIFI_PORTAL_AP_PASS  "123456789"
 #define WIFI_PORTAL_HOSTNAME "satwatch"
 #define ZOOM_SNAPSHOT_META_FILE SD_ROOT "/frames/zoom.meta"
+
+// ── Pre-allocated frame store (replaces per-frame .jpg files) ──
+#define JPEG_SLOT_BYTES     (64 * 1024)
+#define FRAMES_BIN_FILE     SD_ROOT "/frames/frames.bin"
+#define INDEX_BIN_FILE      SD_ROOT "/frames/index.bin"
+#define INDEX_TMP_FILE      SD_ROOT "/frames/index.tmp"
+#define INDEX_MAGIC         0x4C534658    // "LSFX"
 #define ZOOM1_FILE SD_ROOT "/frames/vz1.jpg"
 #define ZOOM2_FILE SD_ROOT "/frames/vz2.jpg"
 #define ZOOM3_FILE SD_ROOT "/frames/vz3.jpg"
@@ -190,7 +197,6 @@ static NullSerialSink s_nullSerial;
 #define ZOOM_TERRAIN_NIGHT_RAW  SD_ROOT "/frames/terrain_night.raw"
 #define ZOOM_TERRAIN_RADAR_FILE SD_ROOT "/frames/terrain_radar_z3.jpg"
 #define ZOOM_TERRAIN_RADAR_RAW_TMP_FILE SD_ROOT "/frames/.terrain_radar.raw"
-#define RAW_CACHE_VERSION  34   // bump: force one-time raw rebuild after GIF rollback
 #define CACHE_VALIDATE_VERSION 2
 #define ZOOM_META_VERSION 6
 #define WIFI_CONFIG_SLOTS 5
@@ -378,8 +384,6 @@ static LovyanGFX* g_drawTarget = nullptr;
 #else
 static LovyanGFX* g_drawTarget = &tft;
 #endif
-static bool s_rawMetaChecked = false;
-static bool s_rawMetaVersionCurrent = false;
 static int s_jpegMinX = 0;
 static int s_jpegMinY = 0;
 static int s_jpegMaxX = 0;
@@ -400,17 +404,6 @@ static bool spriteLooksHoldFrameBlockCorrupted();
 static bool spriteLooksBlackSlabCorrupted();
 static bool spriteLooksCyanWhiteBlockCorrupted();
 static bool spriteLooksBottomBandJunkCorrupted();
-static bool validateStoredWeatherFramePath(const char* path, const char* label = nullptr);
-static bool weatherFrameLooksCompressedSizeOutlier(int idx, const char* candidatePath,
-                                                   const char* label = nullptr);
-static bool weatherFrameLooksSemanticOutlier(int idx, const char* candidatePath,
-                                             const char* label = nullptr);
-static bool healCachedWeatherFrameFromNeighbor(int idx, int frameLimit = -1);
-static bool downloadFrameToPath(HTTPClient& http,
-                                WiFiClientSecure& client,
-                                time_t t,
-                                const char* sdPath,
-                                size_t* outBytes);
 static bool terrainUsesNightLayerForUtc(time_t weatherFrameUtc);
 static int activeCadenceMin();
 static int activeLagHours();
@@ -441,13 +434,23 @@ static int    s_batChargeState = -1;  // Raw AXP2101 STATUS2 (0x01) byte
 static time_t s_frameTimes[MAX_FRAMES];
 static bool   s_timesLoaded = false;
 static uint8_t s_sourceBlackLogged[MAX_FRAMES];
+
+struct FrameStoreIndex {
+  uint32_t magic;
+  uint16_t head;
+  uint16_t count;
+  time_t   times[MAX_FRAMES];
+  uint32_t jpegLen[MAX_FRAMES];
+  uint8_t  jpegValid[MAX_FRAMES];
+  uint8_t  rawValid[MAX_FRAMES];
+};
+static FrameStoreIndex s_idx;
 RTC_DATA_ATTR static char s_displayLocationLabel[16] = DISPLAY_TZ_LABEL;
 RTC_DATA_ATTR static char s_displayLocationFull[64]  = DISPLAY_TZ_LABEL;
 
 // Stream playback: one contiguous file, kept open during playback.
 // s_streamValid[i] == 1 means frame i was successfully decoded and written.
 static uint8_t s_streamValid[MAX_FRAMES];
-static uint8_t s_streamSlotMap[MAX_FRAMES];
 static File    s_streamFile;
 static bool    s_streamReady = false;
 
@@ -469,7 +472,6 @@ static bool s_zoomSnapshotsRefreshPending = false;
 // Weather zoom stages only refresh when new weather frames were downloaded
 // in this sync cycle (or when zoom assets are missing/stale).
 static bool s_zoomWeatherRefreshNeeded = false;
-RTC_DATA_ATTR static uint8_t s_cacheRepairCursor = 0;
 struct WifiConfigEntry {
   char ssid[33];
   char pass[65];
@@ -568,7 +570,6 @@ static volatile uint32_t s_topBtnPressStartMs = 0;
 static volatile uint32_t s_topBtnReleaseMs = 0;
 static bool s_topBtnIgnoreUntilRelease = false;
 
-struct CacheEntry;
 struct ClockOverlayLayout {
   int textX, textY;
   int textW, textH;
@@ -592,6 +593,14 @@ static void syncProgressCompletePhase();
 static void syncProgressSetPhaseProgress(int current, int total);
 static void syncProgressTick(uint32_t units);
 static void syncProgressEnd();
+static void initFrameStore();
+static bool loadIndex();
+static void writeIndex();
+static bool readJpegFromSlot(int logicalIdx, uint8_t* buf, size_t* outLen);
+static bool writeJpegToSlot(int logicalIdx, const uint8_t* buf, size_t len);
+static bool writeRawToSlot(int logicalIdx, const uint8_t* buf);
+static void syncWeatherFrames();
+static void rebuildRawFromStored();
 
 static void portalFriendlyDelay(uint32_t ms) {
   uint32_t deadline = millis() + ms;
@@ -1276,8 +1285,10 @@ static void sendDiagHandler() {
 
 static void handleClearFrames() {
   // Invalidate the frame cache so the next boot triggers a full re-download.
-  SD.remove(META_FILE);
-  SD.remove(CACHE_VALIDATE_META_FILE);
+  SD.remove(INDEX_BIN_FILE);
+  SD.remove(INDEX_TMP_FILE);
+  SD.remove(META_FILE);           // legacy cleanup
+  SD.remove(CACHE_VALIDATE_META_FILE);  // legacy cleanup
   // Clear the skip-sync NVS flag so the reboot doesn't bypass the sync.
   {
     Preferences prefs;
@@ -1296,6 +1307,43 @@ static void handleClearFrames() {
   delay(600);
   SD_MMC.end();
   ESP.restart();
+}
+
+static void handleServeFrame() {
+  if (!s_wifiPortalServer.hasArg("idx")) {
+    s_wifiPortalServer.send(400, "text/plain", "missing idx param");
+    return;
+  }
+  int idx = s_wifiPortalServer.arg("idx").toInt();
+  if (idx < 0 || idx >= (int)s_idx.count || !s_idx.jpegValid[idx]) {
+    s_wifiPortalServer.send(404, "text/plain", "frame not available");
+    return;
+  }
+  int phys = ((int)s_idx.head + idx) % MAX_FRAMES;
+  size_t len = s_idx.jpegLen[idx];
+  if (len == 0 || len > JPEG_SLOT_BYTES) {
+    s_wifiPortalServer.send(404, "text/plain", "invalid frame length");
+    return;
+  }
+  File f = SD.open(FRAMES_BIN_FILE, FILE_READ);
+  if (!f) {
+    s_wifiPortalServer.send(500, "text/plain", "frames.bin open error");
+    return;
+  }
+  f.seek((uint32_t)phys * JPEG_SLOT_BYTES);
+  s_wifiPortalServer.sendHeader("Cache-Control", "no-cache");
+  s_wifiPortalServer.setContentLength(len);
+  s_wifiPortalServer.send(200, "image/jpeg", "");
+  WiFiClient& cl = s_wifiPortalServer.client();
+  uint8_t chunk[1024];
+  size_t remaining = len;
+  while (remaining > 0) {
+    size_t n = f.read(chunk, min(remaining, sizeof(chunk)));
+    if (n == 0) break;
+    cl.write(chunk, n);
+    remaining -= n;
+  }
+  f.close();
 }
 
 static void sendLsHandler() {
@@ -1356,6 +1404,7 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/diag", HTTP_GET, sendDiagHandler);
   s_wifiPortalServer.on("/ls", HTTP_GET, sendLsHandler);
   s_wifiPortalServer.on("/clearframes", HTTP_POST, handleClearFrames);
+  s_wifiPortalServer.on("/frame", HTTP_GET, handleServeFrame);
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
   s_wifiPortalHandlersReady = true;
 }
@@ -2374,12 +2423,7 @@ static void invalidateStreamSlot(int idx, const char* reason) {
   if (idx < 0 || idx >= MAX_FRAMES) return;
   if (!s_streamValid[idx]) return;
   s_streamValid[idx] = 0;
-  s_streamSlotMap[idx] = 0xFF;
-#if !BOARD_IS_AMOLED_206
-  tft.waitDMA();  // ensure LCD DMA done before SD bus access
-#endif
-  SD.remove(RAW_CACHE_META_FILE);     // force rebuild next boot / next cache check
-  invalidateRawCacheMetaState();
+  if (idx < (int)s_idx.count) s_idx.rawValid[idx] = 0;
   invalidateValidIdxCache();
   Serial.printf("INV idx=%d %s\n", idx, reason ? reason : "?");
 }
@@ -2586,7 +2630,7 @@ static inline uint16_t lerp565_16(uint16_t a, uint16_t b, uint8_t t) {
 
 // Scale sprite (320×176) bilinear → 410×360 canonical little-endian RGB565 into dst.
 // Byte-swap is normalised out in the bswap branch so dst is always canonical.
-// Called once at build time (buildRawPlaybackCache) and before each present
+// Called during raw-slot decode and before each present
 // for paths that draw into sprite then scale.
 static void scaleSpriteTo410x360(uint16_t* dst) {
   const uint16_t* px = (const uint16_t*)sprite.getBuffer();
@@ -3881,49 +3925,6 @@ static bool zoomSnapshotsCurrentAndUsable(time_t newestUtc) {
 // ─────────────────────────────────────────────────────────────
 //  SD helpers
 // ─────────────────────────────────────────────────────────────
-static bool flushSdFat() {
-  SD_MMC.end();
-  return SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
-}
-
-static void deleteFramesDir() {
-  // Remove all files in /frames/ — SD.h doesn't have rmdir,
-  // so we open the dir and remove each file individually.
-  File dir = SD.open(FRAMES_DIR);
-  if (!dir) return;
-  while (true) {
-    File entry = dir.openNextFile();
-    if (!entry) break;
-    char path[64];
-    snprintf(path, sizeof(path), "%s/%s", FRAMES_DIR, entry.name());
-    entry.close();
-    SD.remove(path);
-  }
-  dir.close();
-  SD.rmdir(FRAMES_DIR);
-  flushSdFat();
-}
-
-static int readMetaCount() {
-  File f = SD.open(META_FILE, FILE_READ);
-  if (!f) return 0;
-  char buf[16] = {};
-  f.readBytes(buf, sizeof(buf) - 1);
-  f.close();
-  int n = atoi(buf);
-  return (n > 0 && n <= MAX_FRAMES) ? n : 0;
-}
-
-static void writeMetaCount(int n) {
-  SD.remove(META_FILE);  // FILE_WRITE may append on SD.h; force truncate
-  File f = SD.open(META_FILE, FILE_WRITE);
-  if (!f) return;
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%d\n", n);
-  f.print(buf);
-  f.close();
-}
-
 static void appendDiagLog(const char* fmt, ...) {
   File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
   if (!diagF) return;
@@ -3936,163 +3937,322 @@ static void appendDiagLog(const char* fmt, ...) {
   diagF.close();
 }
 
-static void writeCurrentFrameDimMeta() {
-  char expected[16];
-  snprintf(expected, sizeof(expected), "%d %d", DISP_W, DISP_H);
-  SD.remove(FRAME_DIM_FILE);
-  File f = SD.open(FRAME_DIM_FILE, FILE_WRITE);
-  if (!f) {
-    appendDiagLog("cache-meta: dim write FAIL want='%s'\n", expected);
-    return;
+// ─────────────────────────────────────────────────────────────
+//  Pre-allocated frame store helpers
+// ─────────────────────────────────────────────────────────────
+
+static void initFrameStore() {
+  SD.mkdir(FRAMES_DIR);
+
+  // Delete legacy per-frame files if any exist
+  bool hasLegacy = false;
+  {
+    File lf = SD.open(META_FILE, FILE_READ);
+    if (lf) { lf.close(); hasLegacy = true; }
   }
-  f.print(expected);
-  f.close();
-  appendDiagLog("cache-meta: dim write OK '%s'\n", expected);
+  {
+    File lf = SD.open(TIMES_FILE, FILE_READ);
+    if (lf) { lf.close(); hasLegacy = true; }
+  }
+  if (hasLegacy) {
+    appendDiagLog("initFrameStore: legacy files detected, cleaning up\n");
+    // Remove old metadata files
+    SD.remove(META_FILE);
+    SD.remove(TIMES_FILE);
+    SD.remove(RAW_CACHE_META_FILE);
+    SD.remove(CACHE_VALIDATE_META_FILE);
+    SD.remove(FRAME_DIM_FILE);
+    // Remove old per-frame .jpg files
+    File dir = SD.open(FRAMES_DIR);
+    if (dir) {
+      char names[MAX_FRAMES + 16][20];
+      int nameCount = 0;
+      while (nameCount < (int)(sizeof(names)/sizeof(names[0]))) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        const char* n = entry.name();
+        size_t nlen = strlen(n);
+        entry.close();
+        if (nlen < 5 || nlen >= sizeof(names[0])) continue;
+        if (strcmp(n + nlen - 4, ".jpg") != 0) continue;
+        // Skip zoom files
+        if (strncmp(n, "vz", 2) == 0) continue;
+        if (strncmp(n, "terrain", 7) == 0) continue;
+        strncpy(names[nameCount], n, sizeof(names[0]) - 1);
+        names[nameCount][sizeof(names[0]) - 1] = '\0';
+        nameCount++;
+      }
+      dir.close();
+      for (int k = 0; k < nameCount; k++) {
+        char path[40];
+        snprintf(path, sizeof(path), "%s/%s", FRAMES_DIR, names[k]);
+        SD.remove(path);
+      }
+    }
+    // Also remove old stream.raw (wrong layout for new system)
+    SD.remove(RAW_STREAM_FILE);
+  }
+
+  // Pre-allocate frames.bin (144 × 64KB = 9MB)
+  const size_t framesBinSize = (size_t)MAX_FRAMES * JPEG_SLOT_BYTES;
+  {
+    File f = SD.open(FRAMES_BIN_FILE, FILE_READ);
+    bool needCreate = !f;
+    if (f) {
+      if (f.size() != framesBinSize) needCreate = true;
+      f.close();
+    }
+    if (needCreate) {
+      showMessage("Allocating frames.bin...", "First boot setup");
+      SD.remove(FRAMES_BIN_FILE);
+      File wf = SD.open(FRAMES_BIN_FILE, FILE_WRITE);
+      if (wf) {
+        memset(s_dlBuf, 0, DL_BUF_BYTES);
+        size_t written = 0;
+        while (written < framesBinSize) {
+          size_t chunk = framesBinSize - written;
+          if (chunk > DL_BUF_BYTES) chunk = DL_BUF_BYTES;
+          wf.write(s_dlBuf, chunk);
+          written += chunk;
+          int pct = (int)((written * 100ULL) / framesBinSize);
+          showProgress(pct, 100, "frames.bin");
+          yield();
+        }
+        wf.flush();
+        wf.close();
+        appendDiagLog("initFrameStore: frames.bin created %u bytes\n", (unsigned)framesBinSize);
+      }
+    }
+  }
+
+  // Pre-allocate stream.raw (144 × 295200 = ~42.5MB)
+  const size_t streamRawSize = (size_t)MAX_FRAMES * SCALED_FRAME_BYTES;
+  {
+    File f = SD.open(RAW_STREAM_FILE, FILE_READ);
+    bool needCreate = !f;
+    if (f) {
+      if (f.size() != streamRawSize) needCreate = true;
+      f.close();
+    }
+    if (needCreate) {
+      showMessage("Allocating stream.raw...", "First boot setup");
+      SD.remove(RAW_STREAM_FILE);
+      File wf = SD.open(RAW_STREAM_FILE, FILE_WRITE);
+      if (wf) {
+        memset(s_dlBuf, 0, DL_BUF_BYTES);
+        size_t written = 0;
+        while (written < streamRawSize) {
+          size_t chunk = streamRawSize - written;
+          if (chunk > DL_BUF_BYTES) chunk = DL_BUF_BYTES;
+          wf.write(s_dlBuf, chunk);
+          written += chunk;
+          int pct = (int)((written * 100ULL) / streamRawSize);
+          showProgress(pct, 100, "stream.raw");
+          yield();
+        }
+        wf.flush();
+        wf.close();
+        appendDiagLog("initFrameStore: stream.raw created %u bytes\n", (unsigned)streamRawSize);
+      }
+    }
+  }
 }
 
-static bool cacheValidationMetaIsCurrent() {
-  if (frameCount <= 0 || !s_timesLoaded) return false;
+static bool loadIndex() {
+  memset(&s_idx, 0, sizeof(s_idx));
+  memset(s_streamValid, 0, sizeof(s_streamValid));
 
-  File f = SD.open(CACHE_VALIDATE_META_FILE, FILE_READ);
-  if (!f) return false;
-
-  char buf[96];
-  size_t n = f.readBytesUntil('\n', buf, sizeof(buf) - 1);
+  File f = SD.open(INDEX_BIN_FILE, FILE_READ);
+  if (!f) {
+    appendDiagLog("loadIndex: no index.bin\n");
+    frameCount = 0;
+    framesReady = false;
+    s_timesLoaded = true;
+    return false;
+  }
+  if (f.size() != sizeof(FrameStoreIndex)) {
+    f.close();
+    appendDiagLog("loadIndex: bad size %u\n", (unsigned)f.size());
+    frameCount = 0;
+    framesReady = false;
+    s_timesLoaded = true;
+    return false;
+  }
+  f.read((uint8_t*)&s_idx, sizeof(s_idx));
   f.close();
-  if (n == 0) return false;
-  buf[n] = '\0';
 
-  unsigned ver = 0;
-  int count = 0;
-  long long first = 0;
-  long long last = 0;
-  if (sscanf(buf, "%u %d %lld %lld", &ver, &count, &first, &last) != 4) return false;
-  if (ver != CACHE_VALIDATE_VERSION) return false;
-  if (count != frameCount) return false;
-  if ((time_t)first != s_frameTimes[0]) return false;
-  if ((time_t)last != s_frameTimes[frameCount - 1]) return false;
+  if (s_idx.magic != INDEX_MAGIC) {
+    appendDiagLog("loadIndex: bad magic 0x%08X\n", s_idx.magic);
+    memset(&s_idx, 0, sizeof(s_idx));
+    frameCount = 0;
+    framesReady = false;
+    s_timesLoaded = true;
+    return false;
+  }
+
+  // SOI sanity check: verify jpegValid slots have valid JPEG headers
+  File fb = SD.open(FRAMES_BIN_FILE, FILE_READ);
+  if (fb) {
+    for (int i = 0; i < (int)s_idx.count; i++) {
+      if (!s_idx.jpegValid[i]) continue;
+      int phys = ((int)s_idx.head + i) % MAX_FRAMES;
+      uint32_t off = (uint32_t)phys * JPEG_SLOT_BYTES;
+      uint8_t hdr[2] = {0, 0};
+      fb.seek(off);
+      fb.read(hdr, 2);
+      if (hdr[0] != 0xFF || hdr[1] != 0xD8) {
+        appendDiagLog("loadIndex: SOI fail slot %d phys %d\n", i, phys);
+        s_idx.jpegValid[i] = 0;
+        s_idx.rawValid[i] = 0;
+      }
+    }
+    fb.close();
+  }
+
+  // Populate compatibility arrays
+  int validCount = 0;
+  for (int i = 0; i < (int)s_idx.count && i < MAX_FRAMES; i++) {
+    s_frameTimes[i] = s_idx.times[i];
+    s_streamValid[i] = s_idx.rawValid[i];
+    if (s_idx.rawValid[i]) validCount++;
+  }
+  for (int i = (int)s_idx.count; i < MAX_FRAMES; i++) {
+    s_frameTimes[i] = 0;
+    s_streamValid[i] = 0;
+  }
+
+  frameCount = (int)s_idx.count;
+  framesReady = (frameCount > 0 && validCount > 0);
+  s_timesLoaded = true;
+  invalidateValidIdxCache();
+
+  appendDiagLog("loadIndex: count=%d head=%d valid=%d\n",
+                frameCount, (int)s_idx.head, validCount);
   return true;
 }
 
-static void writeCurrentCacheValidationMeta() {
-  if (frameCount <= 0 || !s_timesLoaded) return;
+static void writeIndex() {
+  s_idx.magic = INDEX_MAGIC;
 
-  SD.remove(CACHE_VALIDATE_META_FILE);
-  File f = SD.open(CACHE_VALIDATE_META_FILE, FILE_WRITE);
-  if (!f) return;
-  f.printf("%u %d %lld %lld\n",
-           (unsigned)CACHE_VALIDATE_VERSION,
-           frameCount,
-           (long long)s_frameTimes[0],
-           (long long)s_frameTimes[frameCount - 1]);
+  // Write to tmp, flush, rename for atomic commit
+  SD.remove(INDEX_TMP_FILE);
+  File f = SD.open(INDEX_TMP_FILE, FILE_WRITE);
+  if (!f) {
+    appendDiagLog("writeIndex: open tmp fail\n");
+    return;
+  }
+  f.write((const uint8_t*)&s_idx, sizeof(s_idx));
+  f.flush();
   f.close();
+
+  SD.remove(INDEX_BIN_FILE);
+  if (!SD.rename(INDEX_TMP_FILE, INDEX_BIN_FILE)) {
+    appendDiagLog("writeIndex: rename fail\n");
+  }
+
+  // Sync compatibility arrays
+  for (int i = 0; i < (int)s_idx.count && i < MAX_FRAMES; i++) {
+    s_frameTimes[i] = s_idx.times[i];
+    s_streamValid[i] = s_idx.rawValid[i];
+  }
+  for (int i = (int)s_idx.count; i < MAX_FRAMES; i++) {
+    s_frameTimes[i] = 0;
+    s_streamValid[i] = 0;
+  }
+  frameCount = (int)s_idx.count;
+  framesReady = (frameCount > 0);
+  s_timesLoaded = true;
+  invalidateValidIdxCache();
 }
 
-struct CacheEntry {
-  time_t t;
-  int idx;
-  bool used;
-};
+static bool readJpegFromSlot(int logicalIdx, uint8_t* buf, size_t* outLen) {
+  if (logicalIdx < 0 || logicalIdx >= (int)s_idx.count) return false;
+  if (!s_idx.jpegValid[logicalIdx]) return false;
+  int phys = ((int)s_idx.head + logicalIdx) % MAX_FRAMES;
+  uint32_t off = (uint32_t)phys * JPEG_SLOT_BYTES;
+  size_t len = s_idx.jpegLen[logicalIdx];
+  if (len == 0 || len > JPEG_SLOT_BYTES) return false;
 
-static void makeFramePathByTime(time_t t, char* out, size_t len) {
-  snprintf(out, len, "%s/%lu.jpg", FRAMES_DIR, (unsigned long)t);
-}
-
-static void makeFramePathByIdx(int idx, char* out, size_t len) {
-  makeFramePathByTime(s_frameTimes[idx], out, len);
-}
-
-static bool frameFileExistsByTime(time_t t) {
-  if (t == 0) return false;
-  char path[32];
-  makeFramePathByTime(t, path, sizeof(path));
-  File f = SD.open(path, FILE_READ);
-  bool ok = (bool)f;
-  if (f) f.close();
-  return ok;
-}
-
-static bool frameFileExists(int idx) {
-  if (idx < 0 || idx >= MAX_FRAMES || s_frameTimes[idx] == 0) return false;
-  return frameFileExistsByTime(s_frameTimes[idx]);
-}
-
-static bool cachedFrameLooksReusable(time_t t) {
-  if (t == 0) return false;
-  if (!frameFileExistsByTime(t)) return false;
-  char path[32];
-  makeFramePathByTime(t, path, sizeof(path));
-  File f = SD.open(path, FILE_READ);
+  File f = SD.open(FRAMES_BIN_FILE, FILE_READ);
   if (!f) return false;
-  size_t sz = f.size();
-  if (sz < 7000) { f.close(); return false; }
-  uint8_t hdr[2], tail[2];
-  f.readBytes((char*)hdr, 2);
-  f.seek(sz - 2);
-  f.readBytes((char*)tail, 2);
+  f.seek(off);
+  size_t got = f.read(buf, len);
   f.close();
-  return (hdr[0] == 0xFF && hdr[1] == 0xD8 && tail[0] == 0xFF && tail[1] == 0xD9);
+  if (got != len) return false;
+  if (outLen) *outLen = len;
+  return true;
 }
 
-static void removeStaleFrameFiles(const time_t* activeTimes, int activeCount) {
-  File dir = SD.open(FRAMES_DIR);
-  if (!dir) return;
-  // Collect names first — deleting while iterating can skip entries
-  char names[MAX_FRAMES + 16][20];
-  int nameCount = 0;
-  while (nameCount < (int)(sizeof(names)/sizeof(names[0]))) {
-    File entry = dir.openNextFile();
-    if (!entry) break;
-    const char* n = entry.name();
-    size_t nlen = strlen(n);
-    entry.close();
-    if (nlen < 5 || nlen >= sizeof(names[0])) continue;
-    if (strcmp(n + nlen - 4, ".jpg") != 0) continue;
-    // Skip .part files
-    if (nlen > 5 && strstr(n, ".part")) continue;
-    strncpy(names[nameCount], n, sizeof(names[0]) - 1);
-    names[nameCount][sizeof(names[0]) - 1] = '\0';
-    nameCount++;
-  }
-  dir.close();
+static bool writeJpegToSlot(int logicalIdx, const uint8_t* buf, size_t len) {
+  if (logicalIdx < 0 || logicalIdx >= MAX_FRAMES) return false;
+  if (len == 0 || len > JPEG_SLOT_BYTES) return false;
+  int phys = ((int)s_idx.head + logicalIdx) % MAX_FRAMES;
+  uint32_t off = (uint32_t)phys * JPEG_SLOT_BYTES;
 
-  for (int k = 0; k < nameCount; k++) {
-    const char* n = names[k];
-    // Delete any old-format f/n-prefix files
-    if ((n[0] == 'f' || n[0] == 'n') && n[1] >= '0' && n[1] <= '9') {
-      char path[40];
-      snprintf(path, sizeof(path), "%s/%s", FRAMES_DIR, n);
-      SD.remove(path);
-      continue;
-    }
-    // Parse timestamp
-    char* endp = nullptr;
-    unsigned long ts = strtoul(n, &endp, 10);
-    if (!endp || strcmp(endp, ".jpg") != 0 || ts == 0) continue;
-    bool active = false;
-    for (int i = 0; i < activeCount; i++) {
-      if ((unsigned long)activeTimes[i] == ts) { active = true; break; }
-    }
-    if (!active) {
-      char path[40];
-      snprintf(path, sizeof(path), "%s/%s", FRAMES_DIR, n);
-      SD.remove(path);
-    }
-  }
-  // Flush dirty FAT sectors to disk — SD.remove() dirties FAT sector buffer
-  // and subsequent reads can get corrupt cluster-chain data if not flushed
-  if (nameCount > 0) flushSdFat();
+  File f = SD.open(FRAMES_BIN_FILE, "r+");
+  if (!f) return false;
+  f.seek(off);
+  size_t written = f.write(buf, len);
+  f.flush();
+  f.close();
+  if (written != len) return false;
+
+  s_idx.jpegLen[logicalIdx] = (uint32_t)len;
+  s_idx.jpegValid[logicalIdx] = 1;
+  return true;
 }
 
-static void removeObsoleteGifAssetsIfPresent() {
-  bool removed = false;
-  removed = SD.remove(SD_ROOT "/radar_gif_70/meta.txt") || removed;
-  removed = SD.remove(SD_ROOT "/radar_gif_70/frames_le_rgb565.bin") || removed;
-  removed = SD.remove(SD_ROOT "/radar_gif_70/delays_ms_u16.bin") || removed;
-  if (removed) {
-    SD.rmdir(SD_ROOT "/radar_gif_70");
-    Serial.println("removed obsolete radar_gif_70 assets");
+static bool writeRawToSlot(int logicalIdx, const uint8_t* buf) {
+  if (logicalIdx < 0 || logicalIdx >= MAX_FRAMES) return false;
+  int phys = ((int)s_idx.head + logicalIdx) % MAX_FRAMES;
+  uint32_t off = (uint32_t)phys * (uint32_t)SCALED_FRAME_BYTES;
+
+  File f = SD.open(RAW_STREAM_FILE, "r+");
+  if (!f) return false;
+  f.seek(off);
+  size_t written = f.write(buf, SCALED_FRAME_BYTES);
+  f.flush();
+  f.close();
+  if (written != SCALED_FRAME_BYTES) return false;
+
+  s_idx.rawValid[logicalIdx] = 1;
+  s_streamValid[logicalIdx] = 1;
+  return true;
+}
+
+// Decode JPEG from s_dlBuf, validate all sprite checks, scale, write raw slot.
+// Returns true if raw slot was successfully written.
+static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
+  if (!ensureSprite() || !s_frameDisplayBuf) return false;
+
+  LovyanGFX* prevTarget = g_drawTarget;
+  sprite.fillScreen(TFT_BLACK);
+  g_drawTarget = &sprite;
+  resetJpegDrawStats();
+
+  bool ok = false;
+  if (jpeg.openRAM(s_dlBuf, (int)jpegLen, jpegDraw)) {
+    if (jpeg.getWidth() == DISP_W && jpeg.getHeight() == DISP_H) {
+      jpeg.setPixelType(RGB565_BIG_ENDIAN);
+      ok = jpeg.decode(0, 0, 0);
+    }
+    jpeg.close();
   }
+  g_drawTarget = prevTarget;
+
+  if (!ok || !jpegDrawLooksFullFrame()) return false;
+  if (spriteLooksCompletelyBlack()) return false;
+  if (spriteLooksPartialDecode()) return false;
+  if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) return false;
+  if (spriteLooksHoldFrameBlockCorrupted()) return false;
+  if (spriteLooksCyanWhiteBlockCorrupted()) return false;
+  if (spriteLooksBottomBandJunkCorrupted()) return false;
+  if (spriteLooksBlackSlabCorrupted()) return false;
+
+  scaleSpriteTo410x360(s_frameDisplayBuf);
+  if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) return false;
+
+  return writeRawToSlot(logicalIdx, (const uint8_t*)s_frameDisplayBuf);
 }
 
 static bool copyFrameFile(const char* srcPath, const char* dstPath) {
@@ -4127,165 +4287,158 @@ static bool copyFrameFile(const char* srcPath, const char* dstPath) {
   return ok;
 }
 
-
-static int detectForwardWindowShift(const CacheEntry* entries,
-                                    int count,
-                                    time_t fetchStart,
-                                    int totalFrames) {
-  if (!entries || count <= 1 || count > totalFrames || totalFrames <= 1) return -1;
-  time_t cadenceSec = (time_t)activeCadenceMin() * 60;
-  if (cadenceSec <= 0) return -1;
-
-  time_t delta = fetchStart - entries[0].t;
-  if (delta <= 0 || (delta % cadenceSec) != 0) return -1;
-
-  int shift = (int)(delta / cadenceSec);
-  if (shift <= 0 || shift >= count) return -1;
-
-  for (int i = shift; i < count; i++) {
-    time_t expected = fetchStart + (time_t)((i - shift) * cadenceSec);
-    if (entries[i].idx != i || entries[i].t != expected) return -1;
+static void removeObsoleteGifAssetsIfPresent() {
+  bool removed = false;
+  removed = SD.remove(SD_ROOT "/radar_gif_70/meta.txt") || removed;
+  removed = SD.remove(SD_ROOT "/radar_gif_70/frames_le_rgb565.bin") || removed;
+  removed = SD.remove(SD_ROOT "/radar_gif_70/delays_ms_u16.bin") || removed;
+  if (removed) {
+    SD.rmdir(SD_ROOT "/radar_gif_70");
+    Serial.println("removed obsolete radar_gif_70 assets");
   }
-  return shift;
 }
 
-static int loadCacheEntries(CacheEntry* out, int maxEntries) {
-  int n = readMetaCount();
-  if (n <= 0 || n > maxEntries) return 0;
 
-  File tf = SD.open(TIMES_FILE, FILE_READ);
-  if (!tf) return 0;
+// Simplified path-based JPEG installer for zoom/terrain downloads.
+// Writes s_dlBuf to disk via tmp+rename with SOI/EOI verify.
+static bool installValidatedWeatherJpegToPath(const char* finalPath,
+                                              size_t jpegLen,
+                                              const char* label = nullptr,
+                                              bool skipStoredValidate = false) {
+  (void)skipStoredValidate;
+  if (!finalPath || jpegLen == 0 || jpegLen > DL_BUF_BYTES) return false;
 
-  size_t wantBytes = (size_t)n * sizeof(time_t);
-  size_t haveBytes = tf.size();
-  if (haveBytes < wantBytes) {
-    Serial.printf("times small %u<%u\n",
-                  (unsigned)haveBytes, (unsigned)wantBytes);
-    appendDiagLog("times: small have=%u want=%u n=%d\n",
-                  (unsigned)haveBytes, (unsigned)wantBytes, n);
-    tf.close();
-    return 0;
-  }
-  if (haveBytes > wantBytes) {
-    size_t tailOffset = haveBytes - wantBytes;
-    Serial.printf("times big %u>%u\n",
-                  (unsigned)haveBytes, (unsigned)wantBytes);
-    appendDiagLog("times: big have=%u want=%u n=%d\n",
-                  (unsigned)haveBytes, (unsigned)wantBytes, n);
-    tf.seek((uint32_t)tailOffset);
-  }
+  char tmpPath[64];
+  snprintf(tmpPath, sizeof(tmpPath), "%s.part", finalPath);
+  SD.remove(tmpPath);
 
-  int count = 0;
-  for (int i = 0; i < n; i++) {
-    time_t t = 0;
-    if (tf.read((uint8_t*)&t, sizeof(time_t)) != (int)sizeof(time_t)) break;
-    t = roundToCadence(t);  // normalize older caches written with non-zero seconds
-    if (t == 0 || !frameFileExistsByTime(t)) continue;
-    out[count].t = t;
-    out[count].idx = i;
-    out[count].used = false;
-    count++;
-  }
-  tf.close();
-  return count;
-}
-
-static int findCacheEntryByTime(CacheEntry* entries, int count, time_t t) {
-  for (int i = 0; i < count; i++) {
-    if (!entries[i].used && entries[i].t == t) return i;
-  }
-  return -1;
-}
-
-static bool cacheMatchesWindowExactly(const CacheEntry* entries,
-                                      int count,
-                                      time_t fetchStart,
-                                      int totalFrames) {
-  if (count != totalFrames || totalFrames <= 0) return false;
-
-  for (int i = 0; i < totalFrames; i++) {
-    time_t expected = fetchStart + (time_t)(i * activeCadenceMin() * 60);
-    if (entries[i].idx != i || entries[i].t != expected) return false;
-  }
-  return true;
-}
-
-static bool cacheMatchesWindowPrefix(const CacheEntry* entries,
-                                     int count,
-                                     time_t fetchStart,
-                                     int totalFrames) {
-  if (!entries || count <= 0 || count >= totalFrames || totalFrames <= 0) return false;
-  for (int i = 0; i < count; i++) {
-    time_t expected = fetchStart + (time_t)(i * activeCadenceMin() * 60);
-    if (entries[i].idx != i || entries[i].t != expected) return false;
-  }
-  return true;
-}
-
-static void installCacheState(const time_t* times, int count) {
-  for (int i = 0; i < count && i < MAX_FRAMES; i++) {
-    s_frameTimes[i] = times[i];
-  }
-  for (int i = count; i < MAX_FRAMES; i++) {
-    s_frameTimes[i] = 0;
-  }
-  s_timesLoaded = (count > 0);
-  writeMetaCount(count);
-  if (count > 0) writeCurrentFrameDimMeta();
-  frameCount = count;
-  framesReady = (count > 0);
-}
-
-static void installCacheStateFromEntries(const CacheEntry* entries, int count) {
-  time_t times[MAX_FRAMES];
-  int n = (count > MAX_FRAMES) ? MAX_FRAMES : count;
-  for (int i = 0; i < n; i++) times[i] = entries[i].t;
-  installCacheState(times, n);
-}
-
-static int verifyCommittedFrameIntegrity(int count) {
-  // Full sequential read verification — catches FAT cluster chain corruption
-  // that the old SOI+EOI spot-check missed (corrupt intermediate clusters
-  // produce no-eoi on full read even when head/tail bytes look fine).
-  flushSdFat();  // ensure FAT is clean before reading cluster chains
-  int corrupt = 0;
-  for (int i = 0; i < count; i++) {
-    char path[32];
-    if (s_frameTimes[i] == 0) { corrupt++; continue; }
-    makeFramePathByIdx(i, path, sizeof(path));
-    File f = SD.open(path, FILE_READ);
-    if (!f) { corrupt++; continue; }
-    size_t sz = f.size();
-    if (sz < 7000 || sz > DL_BUF_BYTES) { f.close(); SD.remove(path); flushSdFat(); corrupt++; appendDiagLog("post-commit: bad-sz idx=%d sz=%u\n", i, (unsigned)sz); continue; }
-    size_t got = f.readBytes((char*)s_dlBuf, sz);
+  File f = SD.open(tmpPath, FILE_WRITE);
+  size_t written = 0;
+  if (f) {
+    written = f.write(s_dlBuf, jpegLen);
+    f.flush();
     f.close();
-    if (got < sz || jpegEffectiveLength(s_dlBuf, got) == 0) {
-      SD.remove(path);
-      flushSdFat();  // flush after delete so next read doesn't get stale FAT
-      appendDiagLog("post-commit: corrupt idx=%d got=%u/%u\n", i, (unsigned)got, (unsigned)sz);
-      corrupt++;
-    }
-    if ((i & 7) == 7) yield();
   }
-  if (corrupt > 0) {
-    appendDiagLog("post-commit: %d/%d frames corrupt\n", corrupt, count);
+  if (written != jpegLen) {
+    SD.remove(tmpPath);
+    if (label) appendDiagLog("inst: %s SD-ERR wr=%u want=%u\n", label, (unsigned)written, (unsigned)jpegLen);
+    return false;
   }
-  return corrupt;
+
+  // Quick SOI/EOI verify on what was written
+  File vf = SD.open(tmpPath, FILE_READ);
+  if (!vf || (size_t)vf.size() != jpegLen) {
+    if (vf) vf.close();
+    SD.remove(tmpPath);
+    return false;
+  }
+  uint8_t hdr[2]; vf.read(hdr, 2);
+  vf.seek(jpegLen - 2); uint8_t trl[2]; vf.read(trl, 2);
+  vf.close();
+  if (hdr[0] != 0xFF || hdr[1] != 0xD8 || trl[0] != 0xFF || trl[1] != 0xD9) {
+    SD.remove(tmpPath);
+    return false;
+  }
+
+  SD.remove(finalPath);
+  bool moved = SD.rename(tmpPath, finalPath);
+  if (!moved) {
+    moved = copyFrameFile(tmpPath, finalPath);
+    if (moved) SD.remove(tmpPath);
+  }
+  if (!moved) {
+    SD.remove(tmpPath);
+    return false;
+  }
+  return true;
 }
 
-static bool writeTimesAndInstallCacheState(const time_t* times, int count) {
-  if (!times || count < 0 || count > MAX_FRAMES) return false;
-  SD.remove(TIMES_FILE);
-  File tf = SD.open(TIMES_FILE, FILE_WRITE);
-  if (!tf) return false;
-  size_t want = (size_t)count * sizeof(time_t);
-  size_t wrote = tf.write((const uint8_t*)times, want);
-  tf.flush();
-  tf.close();
-  if (wrote != want) return false;
-  installCacheState(times, count);
-  writeCurrentWeatherViewMeta();
-  return true;
+// Forward declarations for GIBS available times (defined later in file)
+#ifndef MAX_GIBS_AVAIL
+#define MAX_GIBS_AVAIL 160
+#endif
+static time_t s_gibsAvailTimes[MAX_GIBS_AVAIL];
+static int s_gibsAvailCount = 0;
+
+// Download a GIBS frame to an SD file path — used by zoom/terrain pipeline.
+static bool downloadFrameToPathAtBbox(HTTPClient& http,
+                                      WiFiClientSecure& client,
+                                      time_t t,
+                                      const char* sdPath,
+                                      float bboxWest, float bboxSouth,
+                                      float bboxEast, float bboxNorth,
+                                      int reqW = DISP_W,
+                                      int reqH = DISP_H,
+                                      size_t* outBytes = nullptr,
+                                      bool validateWeatherFrame = false) {
+  char timeISO[32];
+  char url[512];
+  size_t jpegLen = 0;
+
+  const int cadenceSec = max(60, activeCadenceMin() * 60);
+  time_t snappedTime = snapToNearestGibsTime(t, 2 * cadenceSec);
+
+  const time_t secondOffsets[] = {0, -60, 60,
+                                  -(time_t)cadenceSec,   (time_t)cadenceSec,
+                                  -2*(time_t)cadenceSec, 2*(time_t)cadenceSec};
+  int stepCount;
+  if (snappedTime > 0) {
+    stepCount = 1;
+  } else if (s_gibsAvailCount > 0) {
+    return false;
+  } else {
+    stepCount = validateWeatherFrame ? 7 : 1;
+  }
+
+  for (int si = 0; si < stepCount; ++si) {
+    time_t candT = (snappedTime > 0) ? snappedTime : (t + secondOffsets[si]);
+    if (candT <= 0) continue;
+    toISO(candT, timeISO, sizeof(timeISO));
+
+    if (!buildWeatherFrameUrl(url, sizeof(url), candT,
+                              bboxWest, bboxSouth, bboxEast, bboxNorth,
+                              reqW, reqH)) {
+      continue;
+    }
+
+    const int maxAttempts = 2;
+    bool fetchedOk = false;
+    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+      http.begin(client, url);
+      http.setTimeout(5000);
+      int code = http.GET();
+      if (code != HTTP_CODE_OK) {
+        http.end();
+        continue;
+      }
+      if (!readHttpJpegBodyToDlBuf(http, "MISS", &jpegLen)) {
+        continue;
+      }
+      if (validateWeatherFrame && !validateBufferedWeatherFrameJpeg(jpegLen, "MISS")) {
+        continue;
+      }
+      if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) {
+        appendDiagLog("BUG: decoder-corrupt s_dlBuf jpegLen=%u\n", (unsigned)jpegLen);
+        continue;
+      }
+      fetchedOk = true;
+      break;
+    }
+    if (!fetchedOk) continue;
+
+    char verifyLabel[40];
+    snprintf(verifyLabel, sizeof(verifyLabel), "MISS %s", timeISO);
+    bool instOk = false;
+    for (int ir = 0; ir < 3 && !instOk; ir++) {
+      if (ir > 0) delay(10);
+      instOk = installValidatedWeatherJpegToPath(sdPath, jpegLen, verifyLabel, validateWeatherFrame);
+    }
+    if (!instOk) continue;
+
+    if (outBytes) *outBytes = jpegLen;
+    return true;
+  }
+  return false;
 }
 
 static bool connectWifiForSync(bool required, const char* statusLine = "Connecting WiFi...") {
@@ -4567,8 +4720,6 @@ static void maybeRefreshPendingZoomSnapshots() {
 }
 
 static void drawTimestamp(int frameIdx, LovyanGFX* target);
-static bool rawCacheMetaVersionIsCurrent();
-static void loadTimesIfNeeded();
 static void logSourceBlackFrame(int idx, const char* phase);
 static bool spriteLooksPartialDecode();
 static void ensureStreamOpen();
@@ -4577,99 +4728,10 @@ static void getActiveWeatherBbox(float* west, float* south, float* east, float* 
 static bool currentWeatherViewMatchesCache();
 static void writeCurrentWeatherViewMeta();
 
-static void invalidateRawCacheMetaState() {
-  s_rawMetaChecked = false;
-  s_rawMetaVersionCurrent = false;
-}
-
 static void invalidateValidIdxCache() {
   s_validCount = -1;
 }
 
-static int countValidStreamSlots(int count) {
-  int n = (count < MAX_FRAMES) ? count : MAX_FRAMES;
-  if (n < 0) n = 0;
-  int valid = 0;
-  for (int i = 0; i < n; ++i) {
-    if (s_streamValid[i]) valid++;
-  }
-  return valid;
-}
-
-static bool rawCacheMetaVersionIsCurrent() {
-  if (s_rawMetaChecked) {
-    if (!s_rawMetaVersionCurrent) return false;
-    int validCount = (frameCount < MAX_FRAMES) ? frameCount : MAX_FRAMES;
-    if (validCount > 0 && countValidStreamSlots(validCount) == 0) {
-      // Guard against in-RAM stale state where meta was marked current but bitmap
-      // has no playable frames (observed as: "0 frames ... vbm=0 meta=1").
-      s_rawMetaChecked = false;
-      s_rawMetaVersionCurrent = false;
-    } else {
-      return true;
-    }
-  }
-
-  s_rawMetaChecked = true;
-  s_rawMetaVersionCurrent = false;
-  memset(s_streamValid, 0, sizeof(s_streamValid));
-  memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-
-  File mf = SD.open(RAW_CACHE_META_FILE, FILE_READ);
-  if (!mf) return false;
-  char meta[24] = {};
-  int metaLen = mf.readBytes(meta, sizeof(meta) - 1);
-
-  int ver = 0, saved = 0;
-  if (sscanf(meta, "%d %d", &ver, &saved) != 2 || ver != RAW_CACHE_VERSION) {
-    mf.close();
-    return false;
-  }
-
-  // Read validity bitmap (stored after the text header line)
-  // Find the newline that ends the header
-  int headerEnd = 0;
-  for (int i = 0; i < metaLen; i++) {
-    if (meta[i] == '\n') { headerEnd = i + 1; break; }
-  }
-  int validBytesRead = 0;
-  int slotMapBytesRead = 0;
-  if (headerEnd > 0) {
-    mf.seek(headerEnd);
-    int validCount = (frameCount < MAX_FRAMES) ? frameCount : MAX_FRAMES;
-    validBytesRead = mf.read(s_streamValid, validCount);
-    if (validCount > 0) {
-      slotMapBytesRead = mf.read(s_streamSlotMap, validCount);
-    }
-  }
-  mf.close();
-
-  int validCount = (frameCount < MAX_FRAMES) ? frameCount : MAX_FRAMES;
-  if (validCount > 0 && validBytesRead != validCount) return false;
-  if (validCount > 0 && slotMapBytesRead != validCount) return false;
-  int validFrames = 0;
-  for (int i = 0; i < validCount; i++) {
-    if (s_streamValid[i]) {
-      if (s_streamSlotMap[i] >= validCount) return false;
-      validFrames++;
-    } else {
-      s_streamSlotMap[i] = 0xFF;
-    }
-  }
-  if (validCount > 0 && validFrames == 0) return false;
-  if (saved > 0 && validFrames == 0) return false;
-
-  // Verify stream file exists and has correct size
-  File sf = SD.open(RAW_STREAM_FILE, FILE_READ);
-  if (!sf) return false;
-  size_t expectedSize = (size_t)frameCount * SCALED_FRAME_BYTES;
-  bool sizeOk = (sf.size() == expectedSize);
-  sf.close();
-  if (!sizeOk) return false;
-
-  s_rawMetaVersionCurrent = true;
-  return true;
-}
 
 static void logSourceBlackFrame(int idx, const char* phase) {
   (void)phase;
@@ -4678,705 +4740,31 @@ static void logSourceBlackFrame(int idx, const char* phase) {
 }
 
 static bool decodeJpegFrameToSprite(int idx, bool rejectBlank) {
-  if (idx < 0 || idx >= MAX_FRAMES || s_frameTimes[idx] == 0) return false;
-  char path[32];
-  makeFramePathByIdx(idx, path, sizeof(path));
-  if (!decodeJpegPathToSprite(path)) return false;
+  if (idx < 0 || idx >= (int)s_idx.count) return false;
+  if (!s_idx.jpegValid[idx]) return false;
+  size_t readLen = 0;
+  if (!readJpegFromSlot(idx, s_dlBuf, &readLen) || readLen == 0) return false;
+
+  if (!ensureSprite()) return false;
+  sprite.fillScreen(TFT_BLACK);
+  g_drawTarget = &sprite;
+  resetJpegDrawStats();
+
+  bool ok = false;
+  if (jpeg.openRAM(s_dlBuf, (int)readLen, jpegDraw)) {
+    if (jpeg.getWidth() == DISP_W && jpeg.getHeight() == DISP_H) {
+      jpeg.setPixelType(RGB565_BIG_ENDIAN);
+      ok = jpeg.decode(0, 0, 0);
+    }
+    jpeg.close();
+  }
+  if (!ok || !jpegDrawLooksFullFrame()) return false;
   if (rejectBlank && spriteLooksCompletelyBlack()) return false;
   return true;
 }
 
 // Individual rNNN.raw read/write functions removed — replaced by stream.raw
 
-static bool verifyStreamSlotAgainstSprite(File& sf, uint32_t offset, const uint8_t* frameBuf) {
-  if (!frameBuf) return false;
-
-  constexpr size_t kWindowBytes = 128;
-  constexpr int kWindows = 4;
-  if (SCALED_FRAME_BYTES < kWindowBytes) return false;
-
-  // Use local buffer — NOT s_dlBuf. DMA file reads into s_dlBuf contaminate
-  // physical RAM, causing cache coherency issues for subsequent SD writes.
-  uint8_t vrfBuf[kWindowBytes];
-  for (int sample = 0; sample < kWindows; sample++) {
-    size_t rel = 0;
-    if (kWindows > 1) {
-      rel = ((SCALED_FRAME_BYTES - kWindowBytes) * (size_t)sample) / (size_t)(kWindows - 1);
-    }
-    if (!sf.seek(offset + (uint32_t)rel)) return false;
-    size_t got = sf.read(vrfBuf, kWindowBytes);
-    if (got != kWindowBytes) return false;
-    if (memcmp(vrfBuf, frameBuf + rel, kWindowBytes) != 0) return false;
-  }
-
-  return true;
-}
-
-static bool verifyInstalledJpeg(const char* path, size_t expectedLen) {
-  if (!path || expectedLen == 0) return false;
-  for (int attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) delay(5);
-    File vf = SD.open(path, FILE_READ);
-    if (!vf) {
-      if (attempt == 0) appendDiagLog("vij: open-fail %s\n", path);
-      continue;
-    }
-    size_t fsz = vf.size();
-    if (fsz != expectedLen) {
-      if (attempt == 0) appendDiagLog("vij: sz %u!=%u %s\n",
-        (unsigned)fsz, (unsigned)expectedLen, path);
-      vf.close(); continue;
-    }
-    uint8_t hdr[2] = {0, 0};
-    vf.read(hdr, 2);
-    if (hdr[0] != 0xFF || hdr[1] != 0xD8) {
-      if (attempt == 0) appendDiagLog("vij: soi %02x%02x %s\n", hdr[0], hdr[1], path);
-      vf.close(); continue;
-    }
-    uint8_t tail[2] = {0, 0};
-    vf.seek(fsz - 2);
-    vf.read(tail, 2);
-    vf.close();
-    if (tail[0] != 0xFF || tail[1] != 0xD9) {
-      if (attempt == 0) appendDiagLog("vij: eoi %02x%02x %s\n", tail[0], tail[1], path);
-      continue;
-    }
-    if (attempt > 0) appendDiagLog("vij: ok retry=%d %s\n", attempt, path);
-    return true;
-  }
-  return false;
-}
-
-static void buildRawPlaybackCache() {
-  if (!framesReady || frameCount <= 0) {
-    char m[32]; snprintf(m, sizeof(m), "fc=%d ready=%d", frameCount, (int)framesReady);
-    showMessage("SKIP: no frames", m); delay(6000);
-    return;
-  }
-  if (!ensureSprite()) {
-    showMessage("SKIP: no sprite", nullptr); delay(6000);
-    return;
-  }
-  if (!s_frameDisplayBuf) {
-    showMessage("SKIP: no PSRAM buf", nullptr); delay(6000);
-    return;
-  }
-  loadTimesIfNeeded();  // timestamps must be ready before baking into frames
-
-  bool useUnifiedProgress = syncProgressIsActive();
-  if (useUnifiedProgress) {
-    syncProgressBeginPhase("raw", (uint32_t)frameCount);
-  } else {
-    showMessage("Building raw cache...", "Predecode for smooth playback");
-  }
-
-  // Close any open stream handle from a previous playback cycle
-  if (s_streamFile) { s_streamFile.close(); }
-  s_streamReady = false;
-  memset(s_streamValid, 0, sizeof(s_streamValid));
-  memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-  invalidateValidIdxCache();
-
-  // Remove old stream
-  invalidateRawCacheMetaState();
-  SD.remove(RAW_CACHE_META_FILE);
-  SD.remove(RAW_STREAM_FILE);
-  flushSdFat();  // flush dirty FAT sectors before interleaved JPEG reads + stream writes
-
-  // Create the contiguous stream file: frameCount * SCALED_FRAME_BYTES.
-  // Each slot is at offset idx * SCALED_FRAME_BYTES.
-  // Invalid slots are written as zeros (will be skipped during playback).
-  File sf = SD.open(RAW_STREAM_FILE, "w+");
-  if (!sf) {
-    Serial.println("Failed to create stream.raw");
-    return;
-  }
-
-  int built = 0;
-  int sourceBlack = 0;
-  int decFail = 0;
-  int wrFail  = 0;
-  int vrFail  = 0;
-  for (int i = 0; i < frameCount; i++) {
-    showProgress(i + 1, frameCount, "raw");
-    yield();  // reset WDT — JPEG decode + SD writes per frame exceed 5s watchdog without this
-    uint32_t offset = (uint32_t)i * (uint32_t)SCALED_FRAME_BYTES;
-
-    if (!decodeJpegFrameToSprite(i, false)) {
-      Serial.printf("raw skip %d dec\n", i);
-      decFail++;
-      continue;
-    }
-    if (spriteLooksCompletelyBlack()) {
-      sourceBlack++;
-      logSourceBlackFrame(i, "raw-build");
-      continue;
-    }
-    if (spriteLooksPartialDecode()) {
-      Serial.printf("raw skip %d part\n", i);
-      continue;
-    }
-    if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) {
-      Serial.printf("raw skip %d line\n", i);
-      continue;
-    }
-    if (spriteLooksHoldFrameBlockCorrupted()) {
-      Serial.printf("raw skip %d blk\n", i);
-      continue;
-    }
-    if (spriteLooksCyanWhiteBlockCorrupted()) {
-      Serial.printf("raw skip %d cyan\n", i);
-      continue;
-    }
-    if (spriteLooksBottomBandJunkCorrupted()) {
-      Serial.printf("raw skip %d botband\n", i);
-      continue;
-    }
-    if (spriteLooksBlackSlabCorrupted()) {
-      Serial.printf("raw skip %d slab\n", i);
-      continue;
-    }
-    {
-      char framePath[32];
-      makeFramePathByIdx(i, framePath, sizeof(framePath));
-      if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW")) {
-        Serial.printf("raw skip %d sz-outlier\n", i);
-        continue;
-      }
-      if (weatherFrameLooksSemanticOutlier(i, framePath, "RAW")) {
-        Serial.printf("raw skip %d sem-outlier\n", i);
-        continue;
-      }
-    }
-    scaleSpriteTo410x360(s_frameDisplayBuf);
-    if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) {
-      Serial.printf("raw skip %d scaled-blk\n", i);
-      continue;
-    }
-
-    // Write this frame's pre-scaled pixels at its fixed offset in the stream
-    sf.seek(offset);
-    size_t written = sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
-    if (written != SCALED_FRAME_BYTES) {
-      Serial.printf("raw wr fail %d\n", i);
-      wrFail++;
-      continue;
-    }
-    sf.flush();  // sync dirty FAT sectors so next JPEG read gets correct cluster chain
-
-    // Read-back verification (sampled across the full frame, not just the first bytes)
-    bool verified = verifyStreamSlotAgainstSprite(sf, offset, (const uint8_t*)s_frameDisplayBuf);
-    if (!verified) {
-      Serial.printf("raw vrfy fail %d\n", i);
-      vrFail++;
-      continue;
-    }
-
-    s_streamValid[i] = 1;
-    s_streamSlotMap[i] = (uint8_t)i;
-    built++;
-  }
-  if (useUnifiedProgress) syncProgressCompletePhase();
-
-  // Show diagnostic on display if nothing was built — surface the reason visibly
-  // without requiring a serial monitor connection.
-  if (built == 0) {
-    char l1[32], l2[32];
-    snprintf(l1, sizeof(l1), "BUILD 0 fc=%d dec=%d", frameCount, decFail);
-    snprintf(l2, sizeof(l2), "blk=%d wr=%d vr=%d", sourceBlack, wrFail, vrFail);
-    showMessage(l1, nullptr); delay(4000);
-    showMessage(l2, nullptr); delay(4000);
-    // Boot loop safety: if ALL frames failed decode, the cache is toast.
-    // Clear state so next boot does a fresh downloadFrames() instead of looping.
-    if (decFail >= frameCount && frameCount > 0) {
-      appendDiagLog("raw-build: all-corrupt -> clearing cache state\n");
-      deleteFramesDir();
-      framesReady = false;
-      frameCount = 0;
-      sf.close();
-      SD.remove(RAW_STREAM_FILE);
-      SD.remove(RAW_CACHE_META_FILE);
-      invalidateRawCacheMetaState();
-      return;
-    }
-  }
-
-  if (useUnifiedProgress) syncProgressBeginPhase("raw-finalize", 8);
-  int filled = gapFillInvalidStreamMap(frameCount, 0);
-  if (useUnifiedProgress) syncProgressTick(2);
-  sf.close();
-
-  // Write meta
-  SD.remove(RAW_CACHE_META_FILE);
-  bool metaOk = false;
-  File mf = SD.open(RAW_CACHE_META_FILE, FILE_WRITE);
-  if (mf) {
-    mf.printf("%d %d\n", RAW_CACHE_VERSION, built + filled);
-    // Write validity bitmap
-    mf.write(s_streamValid, frameCount);
-    mf.write(s_streamSlotMap, frameCount);
-    mf.close();
-    metaOk = true;
-  }
-  if (useUnifiedProgress) syncProgressTick(2);
-  int validNow = countValidStreamSlots(frameCount);
-  s_rawMetaChecked = true;
-  s_rawMetaVersionCurrent = (metaOk && validNow > 0);
-  if (!s_rawMetaVersionCurrent) {
-    SD.remove(RAW_CACHE_META_FILE);
-  }
-  // Keep filtered zoom raws aligned with the current decode/corruption guards.
-  // These rebuild locally from the existing zoom JPEGs and do not require WiFi.
-  rebuildFilteredZoomRawsFromCache();
-  if (useUnifiedProgress) {
-    syncProgressTick(4);
-    syncProgressCompletePhase();
-  }
-
-  Serial.printf("raw built %d/%d dec=%d sb=%d wr=%d vr=%d fill=%d\n",
-                built, frameCount, decFail, sourceBlack, wrFail, vrFail, filled);
-  appendDiagLog("raw-build: built=%d/%d dec=%d sb=%d wr=%d vr=%d fill=%d\n",
-                built, frameCount, decFail, sourceBlack, wrFail, vrFail, filled);
-}
-
-static bool copyStreamSlot(File& src, int srcIdx, File& dst, int dstIdx) {
-  if (srcIdx < 0 || dstIdx < 0) return false;
-  uint32_t srcOff = (uint32_t)srcIdx * (uint32_t)SCALED_FRAME_BYTES;
-  uint32_t dstOff = (uint32_t)dstIdx * (uint32_t)SCALED_FRAME_BYTES;
-  // Use full PSRAM buffer when available (1 read+write vs 3 chunked passes)
-  uint8_t* buf = s_frameDisplayBuf ? (uint8_t*)s_frameDisplayBuf : s_dlBuf;
-  size_t maxChunk = s_frameDisplayBuf ? SCALED_FRAME_BYTES : (size_t)DL_BUF_BYTES;
-  size_t done = 0;
-  while (done < SCALED_FRAME_BYTES) {
-    size_t chunk = SCALED_FRAME_BYTES - done;
-    if (chunk > maxChunk) chunk = maxChunk;
-    if (!src.seek(srcOff + (uint32_t)done)) return false;
-    size_t got = src.read(buf, chunk);
-    if (got != chunk) return false;
-    if (!dst.seek(dstOff + (uint32_t)done)) return false;
-    if (dst.write(buf, chunk) != chunk) return false;
-    done += chunk;
-  }
-  return true;
-}
-
-static int gapFillInvalidStreamMap(int count, int protectTailSlots) {
-  int fillLimit = count - protectTailSlots;
-  if (fillLimit < 0) fillLimit = 0;
-  int filled = 0;
-  bool anyInvalid = false;
-  bool anyValid = false;
-  for (int i = 0; i < fillLimit; i++) {
-    if (s_streamValid[i]) anyValid = true;
-    else anyInvalid = true;
-  }
-  if (!(anyValid && anyInvalid)) return 0;
-
-  for (int i = 0; i < fillLimit; i++) {
-    if (s_streamValid[i]) continue;
-    int src = -1;
-    for (int d = 1; d < count && src < 0; d++) {
-      if (i - d >= 0 && s_streamValid[i - d]) src = i - d;
-      else if (i + d < count && s_streamValid[i + d]) src = i + d;
-    }
-    if (src < 0) continue;
-    uint8_t srcSlot = s_streamSlotMap[src];
-    if (srcSlot >= count) continue;
-    s_streamValid[i] = 1;
-    s_streamSlotMap[i] = srcSlot;
-    filled++;
-  }
-  return filled;
-}
-
-static bool rebuildRawPlaybackCacheRolling(const int* sourceIdxForSlot,
-                                           const uint8_t* oldValid,
-                                           int count) {
-  if (!sourceIdxForSlot || !oldValid) return false;
-  if (!framesReady || count <= 0 || count > frameCount) return false;
-  if (!ensureSprite() || !s_frameDisplayBuf) return false;
-
-  if (s_streamFile) s_streamFile.close();
-  s_streamReady = false;
-  memset(s_streamValid, 0, sizeof(s_streamValid));
-  memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-  invalidateValidIdxCache();
-  invalidateRawCacheMetaState();
-
-  const char* tmpPath = SD_ROOT "/frames/stream.tmp";
-  SD.remove(tmpPath);
-  flushSdFat();  // flush dirty FAT before interleaved JPEG reads + stream writes
-
-  File oldSf = SD.open(RAW_STREAM_FILE, FILE_READ);
-  if (!oldSf) return false;
-  File newSf = SD.open(tmpPath, "w+");
-  if (!newSf) {
-    oldSf.close();
-    return false;
-  }
-
-  int copied = 0;
-  int built = 0;
-  int decFail = 0;
-  int sourceBlack = 0;
-  int wrFail = 0;
-  bool useUnifiedProgress = syncProgressIsActive();
-  if (useUnifiedProgress) {
-    syncProgressBeginPhase("raw", (uint32_t)count);
-  }
-
-  for (int i = 0; i < count; i++) {
-    showProgress(i + 1, count, "raw");
-    yield();
-    uint32_t offset = (uint32_t)i * (uint32_t)SCALED_FRAME_BYTES;
-
-    int srcIdx = sourceIdxForSlot[i];
-    if (srcIdx >= 0 && srcIdx < MAX_FRAMES && oldValid[srcIdx]) {
-      if (copyStreamSlot(oldSf, srcIdx, newSf, i)) {
-        s_streamValid[i] = 1;
-        s_streamSlotMap[i] = (uint8_t)i;
-        copied++;
-        continue;
-      }
-      Serial.printf("raw copy fail %d<-%d\n", i, srcIdx);
-    }
-
-    if (!decodeJpegFrameToSprite(i, false)) {
-      Serial.printf("raw roll skip %d dec\n", i);
-      decFail++;
-      if (decFail > 10) {
-        appendDiagLog("raw-roll: too many dec failures (%d), fallback to full rebuild\n", decFail);
-        oldSf.close();
-        newSf.close();
-        SD.remove(tmpPath);
-        SD.remove(RAW_CACHE_META_FILE);
-        invalidateRawCacheMetaState();
-        memset(s_streamValid, 0, sizeof(s_streamValid));
-        memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-        invalidateValidIdxCache();
-        if (useUnifiedProgress) syncProgressCompletePhase();
-        return false;
-      }
-      continue;
-    }
-    if (spriteLooksCompletelyBlack()) {
-      sourceBlack++;
-      logSourceBlackFrame(i, "raw-roll");
-      continue;
-    }
-    if (spriteLooksPartialDecode()) {
-      Serial.printf("raw roll skip %d part\n", i);
-      continue;
-    }
-    if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) {
-      Serial.printf("raw roll skip %d line\n", i);
-      continue;
-    }
-    if (spriteLooksHoldFrameBlockCorrupted()) {
-      Serial.printf("raw roll skip %d blk\n", i);
-      continue;
-    }
-    if (spriteLooksCyanWhiteBlockCorrupted()) {
-      Serial.printf("raw roll skip %d cyan\n", i);
-      continue;
-    }
-    if (spriteLooksBottomBandJunkCorrupted()) {
-      Serial.printf("raw roll skip %d botband\n", i);
-      continue;
-    }
-    if (spriteLooksBlackSlabCorrupted()) {
-      Serial.printf("raw roll skip %d slab\n", i);
-      continue;
-    }
-    {
-      char framePath[32];
-      makeFramePathByIdx(i, framePath, sizeof(framePath));
-      if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW-ROLL")) {
-        Serial.printf("raw roll skip %d sz-outlier\n", i);
-        continue;
-      }
-      if (weatherFrameLooksSemanticOutlier(i, framePath, "RAW-ROLL")) {
-        Serial.printf("raw roll skip %d sem-outlier\n", i);
-        continue;
-      }
-    }
-    scaleSpriteTo410x360(s_frameDisplayBuf);
-    if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) {
-      Serial.printf("raw roll skip %d scaled-blk\n", i);
-      continue;
-    }
-    if (!newSf.seek(offset) ||
-        newSf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES) != SCALED_FRAME_BYTES) {
-      Serial.printf("raw roll wr fail %d\n", i);
-      wrFail++;
-      continue;
-    }
-    newSf.flush();  // sync dirty FAT so next JPEG read gets correct cluster chain
-
-    s_streamValid[i] = 1;
-    s_streamSlotMap[i] = (uint8_t)i;
-    built++;
-  }
-  if (useUnifiedProgress) syncProgressCompletePhase();
-
-  if (useUnifiedProgress) syncProgressBeginPhase("raw-finalize", 6);
-  int filled = gapFillInvalidStreamMap(count, 0);
-  if (useUnifiedProgress) syncProgressTick(2);
-
-  newSf.close();
-  oldSf.close();
-
-  SD.remove(RAW_CACHE_META_FILE);
-  bool metaOk = false;
-  File mf = SD.open(RAW_CACHE_META_FILE, FILE_WRITE);
-  if (mf) {
-    mf.printf("%d %d\n", RAW_CACHE_VERSION, copied + built + filled);
-    mf.write(s_streamValid, count);
-    mf.write(s_streamSlotMap, count);
-    mf.close();
-    metaOk = true;
-  }
-  if (useUnifiedProgress) syncProgressTick(2);
-
-  if (metaOk) {
-    SD.remove(RAW_STREAM_FILE);
-    if (!SD.rename(tmpPath, RAW_STREAM_FILE)) {
-      if (!copyFrameFile(tmpPath, RAW_STREAM_FILE)) metaOk = false;
-      SD.remove(tmpPath);
-    }
-  } else {
-    SD.remove(tmpPath);
-  }
-
-  if (!metaOk) {
-    SD.remove(RAW_CACHE_META_FILE);
-    invalidateRawCacheMetaState();
-    memset(s_streamValid, 0, sizeof(s_streamValid));
-    invalidateValidIdxCache();
-    return false;
-  }
-
-  int validNow = countValidStreamSlots(count);
-  if (validNow <= 0) {
-    SD.remove(RAW_CACHE_META_FILE);
-    invalidateRawCacheMetaState();
-    memset(s_streamValid, 0, sizeof(s_streamValid));
-    memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-    invalidateValidIdxCache();
-    return false;
-  }
-  s_rawMetaChecked = true;
-  s_rawMetaVersionCurrent = true;
-
-  rebuildFilteredZoomRawsFromCache();
-  if (useUnifiedProgress) {
-    syncProgressTick(2);
-    syncProgressCompletePhase();
-  }
-
-  Serial.printf("raw roll copy=%d build=%d dec=%d sb=%d wr=%d fill=%d\n",
-                copied, built, decFail, sourceBlack, wrFail, filled);
-  appendDiagLog("raw-roll: copy=%d build=%d dec=%d sb=%d wr=%d fill=%d\n",
-                copied, built, decFail, sourceBlack, wrFail, filled);
-  if (decFail > 0) {
-    SD.remove(RAW_CACHE_META_FILE);
-    s_rawMetaVersionCurrent = false;
-    appendDiagLog("raw-meta: invalidated roll-dec=%d redownload-next-boot\n", decFail);
-  }
-  return true;
-}
-
-static bool remapRawPlaybackCacheRolling(const int* sourceIdxForSlot,
-                                         const uint8_t* oldValid,
-                                         const uint8_t* oldSlotMap,
-                                         int count) {
-  if (!sourceIdxForSlot || !oldValid || !oldSlotMap) return false;
-  if (!framesReady || count <= 0 || count > frameCount) return false;
-  if (!ensureSprite() || !s_frameDisplayBuf) return false;
-
-  if (s_streamFile) s_streamFile.close();
-  s_streamReady = false;
-  memset(s_streamValid, 0, sizeof(s_streamValid));
-  memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-  invalidateValidIdxCache();
-  invalidateRawCacheMetaState();
-
-  File sf = SD.open(RAW_STREAM_FILE, "r+");
-  if (!sf) return false;
-
-  bool usedPhys[MAX_FRAMES] = {};
-  int reused = 0;
-  int built = 0;
-  int decFail = 0;
-  int sourceBlack = 0;
-  int wrFail = 0;
-  bool useUnifiedProgress = syncProgressIsActive();
-  if (useUnifiedProgress) {
-    syncProgressBeginPhase("raw", (uint32_t)count);
-  }
-
-  for (int i = 0; i < count; i++) {
-    int srcIdx = sourceIdxForSlot[i];
-    if (srcIdx < 0 || srcIdx >= MAX_FRAMES || !oldValid[srcIdx]) continue;
-    uint8_t phys = oldSlotMap[srcIdx];
-    if (phys >= count || usedPhys[phys]) continue;
-    char framePath[32];
-    makeFramePathByIdx(i, framePath, sizeof(framePath));
-    if (!frameFileExists(i)) continue;  // file deleted — decode fresh in next pass
-    usedPhys[phys] = true;
-    s_streamValid[i] = 1;
-    s_streamSlotMap[i] = phys;
-    reused++;
-  }
-
-  for (int i = 0; i < count; i++) {
-    if (s_streamValid[i]) continue;
-    showProgress(i + 1, count, "raw");
-    yield();
-
-    int phys = -1;
-    for (int slot = 0; slot < count; slot++) {
-      if (!usedPhys[slot]) {
-        phys = slot;
-        usedPhys[slot] = true;
-        break;
-      }
-    }
-    if (phys < 0) {
-      Serial.printf("raw remap no slot %d\n", i);
-      sf.close();
-      return false;
-    }
-
-    if (!decodeJpegFrameToSprite(i, false)) {
-      Serial.printf("raw remap skip %d dec\n", i);
-      decFail++;
-      // Don't delete JPEG — file is likely fine for playback, just unreadable
-      // while the stream file is open. Fall back to full rebuild if too many.
-      if (decFail > 10) {
-        appendDiagLog("raw-remap: too many dec failures (%d), fallback to full rebuild\n", decFail);
-        sf.close();
-        SD.remove(RAW_CACHE_META_FILE);
-        invalidateRawCacheMetaState();
-        memset(s_streamValid, 0, sizeof(s_streamValid));
-        memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-        invalidateValidIdxCache();
-        if (useUnifiedProgress) syncProgressCompletePhase();
-        return false;
-      }
-      continue;
-    }
-    if (spriteLooksCompletelyBlack()) {
-      sourceBlack++;
-      logSourceBlackFrame(i, "raw-remap");
-      continue;
-    }
-    if (spriteLooksPartialDecode()) {
-      Serial.printf("raw remap skip %d part\n", i);
-      continue;
-    }
-    if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) {
-      Serial.printf("raw remap skip %d line\n", i);
-      continue;
-    }
-    if (spriteLooksHoldFrameBlockCorrupted()) {
-      Serial.printf("raw remap skip %d blk\n", i);
-      continue;
-    }
-    if (spriteLooksCyanWhiteBlockCorrupted()) {
-      Serial.printf("raw remap skip %d cyan\n", i);
-      continue;
-    }
-    if (spriteLooksBottomBandJunkCorrupted()) {
-      Serial.printf("raw remap skip %d botband\n", i);
-      continue;
-    }
-    if (spriteLooksBlackSlabCorrupted()) {
-      Serial.printf("raw remap skip %d slab\n", i);
-      continue;
-    }
-    {
-      char framePath[32];
-      makeFramePathByIdx(i, framePath, sizeof(framePath));
-      if (weatherFrameLooksCompressedSizeOutlier(i, framePath, "RAW-REMAP")) {
-        Serial.printf("raw remap skip %d sz-outlier\n", i);
-        continue;
-      }
-      if (weatherFrameLooksSemanticOutlier(i, framePath, "RAW-REMAP")) {
-        Serial.printf("raw remap skip %d sem-outlier\n", i);
-        continue;
-      }
-    }
-    scaleSpriteTo410x360(s_frameDisplayBuf);
-    if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) {
-      Serial.printf("raw remap skip %d scaled-blk\n", i);
-      continue;
-    }
-    uint32_t offset = (uint32_t)phys * (uint32_t)SCALED_FRAME_BYTES;
-    if (!sf.seek(offset) ||
-        sf.write((const uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES) != SCALED_FRAME_BYTES) {
-      Serial.printf("raw remap wr fail %d\n", i);
-      wrFail++;
-      continue;
-    }
-    sf.flush();  // sync dirty FAT so next JPEG read gets correct cluster chain
-
-    s_streamValid[i] = 1;
-    s_streamSlotMap[i] = (uint8_t)phys;
-    built++;
-  }
-  if (useUnifiedProgress) syncProgressCompletePhase();
-
-  if (useUnifiedProgress) syncProgressBeginPhase("raw-finalize", 6);
-  int filled = gapFillInvalidStreamMap(count, 0);
-  if (useUnifiedProgress) syncProgressTick(2);
-
-  sf.close();
-
-  SD.remove(RAW_CACHE_META_FILE);
-  bool metaOk = false;
-  File mf = SD.open(RAW_CACHE_META_FILE, FILE_WRITE);
-  if (mf) {
-    mf.printf("%d %d\n", RAW_CACHE_VERSION, reused + built + filled);
-    mf.write(s_streamValid, count);
-    mf.write(s_streamSlotMap, count);
-    mf.close();
-    metaOk = true;
-  }
-  if (useUnifiedProgress) syncProgressTick(2);
-  if (!metaOk) {
-    SD.remove(RAW_CACHE_META_FILE);
-    invalidateRawCacheMetaState();
-    memset(s_streamValid, 0, sizeof(s_streamValid));
-    memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-    invalidateValidIdxCache();
-    return false;
-  }
-
-  int validNow = countValidStreamSlots(count);
-  if (validNow <= 0) {
-    SD.remove(RAW_CACHE_META_FILE);
-    invalidateRawCacheMetaState();
-    memset(s_streamValid, 0, sizeof(s_streamValid));
-    memset(s_streamSlotMap, 0xFF, sizeof(s_streamSlotMap));
-    invalidateValidIdxCache();
-    return false;
-  }
-  s_rawMetaChecked = true;
-  s_rawMetaVersionCurrent = true;
-
-  rebuildFilteredZoomRawsFromCache();
-  if (useUnifiedProgress) {
-    syncProgressTick(2);
-    syncProgressCompletePhase();
-  }
-
-  Serial.printf("raw remap reuse=%d build=%d dec=%d sb=%d wr=%d fill=%d\n",
-                reused, built, decFail, sourceBlack, wrFail, filled);
-  appendDiagLog("raw-remap: reuse=%d build=%d dec=%d sb=%d wr=%d fill=%d millis=%lu ms\n",
-                reused, built, decFail, sourceBlack, wrFail, filled, millis());
-  return true;
-}
 
 // ─────────────────────────────────────────────────────────────
 //  Display one frame from SD
@@ -5389,9 +4777,8 @@ static bool showFrame(int idx) {
   if (!s_streamReady || !s_streamFile || idx >= frameCount || !s_streamValid[idx]) return false;
   if (!s_frameDisplayBuf) return false;
 
-  uint8_t physSlot = s_streamSlotMap[idx];
-  if (physSlot >= frameCount) return false;
-  uint32_t offset = (uint32_t)physSlot * (uint32_t)SCALED_FRAME_BYTES;
+  int phys = ((int)s_idx.head + idx) % MAX_FRAMES;
+  uint32_t offset = (uint32_t)phys * (uint32_t)SCALED_FRAME_BYTES;
   bool seekOk = s_streamFile.seek(offset);
   size_t got = s_streamFile.read((uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
   if (!seekOk || got != SCALED_FRAME_BYTES) {
@@ -5400,8 +4787,6 @@ static bool showFrame(int idx) {
                   idx, (unsigned)got, (int)seekOk);
     return false;
   }
-  // Render fresh timestamp bars for this frame and store in s_topBarBuf/s_botBarBuf.
-  // applyBarsToBuf() inside presentScaledBuf() stamps them persistently over the frame.
   updateBarBufs(idx);
   presentScaledBuf(s_frameDisplayBuf);
   return true;
@@ -5565,392 +4950,10 @@ static int weatherSemanticDistance(const WeatherSemanticSignature& a,
   return total / tiles;
 }
 
-static bool loadWeatherSemanticSignature(const char* path, WeatherSemanticSignature* out) {
-  if (!out || !path) return false;
-  if (!validateStoredWeatherFramePath(path, nullptr)) return false;
-  return captureWeatherSemanticSignatureFromSprite(out);
-}
-
-static bool validateStoredWeatherFramePath(const char* path, const char* label) {
-  if (!path) return false;
-  if (!decodeJpegPathToSprite(path)) {
-    if (label) Serial.printf("%s STORED-DEC\n", label);
-    return false;
-  }
-  if (spriteLooksCompletelyBlack()) {
-    if (label) Serial.printf("%s STORED-BLACK\n", label);
-    return false;
-  }
-  if (spriteLooksPartialDecode()) {
-    if (label) Serial.printf("%s STORED-PARTIAL\n", label);
-    return false;
-  }
-  if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) {
-    if (label) { Serial.printf("%s LINE-CORR\n", label); appendDiagLog("vld: %s LINE-CORR\n", label); }
-    return false;
-  }
-  if (spriteLooksHoldFrameBlockCorrupted()) {
-    if (label) { Serial.printf("%s BLOCK-CORR\n", label); appendDiagLog("vld: %s BLOCK-CORR\n", label); }
-    return false;
-  }
-  if (spriteLooksCyanWhiteBlockCorrupted()) {
-    if (label) { Serial.printf("%s CYAN-CORR\n", label); appendDiagLog("vld: %s CYAN-CORR\n", label); }
-    return false;
-  }
-  if (spriteLooksBottomBandJunkCorrupted()) {
-    if (label) { Serial.printf("%s BOTBAND-CORR\n", label); appendDiagLog("vld: %s BOTBAND-CORR\n", label); }
-    return false;
-  }
-  if (spriteLooksBlackSlabCorrupted()) {
-    if (label) { Serial.printf("%s SLAB-CORR\n", label); appendDiagLog("vld: %s SLAB-CORR\n", label); }
-    return false;
-  }
-  return true;
-}
-
-static int weatherFrameFileSize(const char* path) {
-  if (!path) return 0;
-  File f = SD.open(path, FILE_READ);
-  if (!f) return 0;
-  int size = (int)f.size();
-  f.close();
-  return size;
-}
-
-static bool weatherFrameLooksCompressedSizeOutlier(int idx, const char* candidatePath, const char* label) {
-  if (!candidatePath || frameCount < 3) return false;
-  int refA = -1, refB = -1;
-  if (idx <= 0) {
-    refA = 1; refB = 2;
-  } else if (idx >= frameCount - 1) {
-    refA = frameCount - 2; refB = frameCount - 3;
-  } else {
-    refA = idx - 1; refB = idx + 1;
-  }
-  if (refA < 0 || refB < 0 || refA >= frameCount || refB >= frameCount) return false;
-  if (!frameFileExists(refA) || !frameFileExists(refB)) return false;
-
-  char refPathA[32];
-  char refPathB[32];
-  makeFramePathByIdx(refA, refPathA, sizeof(refPathA));
-  makeFramePathByIdx(refB, refPathB, sizeof(refPathB));
-
-  int candSize = weatherFrameFileSize(candidatePath);
-  int sizeA = weatherFrameFileSize(refPathA);
-  int sizeB = weatherFrameFileSize(refPathB);
-  if (candSize <= 0 || sizeA <= 0 || sizeB <= 0) return false;
-
-  if (abs(sizeA - sizeB) > 1500) return false;
-  int refSize = (sizeA + sizeB) / 2;
-  bool outlier = (candSize + 900 < refSize);
-  if (outlier && label) {
-    Serial.printf("%s SIZE-OUTLIER cs=%d rs=%d a=%d b=%d\n",
-                  label, candSize, refSize, sizeA, sizeB);
-  }
-  return outlier;
-}
-
-static bool weatherFrameLooksSemanticOutlier(int idx, const char* candidatePath, const char* label) {
-  if (!candidatePath) return false;
-
-  WeatherSemanticSignature cand = {};
-  if (!loadWeatherSemanticSignature(candidatePath, &cand)) return false;
-  int candSize = weatherFrameFileSize(candidatePath);
-  bool cyanBand = spriteLooksCyanWhiteBlockCorrupted();
-
-  auto checkAgainstRefs = [&](int refIdxA, int refIdxB, const char* which) -> bool {
-    if (refIdxA < 0 || refIdxA >= frameCount || refIdxB < 0 || refIdxB >= frameCount) return false;
-    if (!frameFileExists(refIdxA) || !frameFileExists(refIdxB)) return false;
-
-    char pathA[32];
-    char pathB[32];
-    makeFramePathByIdx(refIdxA, pathA, sizeof(pathA));
-    makeFramePathByIdx(refIdxB, pathB, sizeof(pathB));
-
-    WeatherSemanticSignature refA = {};
-    WeatherSemanticSignature refB = {};
-    if (!loadWeatherSemanticSignature(pathA, &refA)) return false;
-    if (!loadWeatherSemanticSignature(pathB, &refB)) return false;
-
-    int candA = weatherSemanticDistance(cand, refA);
-    int candB = weatherSemanticDistance(cand, refB);
-    int refAB = weatherSemanticDistance(refA, refB);
-
-    int refR = ((int)refA.meanR + (int)refB.meanR) / 2;
-    int refG = ((int)refA.meanG + (int)refB.meanG) / 2;
-    int refBMean = ((int)refA.meanB + (int)refB.meanB) / 2;
-    int refCyan = max((int)refA.cyanTiles, (int)refB.cyanTiles);
-    int refTex = ((int)refA.texture + (int)refB.texture) / 2;
-    int sizeA = weatherFrameFileSize(pathA);
-    int sizeB = weatherFrameFileSize(pathB);
-    int refSize = (sizeA > 0 && sizeB > 0) ? ((sizeA + sizeB) / 2) : 0;
-
-    bool strongDistance = (candA >= max(8, refAB + 7) &&
-                           candB >= max(8, refAB + 7));
-    bool moderateDistance = (candA >= max(6, refAB + 5) &&
-                             candB >= max(6, refAB + 5));
-    int candColorJump = abs((int)cand.meanR - refR) +
-                        abs((int)cand.meanG - refG) +
-                        abs((int)cand.meanB - refBMean);
-    int refMotion = abs((int)refA.meanR - (int)refB.meanR) +
-                    abs((int)refA.meanG - (int)refB.meanG) +
-                    abs((int)refA.meanB - (int)refB.meanB);
-    bool colorJumpOutlier = (candColorJump >= max(10, refMotion + 6));
-    int candYellowSkew = (int)cand.meanR + (int)cand.meanG - (2 * (int)cand.meanB);
-    int refYellowSkew = refR + refG - (2 * refBMean);
-    bool yellowSpike = (candYellowSkew >= refYellowSkew + 8);
-    bool textureDrop = (refTex >= 3 && (int)cand.texture <= refTex - 2);
-    bool colorLift = (cand.meanG >= refG + 3 && cand.meanB >= refBMean + 4);
-    bool cyanLift = (cand.cyanTiles >= refCyan + 2 && cand.cyanTiles >= 3);
-    bool sizeOutlier = (candSize > 0 && refSize > 0 && candSize + 900 < refSize);
-    bool suspiciousColor = colorLift && (sizeOutlier || strongDistance);
-    bool suspiciousCyan = (cyanLift || cyanBand) && moderateDistance;
-    bool suspiciousYellow = yellowSpike && sizeOutlier && colorJumpOutlier && textureDrop;
-
-    if ((moderateDistance && (suspiciousColor || suspiciousCyan)) || suspiciousYellow) {
-      if (label) {
-        Serial.printf("%s SEM-OUTLIER %s ca=%d cb=%d rr=%d cyan=%d/%d sz=%d/%d cj=%d rm=%d ys=%d/%d tx=%d/%d\n",
-                      label, which, candA, candB, refAB,
-                      (int)cand.cyanTiles, refCyan, candSize, refSize,
-                      candColorJump, refMotion, candYellowSkew, refYellowSkew,
-                      (int)cand.texture, refTex);
-      }
-      return true;
-    }
-    decodeJpegPathToSprite(candidatePath);
-    return false;
-  };
-
-  if (idx <= 0) {
-    return checkAgainstRefs(1, 2, "HEAD");
-  }
-  if (idx >= frameCount - 1) {
-    return checkAgainstRefs(frameCount - 2, frameCount - 3, "TAIL");
-  }
-  return checkAgainstRefs(idx - 1, idx + 1, "MID");
-}
-
-static bool installValidatedWeatherJpegToPath(const char* finalPath,
-                                              size_t jpegLen,
-                                              const char* label = nullptr,
-                                              bool skipStoredValidate = false) {
-  if (!finalPath || jpegLen == 0 || jpegLen > DL_BUF_BYTES) return false;
-
-  char tmpPath[64];
-  snprintf(tmpPath, sizeof(tmpPath), "%s.part", finalPath);
-  SD.remove(tmpPath);
-
-  File f = SD.open(tmpPath, FILE_WRITE);
-  size_t written = 0;
-  if (f) {
-    written = f.write(s_dlBuf, jpegLen);
-    f.flush();
-    f.close();
-  }
-  if (written != jpegLen) {
-    SD.remove(tmpPath);
-    if (label) { Serial.printf("%s SD-ERR\n", label); appendDiagLog("inst: %s SD-ERR wr=%u want=%u\n", label, (unsigned)written, (unsigned)jpegLen); }
-    return false;
-  }
-
-  if (!verifyInstalledJpeg(tmpPath, jpegLen)) {
-    SD.remove(tmpPath);
-    if (label) { Serial.printf("%s VERIFY-FAIL\n", label); appendDiagLog("inst: %s VERIFY-FAIL len=%u\n", label, (unsigned)jpegLen); }
-    return false;
-  }
-
-  if (!skipStoredValidate && !validateStoredWeatherFramePath(tmpPath, label)) {
-    SD.remove(tmpPath);
-    appendDiagLog("inst: %s STORED-VAL-FAIL\n", label ? label : "?");
-    return false;
-  }
-
-  SD.remove(finalPath);
-  bool moved = SD.rename(tmpPath, finalPath);
-  if (!moved) {
-    moved = copyFrameFile(tmpPath, finalPath);
-    if (moved) SD.remove(tmpPath);
-  }
-  if (!moved) {
-    SD.remove(tmpPath);
-    if (label) { Serial.printf("%s RENAME-FAIL\n", label); appendDiagLog("inst: %s RENAME-FAIL\n", label); }
-    return false;
-  }
-
-  return true;
-}
-
-static bool repairCachedWeatherFrame(int idx, HTTPClient& http, WiFiClientSecure& client) {
-  if (idx < 0 || idx >= frameCount) return false;
-  time_t t = s_frameTimes[idx];
-  if (t <= 0) return false;
-
-  char finalPath[32];
-  makeFramePathByIdx(idx, finalPath, sizeof(finalPath));
-  const char* tmpPath = SD_ROOT "/frames/.repair.jpg";
-
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    SD.remove(tmpPath);
-    size_t bytes = 0;
-    if (!downloadFrameToPath(http, client, t, tmpPath, &bytes)) {
-      continue;
-    }
-    if (!validateStoredWeatherFramePath(tmpPath, "REPAIR")) {
-      SD.remove(tmpPath);
-      continue;
-    }
-    if (weatherFrameLooksSemanticOutlier(idx, tmpPath, "REPAIR")) {
-      SD.remove(tmpPath);
-      continue;
-    }
-    SD.remove(finalPath);
-    bool moved = SD.rename(tmpPath, finalPath);
-    if (!moved) {
-      moved = copyFrameFile(tmpPath, finalPath);
-      if (moved) SD.remove(tmpPath);
-    }
-    if (moved) {
-      appendDiagLog("repair-frame: ok idx=%d attempt=%d\n", idx, attempt);
-      return true;
-    }
-    SD.remove(tmpPath);
-  }
-
-  appendDiagLog("repair-frame: fail idx=%d\n", idx);
-  return false;
-}
-
-static bool healCachedWeatherFrameFromNeighbor(int idx, int frameLimit) {
-  if (idx < 0 || idx >= frameCount) return false;
-  if (frameLimit < 0 || frameLimit > frameCount) frameLimit = frameCount;
-  if (frameLimit <= 0) return false;
-
-  char dstPath[32];
-  makeFramePathByIdx(idx, dstPath, sizeof(dstPath));
-
-  for (int d = 1; d < frameLimit; ++d) {
-    int candidates[2] = { idx - d, idx + d };
-    for (int pass = 0; pass < 2; ++pass) {
-      int srcIdx = candidates[pass];
-      if (srcIdx < 0 || srcIdx >= frameLimit || srcIdx == idx) continue;
-      if (!frameFileExists(srcIdx)) continue;
-
-      char srcPath[32];
-      makeFramePathByIdx(srcIdx, srcPath, sizeof(srcPath));
-      if (!validateStoredWeatherFramePath(srcPath, nullptr)) continue;
-      if (weatherFrameLooksSemanticOutlier(srcIdx, srcPath, nullptr)) continue;
-
-      SD.remove(dstPath);
-      if (copyFrameFile(srcPath, dstPath)) {
-        Serial.printf("heal frame %d <- %d\n", idx, srcIdx);
-        appendDiagLog("heal-frame: ok idx=%d src=%d\n", idx, srcIdx);
-        return true;
-      }
-    }
-  }
-  appendDiagLog("heal-frame: fail idx=%d\n", idx);
-  return false;
-}
-
-static bool validateAndRepairCachedFrames(const uint8_t* frameMask = nullptr,
-                                         int frameLimit = -1,
-                                         int maxRepairs = -1,
-                                         int* outRepaired = nullptr,
-                                         int* outFailed = nullptr) {
-  if (frameCount <= 0) return false;
-  if (frameLimit < 0 || frameLimit > frameCount) frameLimit = frameCount;
-  if (outRepaired) *outRepaired = 0;
-  if (outFailed) *outFailed = 0;
-
-  int pending = 0;
-  for (int i = 0; i < frameLimit; ++i) {
-    if (!frameMask || frameMask[i]) pending++;
-  }
-  if (pending <= 0) return false;
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setReuse(true);
-
-  int checked = 0;
-  int repaired = 0;
-  int failed = 0;
-  for (int i = 0; i < frameLimit; ++i) {
-    if (frameMask && !frameMask[i]) continue;
-    checked++;
-
-    char finalPath[32];
-    char label[20];
-    makeFramePathByIdx(i, finalPath, sizeof(finalPath));
-    snprintf(label, sizeof(label), "VAL-%03d", i);
-    bool valid = validateStoredWeatherFramePath(finalPath, label);
-    if (valid) valid = !weatherFrameLooksCompressedSizeOutlier(i, finalPath, label);
-    if (valid) valid = !weatherFrameLooksSemanticOutlier(i, finalPath, label);
-    if (valid) continue;
-
-    if (repairCachedWeatherFrame(i, http, client)) {
-      repaired++;
-      if (maxRepairs > 0 && repaired >= maxRepairs) {
-        break;
-      }
-    } else {
-      if (healCachedWeatherFrameFromNeighbor(i, frameLimit)) {
-        repaired++;
-      } else {
-        failed++;
-      }
-    }
-  }
-
-  if (outRepaired) *outRepaired = repaired;
-  if (outFailed) *outFailed = failed;
-  if (repaired > 0) {
-    Serial.printf("validate repaired=%d\n", repaired);
-  }
-  if (repaired > 0 || failed > 0) {
-    appendDiagLog("repair: repaired=%d failed=%d checked=%d\n", repaired, failed, checked);
-  }
-  return (repaired > 0);
-}
-
-static bool validateAndRepairFullCacheIfNeeded(int cacheCount) {
-  if (cacheCount <= 0) return false;
-  if (cacheValidationMetaIsCurrent()) return false;
-
-  int repaired = 0;
-  int failed = 0;
-  bool anyRepaired = validateAndRepairCachedFrames(nullptr, cacheCount, -1, &repaired, &failed);
-  if (failed == 0) {
-    writeCurrentCacheValidationMeta();
-    appendDiagLog("validate: full done repaired=%d failed=%d\n", repaired, failed);
-  } else {
-    SD.remove(CACHE_VALIDATE_META_FILE);
-    appendDiagLog("validate: full incomplete repaired=%d failed=%d\n", repaired, failed);
-  }
-  return anyRepaired;
-}
-
-static bool validateAndRepairCacheSlice(int cacheCount) {
-  if (cacheCount <= 0) return false;
-  uint8_t mask[MAX_FRAMES] = {};
-  const int scrubCount = min(cacheCount, 12);
-  int start = (int)s_cacheRepairCursor;
-  if (start >= cacheCount) start = 0;
-  for (int i = 0; i < scrubCount; ++i) {
-    int idx = (start + i) % cacheCount;
-    mask[idx] = 1;
-  }
-  s_cacheRepairCursor = (uint8_t)((start + scrubCount) % cacheCount);
-  return validateAndRepairCachedFrames(mask, cacheCount, 1);
-}
 
 // ─────────────────────────────────────────────────────────────
 //  GIBS DescribeDomains — query exact available timestamps
 // ─────────────────────────────────────────────────────────────
-#define MAX_GIBS_AVAIL 160
-static time_t s_gibsAvailTimes[MAX_GIBS_AVAIL];
-static int s_gibsAvailCount = 0;
 
 static time_t parseISOToUtcEpoch(const char* p) {
   int Y, M, D, h, m, s;
@@ -6054,115 +5057,6 @@ static bool fetchGibsAvailableTimes(WiFiClientSecure& client,
   Serial.printf("GIBS avail: %d times\n", s_gibsAvailCount);
   appendDiagLog("gibs: describeDomains count=%d\n", s_gibsAvailCount);
   return s_gibsAvailCount > 0;
-}
-
-static bool downloadFrameToPathAtBbox(HTTPClient& http,
-                                      WiFiClientSecure& client,
-                                      time_t t,
-                                      const char* sdPath,
-                                      float bboxWest, float bboxSouth,
-                                      float bboxEast, float bboxNorth,
-                                      int reqW = DISP_W,
-                                      int reqH = DISP_H,
-                                      size_t* outBytes = nullptr,
-                                      bool validateWeatherFrame = false) {
-  char timeISO[32];
-  char url[512];
-  size_t jpegLen = 0;
-
-  // If GIBS available times are loaded, snap directly to the nearest known
-  // timestamp instead of blind-probing 7 offsets.  Falls back to the old
-  // offset logic when DescribeDomains wasn't fetched.
-  const int cadenceSec = max(60, activeCadenceMin() * 60);
-  time_t snappedTime = snapToNearestGibsTime(t, 2 * cadenceSec);
-
-  const time_t secondOffsets[] = {0, -60, 60,
-                                  -(time_t)cadenceSec,   (time_t)cadenceSec,
-                                  -2*(time_t)cadenceSec, 2*(time_t)cadenceSec};
-  int stepCount;
-  if (snappedTime > 0) {
-    stepCount = 1;
-  } else if (s_gibsAvailCount > 0) {
-    return false;  // avail times loaded but nothing near this slot
-  } else {
-    stepCount = validateWeatherFrame ? 7 : 1;
-  }
-
-  for (int si = 0; si < stepCount; ++si) {
-    time_t candT = (snappedTime > 0) ? snappedTime : (t + secondOffsets[si]);
-    if (candT <= 0) continue;
-    toISO(candT, timeISO, sizeof(timeISO));
-
-    if (!buildWeatherFrameUrl(url, sizeof(url), candT,
-                              bboxWest, bboxSouth, bboxEast, bboxNorth,
-                              reqW, reqH)) {
-      continue;
-    }
-
-    const int maxAttempts = 2;  // network retry for each candidate
-    bool fetchedOk = false;
-    for (int attempt = 0; attempt < maxAttempts; ++attempt) {
-      http.begin(client, url);
-      http.setTimeout(5000);
-      int code = http.GET();
-      if (code != HTTP_CODE_OK) {
-        http.end();
-        Serial.printf("MISS %s HTTP-%d\n", timeISO, code);
-        continue;
-      }
-      if (!readHttpJpegBodyToDlBuf(http, "MISS", &jpegLen)) {
-        continue;
-      }
-      if (validateWeatherFrame && !validateBufferedWeatherFrameJpeg(jpegLen, "MISS")) {
-        Serial.printf("MISS %s RETRY %d\n", timeISO, attempt + 1);
-        continue;
-      }
-      // Check if decoder corrupted s_dlBuf
-      if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) {
-        appendDiagLog("BUG: decoder-corrupt s_dlBuf jpegLen=%u\n", (unsigned)jpegLen);
-        continue;
-      }
-      fetchedOk = true;
-      break;
-    }
-    if (!fetchedOk) continue;
-
-    char verifyLabel[40];
-    snprintf(verifyLabel, sizeof(verifyLabel), "MISS %s", timeISO);
-    bool instOk = false;
-    for (int ir = 0; ir < 3 && !instOk; ir++) {
-      if (ir > 0) delay(10);
-      instOk = installValidatedWeatherJpegToPath(sdPath, jpegLen, verifyLabel, validateWeatherFrame);
-    }
-    if (!instOk) {
-      continue;
-    }
-
-    if (outBytes) *outBytes = jpegLen;
-    if (si != 0) {
-      Serial.printf("MISS fallback si=%d off=%llds src=%s OK %u B\n",
-                    si, (long long)secondOffsets[si], timeISO, (unsigned)jpegLen);
-    } else {
-      Serial.printf("MISS %s OK %u B\n", timeISO, (unsigned)jpegLen);
-    }
-    return true;
-  }
-
-  return false;
-}
-
-static bool downloadFrameToPath(HTTPClient& http,
-                                WiFiClientSecure& client,
-                                time_t t,
-                                const char* sdPath,
-                                size_t* outBytes = nullptr) {
-  float bboxWest, bboxSouth, bboxEast, bboxNorth;
-  getActiveWeatherBbox(&bboxWest, &bboxSouth, &bboxEast, &bboxNorth);
-  return downloadFrameToPathAtBbox(http, client, t, sdPath,
-                                   bboxWest, bboxSouth, bboxEast, bboxNorth,
-                                   DISP_W, DISP_H,
-                                   outBytes,
-                                   true);
 }
 
 
@@ -7320,18 +6214,9 @@ static bool currentScaledFreezeFrameLooksCorrupted() {
 
 static bool tryShowCleanFreezeFrameByIdx(int idx) {
   if (idx < 0 || idx >= frameCount) return false;
-
   if (showFrame(idx) && !currentScaledFreezeFrameLooksCorrupted()) {
     return true;
   }
-
-  char framePath[40];
-  makeFramePathByIdx(idx, framePath, sizeof(framePath));
-  if (showZoomSnapshotFrame(framePath, idx) &&
-      !currentScaledFreezeFrameLooksCorrupted()) {
-    return true;
-  }
-
   return false;
 }
 
@@ -7400,7 +6285,6 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
 static void refreshZoomSnapshotsForLatestFrame() {
   if (WiFi.status() != WL_CONNECTED) return;
   if (frameCount <= 0) return;
-  if (!s_timesLoaded) loadTimesIfNeeded();
   if (!s_timesLoaded) return;
   bool useUnifiedProgress = syncProgressIsActive();
   if (useUnifiedProgress) syncProgressBeginPhase("zoom/terrain", 12);
@@ -7559,7 +6443,11 @@ static void refreshZoomSnapshotsForLatestFrame() {
 //  One SSL handshake for the full weather window (frame count derives from
 //  HOURS_BACK and active cadence, clamped to MAX_FRAMES).
 // ─────────────────────────────────────────────────────────────
-static void downloadFrames() {
+// ─────────────────────────────────────────────────────────────
+//  Unified weather frame sync — one function replaces downloadFrames
+//  + syncFramesRolling + all branch logic.
+// ─────────────────────────────────────────────────────────────
+static void syncWeatherFrames() {
   if (!syncProgressIsActive()) showMessage("Syncing time...", "pool.ntp.org");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   struct tm ti;
@@ -7567,911 +6455,485 @@ static void downloadFrames() {
   while (!getLocalTime(&ti, 1000) && tries++ < 20) {}
   time_t now = time(nullptr);
   Serial.printf("UTC: %s\n", ctime(&now));
-  appendDiagLog("download: ntp utc=%lld\n", (long long)now);
+  appendDiagLog("sync: ntp utc=%lld millis=%lu ms\n", (long long)now, millis());
   refreshDisplayLocationTimeFromIpInfo();
-  if (syncProgressIsActive()) syncProgressCompletePhase(); // sync phase
-
-  const int cadenceMin = activeCadenceMin();
-  const int lagHours = activeLagHours();
-  const int totalFrames = targetFrameCount();
-  time_t fetchEnd = roundToCadence(now - (time_t)(lagHours * 3600));
-
-  SD.mkdir(FRAMES_DIR);
-  if (!syncProgressIsActive()) showMessage("Updating cache...", "NASA GIBS");
-  Serial.printf("heap %u fetch %d src=%s cad=%d lag=%d\n",
-                (unsigned)ESP.getFreeHeap(),
-                totalFrames, s_activeWeatherSource, cadenceMin, lagHours);
-  appendDiagLog("download: start total=%d end=%lld cad=%d lag=%d src=%s heap=%u millis=%lu ms\n",
-                totalFrames, (long long)fetchEnd, cadenceMin, lagHours,
-                s_activeWeatherSource, (unsigned)ESP.getFreeHeap(), millis());
-
-  // One persistent SSL connection for all frames.
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setReuse(true);   // keep-alive — avoids SSL handshake on every frame
-
-  time_t fetchStart = fetchEnd - (time_t)((totalFrames - 1) * cadenceMin * 60);
-  fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
-
-  // Diag: log GIBS window alignment
-  if (s_gibsAvailCount > 0) {
-    char isoA[32], isoB[32], isoC[32], isoD[32];
-    toISO(s_gibsAvailTimes[0], isoA, sizeof(isoA));
-    toISO(s_gibsAvailTimes[s_gibsAvailCount-1], isoB, sizeof(isoB));
-    toISO(fetchStart, isoC, sizeof(isoC));
-    toISO(fetchEnd, isoD, sizeof(isoD));
-    appendDiagLog("gibs: avail[0]=%s avail[%d]=%s window=%s..%s\n",
-                  isoA, s_gibsAvailCount-1, isoB, isoC, isoD);
-    // Log raw epoch values for comparison
-    appendDiagLog("gibs: epoch avail[0]=%lld avail[last]=%lld start=%lld end=%lld\n",
-                  (long long)s_gibsAvailTimes[0],
-                  (long long)s_gibsAvailTimes[s_gibsAvailCount-1],
-                  (long long)fetchStart, (long long)fetchEnd);
-  }
-
-  int saved = 0;
-  int snapMisses = 0;
-  int httpFails = 0, fetchFails = 0, valFails = 0, installFails = 0;
-  char url[512];
-  float bboxWest, bboxSouth, bboxEast, bboxNorth;
-  getActiveWeatherBbox(&bboxWest, &bboxSouth, &bboxEast, &bboxNorth);
-
-  if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-  for (int i = 0; i < totalFrames; i++) {
-    time_t t = fetchEnd - (time_t)((totalFrames - 1 - i) * cadenceMin * 60);
-    char timeISO[32];
-    toISO(t, timeISO, sizeof(timeISO));
-    if (!buildWeatherFrameUrl(url, sizeof(url), t,
-                              bboxWest, bboxSouth, bboxEast, bboxNorth)) {
-      Serial.printf("[%3d/%d] %s URL\n", i + 1, totalFrames, timeISO);
-      continue;
-    }
-
-    showProgress(i + 1, totalFrames, "frames");
-    size_t total = 0;
-    size_t jpegLen = 0;
-    bool fetchedOk = false;
-    // If GIBS available times loaded, snap directly; else probe ±1 min.
-    time_t snapped = snapToNearestGibsTime(t, 2 * cadenceMin * 60);
-    static const int kGibsOffsetsSec[] = { 0, -60, 60 };
-    int kGibsOffsetCount;
-    if (snapped > 0) {
-      kGibsOffsetCount = 1;
-    } else if (s_gibsAvailCount > 0) {
-      if (snapMisses < 3) {
-        appendDiagLog("snap-miss: i=%d t=%lld avail=%d\n",
-                      i, (long long)t, s_gibsAvailCount);
-      }
-      snapMisses++;
-      continue;  // avail times loaded, no data for this slot
-    } else {
-      kGibsOffsetCount = (int)(sizeof(kGibsOffsetsSec) / sizeof(kGibsOffsetsSec[0]));
-    }
-    for (int attempt = 0; attempt < kGibsOffsetCount; ++attempt) {
-      time_t tTry = (snapped > 0) ? snapped : (t + (time_t)kGibsOffsetsSec[attempt]);
-      if (!buildWeatherFrameUrl(url, sizeof(url), tTry,
-                                bboxWest, bboxSouth, bboxEast, bboxNorth)) continue;
-      int code = 0;
-      for (int httpRetry = 0; httpRetry < 3; httpRetry++) {
-        if (httpRetry > 0) { delay(100); yield(); }
-        http.begin(client, url);
-        http.setTimeout(5000);
-        code = http.GET();
-        if (code == HTTP_CODE_OK) break;
-        http.end();
-        if (httpRetry == 0 && i == 0 && attempt == 0) {
-          File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-          if (diagF) {
-            diagF.printf("frame0 code=%d err=%s (retrying)\n", code, http.errorToString(code).c_str());
-            diagF.close();
-          }
-        }
-      }
-      if (i == 0 && attempt == 0) {
-        File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-        if (diagF) {
-          diagF.printf("frame0 url=%.120s\n", url);
-          diagF.printf("frame0 code=%d err=%s\n", code, http.errorToString(code).c_str());
-          diagF.printf("frame0 freeHeap=%u\n", (unsigned)ESP.getFreeHeap());
-          diagF.close();
-        }
-      }
-      if (code != HTTP_CODE_OK) {
-        http.end();
-        if (httpFails < 3) {
-          appendDiagLog("dl-fail: i=%d HTTP-%d heap=%u\n",
-                        i, code, (unsigned)ESP.getFreeHeap());
-        }
-        httpFails++;
-        Serial.printf("[%3d/%d] %s HTTP-%d\n", i+1, totalFrames, timeISO, code);
-        continue;
-      }
-
-      if (!readHttpJpegBodyToDlBuf(http, "FRAME", &jpegLen, &total)) {
-        fetchFails++;
-        Serial.printf("[%3d/%d] %s FETCH-BAD\n", i+1, totalFrames, timeISO);
-        continue;
-      }
-      if (!validateBufferedWeatherFrameJpeg(jpegLen, "FRAME")) {
-        valFails++;
-        if (attempt + 1 < kGibsOffsetCount) {
-          Serial.printf("[%3d/%d] %s probe%+d\n", i+1, totalFrames, timeISO,
-                        kGibsOffsetsSec[attempt+1] / 60);
-        }
-        continue;
-      }
-      // Check if decoder corrupted s_dlBuf
-      if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) {
-        appendDiagLog("BUG: decoder-corrupt s_dlBuf i=%d jpegLen=%u\n", i, (unsigned)jpegLen);
-        valFails++;
-        continue;
-      }
-      fetchedOk = true;
-      break;
-    }
-    if (!fetchedOk) {
-      appendDiagLog("download: miss i=%d t=%lld\n", i, (long long)t);
-      continue;
-    }
-
-    if (i == 0) {
-      File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-      if (diagF) {
-        diagF.printf("frame0 total=%u jpegLen=%u\n", (unsigned)total, (unsigned)jpegLen);
-        diagF.printf("frame0 hdr=%02x%02x%02x%02x\n",
-                     (unsigned)(uint8_t)s_dlBuf[0],
-                     (unsigned)(total > 1 ? (uint8_t)s_dlBuf[1] : 0),
-                     (unsigned)(total > 2 ? (uint8_t)s_dlBuf[2] : 0),
-                     (unsigned)(total > 3 ? (uint8_t)s_dlBuf[3] : 0));
-        diagF.close();
-      }
-    }
-
-    // Use timestamp as filename — no renames needed during rolling sync
-    char sdPath[32];
-    makeFramePathByTime(t, sdPath, sizeof(sdPath));
-
-    char verifyLabel[48];
-    snprintf(verifyLabel, sizeof(verifyLabel), "FRAME-%03d", saved);
-    bool installed = false;
-    for (int instRetry = 0; instRetry < 3 && !installed; instRetry++) {
-      if (instRetry > 0) delay(10);
-      installed = installValidatedWeatherJpegToPath(sdPath, jpegLen, verifyLabel, true);
-    }
-    if (!installed) {
-      if (installFails < 3) {
-        appendDiagLog("dl-fail: i=%d INSTALL heap=%u\n",
-                      i, (unsigned)ESP.getFreeHeap());
-      }
-      installFails++;
-      Serial.printf("[%3d/%d] %s INSTALL-FAIL\n", i+1, totalFrames, timeISO);
-      continue;
-    }
-
-    s_frameTimes[saved] = t;
-    saved++;
-    Serial.printf("[%3d/%d] %s OK %u B\n", i+1, totalFrames, timeISO, (unsigned)jpegLen);
-    delay(20);  // pace requests to avoid WiFi stack congestion
-  }
   if (syncProgressIsActive()) syncProgressCompletePhase();
-
-  if (syncProgressIsActive()) syncProgressBeginPhase("finalize", 8);
-  // Clean up any stale frame files from previous sessions
-  removeStaleFrameFiles(s_frameTimes, saved);
-  // Save frame timestamps to SD (for wake-from-sleep playback)
-  SD.remove(TIMES_FILE);  // FILE_WRITE may append; timestamps must be exact
-  File tf = SD.open(TIMES_FILE, FILE_WRITE);
-  if (tf) { tf.write((uint8_t*)s_frameTimes, saved * sizeof(time_t)); tf.flush(); tf.close(); }
-  if (syncProgressIsActive()) syncProgressTick(1);
-  installCacheState(s_frameTimes, saved);
-  if (syncProgressIsActive()) syncProgressTick(1);
-
-  if (syncProgressIsActive()) syncProgressTick(2);
-
-  writeCurrentWeatherViewMeta();
-  if (syncProgressIsActive()) syncProgressTick(1);
-  s_zoomSnapshotsRefreshPending = (saved > 0);
-  s_zoomWeatherRefreshNeeded = (saved > 0);
-  SD.remove(CACHE_VALIDATE_META_FILE);
-  if (syncProgressIsActive()) {
-    syncProgressTick(3);
-    syncProgressCompletePhase();
-  }
-
-  Serial.printf("dl done %d/%d\n", saved, totalFrames);
-  appendDiagLog("download: done saved=%d snapMiss=%d http=%d fetch=%d val=%d inst=%d total=%d millis=%lu ms\n",
-                saved, snapMisses, httpFails, fetchFails, valFails, installFails, totalFrames, millis());
-}
-
-// Returns true if rolling sync handled the refresh path itself.
-// Returns false if caller should do a full refresh via downloadFrames() after
-// this function returns (avoids nested-call stack overflow on ESP32-C6).
-static bool syncFramesRolling() {
-  if (!syncProgressIsActive()) showMessage("Syncing time...", "pool.ntp.org");
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-  struct tm ti;
-  int tries = 0;
-  while (!getLocalTime(&ti, 1000) && tries++ < 20) {}
-  time_t now = time(nullptr);
-  Serial.printf("UTC: %s\n", ctime(&now));
-  {
-    char isoNow[32];
-    toISO(now, isoNow, sizeof(isoNow));
-    appendDiagLog("sync: ntp utc=%lld (%s) millis=%lu ms\n", (long long)now, isoNow, millis());
-  }
-  refreshDisplayLocationTimeFromIpInfo();
-  if (syncProgressIsActive()) syncProgressCompletePhase(); // sync phase
 
   const int cadenceMin = activeCadenceMin();
   const int lagHours = activeLagHours();
   const int totalFrames = targetFrameCount();
   const time_t cadenceSec = (time_t)cadenceMin * 60;
   const time_t fetchEnd = roundToCadence(now - (time_t)(lagHours * 3600));
-  const time_t fetchStart =
-    fetchEnd - (time_t)((totalFrames - 1) * cadenceMin * 60);
+  const time_t fetchStart = fetchEnd - (time_t)((totalFrames - 1) * cadenceMin * 60);
 
-  CacheEntry cache[MAX_FRAMES];
-  int cacheCount = loadCacheEntries(cache, MAX_FRAMES);
-  time_t firstCached = (cacheCount > 0) ? cache[0].t : 0;
-  time_t lastCached  = (cacheCount > 0) ? cache[cacheCount - 1].t : 0;
-  appendDiagLog("sync: cad=%d lag=%d tf=%d cc=%d start=%lld end=%lld\n",
-                cadenceMin, lagHours, totalFrames, cacheCount,
-                (long long)fetchStart, (long long)fetchEnd);
+  // Load current index
+  loadIndex();
+  int oldCount = (int)s_idx.count;
+
+  // Check view mismatch
   bool viewMatches = true;
-  if (cacheCount > 0) {
+  if (s_idx.count > 0) {
     viewMatches = currentWeatherViewMatchesCache();
   }
-  if (cacheCount > 0 && !viewMatches) {
-    Serial.println("view changed -> full refresh");
-    appendDiagLog("sync: full-refresh reason=view cc=%d first=%lld last=%lld start=%lld end=%lld\n",
-                  cacheCount,
-                  (long long)firstCached, (long long)lastCached,
-                  (long long)fetchStart, (long long)fetchEnd);
-    deleteFramesDir();
-    return false;
-  }
-  int recentCount = 0;
-  for (int i = 0; i < cacheCount; i++) {
-    if (cache[i].t >= fetchStart && cache[i].t <= fetchEnd) recentCount++;
+
+  // Compute shift and slot reuse
+  int shift = 0;
+  bool fullRefresh = false;
+  if (!viewMatches && s_idx.count > 0) {
+    fullRefresh = true;
+    appendDiagLog("sync: full-refresh reason=view\n");
+  } else if (s_idx.count > 0 && s_idx.times[0] != 0) {
+    time_t delta = fetchStart - s_idx.times[0];
+    if (delta > 0 && cadenceSec > 0 && (delta % cadenceSec) == 0) {
+      shift = (int)(delta / cadenceSec);
+      if (shift >= (int)s_idx.count) fullRefresh = true;
+    } else if (delta != 0) {
+      fullRefresh = true;
+    }
+  } else if (s_idx.count == 0) {
+    fullRefresh = true;
   }
 
-  if (recentCount == 0) {
-    Serial.println("no in-window cache -> full refresh");
-    appendDiagLog("sync: full-refresh reason=no-window cc=%d first=%lld last=%lld start=%lld end=%lld\n",
-                  cacheCount,
-                  (long long)firstCached, (long long)lastCached,
-                  (long long)fetchStart, (long long)fetchEnd);
-    deleteFramesDir();
-    return false;
-  }
-  if (cacheCount < totalFrames) {
-    Serial.println("partial cache -> rolling");
-    appendDiagLog("sync: partial cache -> rolling cc=%d tf=%d first=%lld last=%lld start=%lld end=%lld\n",
-                  cacheCount, totalFrames,
-                  (long long)firstCached, (long long)lastCached,
-                  (long long)fetchStart, (long long)fetchEnd);
+  if (fullRefresh) {
+    memset(&s_idx, 0, sizeof(s_idx));
+    s_idx.magic = INDEX_MAGIC;
+    s_idx.head = 0;
+    s_idx.count = 0;
+    shift = 0;
   }
 
-  bool oldRawCurrent = false;
-  uint8_t oldRawValid[MAX_FRAMES] = {};
-  uint8_t oldRawSlotMap[MAX_FRAMES] = {};
-  if (cacheCount > 0) {
-    oldRawCurrent = rawCacheMetaVersionIsCurrent();
-    if (oldRawCurrent) {
-      memcpy(oldRawValid, s_streamValid, sizeof(oldRawValid));
-      memcpy(oldRawSlotMap, s_streamSlotMap, sizeof(oldRawSlotMap));
+  // Determine which slots need download
+  bool needsDownload[MAX_FRAMES];
+  memset(needsDownload, 0, sizeof(needsDownload));
+  int downloadCount = 0;
+
+  if (fullRefresh) {
+    // Everything needs download
+    s_idx.count = (uint16_t)totalFrames;
+    for (int i = 0; i < totalFrames; i++) {
+      s_idx.times[i] = fetchStart + (time_t)(i * cadenceSec);
+      s_idx.jpegValid[i] = 0;
+      s_idx.rawValid[i] = 0;
+      s_idx.jpegLen[i] = 0;
+      needsDownload[i] = true;
+      downloadCount++;
+    }
+  } else if (shift > 0) {
+    // Advance head, keep overlapping slots
+    int oldUsable = (int)s_idx.count - shift;
+    if (oldUsable < 0) oldUsable = 0;
+
+    // Build new index
+    FrameStoreIndex newIdx;
+    memset(&newIdx, 0, sizeof(newIdx));
+    newIdx.magic = INDEX_MAGIC;
+    newIdx.head = (s_idx.head + (uint16_t)shift) % MAX_FRAMES;
+    newIdx.count = (uint16_t)totalFrames;
+
+    for (int i = 0; i < totalFrames; i++) {
+      time_t t = fetchStart + (time_t)(i * cadenceSec);
+      newIdx.times[i] = t;
+
+      // Check if this slot was in old index
+      int oldLogical = i + shift - ((int)s_idx.count - oldUsable);
+      // Actually: old slot for this time = shift + i if within old range
+      int oldSlot = shift + i;
+      if (oldSlot >= 0 && oldSlot < (int)s_idx.count && i < oldUsable &&
+          s_idx.times[oldSlot] == t && s_idx.jpegValid[oldSlot]) {
+        // Reuse this slot — physical slot is the same (circular)
+        newIdx.jpegLen[i] = s_idx.jpegLen[oldSlot];
+        newIdx.jpegValid[i] = 1;
+        newIdx.rawValid[i] = s_idx.rawValid[oldSlot];
+      } else {
+        needsDownload[i] = true;
+        downloadCount++;
+      }
+    }
+    memcpy(&s_idx, &newIdx, sizeof(s_idx));
+  } else {
+    // shift == 0, check for gaps and update count if needed
+    if ((int)s_idx.count < totalFrames) {
+      // Need more frames at the tail
+      for (int i = (int)s_idx.count; i < totalFrames; i++) {
+        s_idx.times[i] = fetchStart + (time_t)(i * cadenceSec);
+        s_idx.jpegValid[i] = 0;
+        s_idx.rawValid[i] = 0;
+        needsDownload[i] = true;
+        downloadCount++;
+      }
+      s_idx.count = (uint16_t)totalFrames;
+    }
+    // Check for invalid slots
+    for (int i = 0; i < (int)s_idx.count; i++) {
+      if (!s_idx.jpegValid[i]) {
+        s_idx.times[i] = fetchStart + (time_t)(i * cadenceSec);
+        needsDownload[i] = true;
+        downloadCount++;
+      }
     }
   }
 
-  // Stable partial window shortcut:
-  // If cache already spans current start/end anchors but has interior holes,
-  // do not re-attempt dozens of old missing timestamps every reboot.
-  // Keep the partial set and skip to raw handling.
-  if (cacheCount > 0 &&
-      cacheCount < totalFrames &&
-      recentCount == cacheCount &&
-      firstCached == fetchStart &&
-      lastCached == fetchEnd) {
-    installCacheStateFromEntries(cache, cacheCount);
-    s_zoomSnapshotsRefreshPending =
-      (cacheCount > 0 && !zoomSnapshotsCurrentAndUsable(cache[cacheCount - 1].t));
+  appendDiagLog("sync: totalFrames=%d shift=%d downloadCount=%d oldCount=%d\n",
+                totalFrames, shift, downloadCount, oldCount);
+
+  if (downloadCount == 0) {
+    // Check if raw is all built
+    bool allRawValid = true;
+    for (int i = 0; i < (int)s_idx.count; i++) {
+      if (s_idx.jpegValid[i] && !s_idx.rawValid[i]) { allRawValid = false; break; }
+    }
+    writeIndex();
     s_zoomWeatherRefreshNeeded = false;
-    appendDiagLog("sync: partial-window-current cc=%d tf=%d raw=%d keep=1\n",
-                  cacheCount, totalFrames, (int)oldRawCurrent);
-
-    if (oldRawCurrent) {
+    if (s_idx.count > 0) {
+      s_zoomSnapshotsRefreshPending = !zoomSnapshotsCurrentAndUsable(s_idx.times[s_idx.count - 1]);
+    }
+    if (allRawValid) {
       if (syncProgressIsActive()) {
         syncProgressBeginPhase("cache", (uint32_t)totalFrames);
         syncProgressCompletePhase();
         syncProgressBeginPhase("raw", (uint32_t)totalFrames);
         syncProgressCompletePhase();
       }
-      Serial.println("partial window current -> skip rolling");
-      showMessage("Cache current", "Partial window stable");
-      delay(700);
-      return true;
-    }
-
-    if (syncProgressIsActive()) {
-      syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-      syncProgressCompletePhase();
-    }
-    Serial.println("partial window current -> rebuild raw");
-    buildRawPlaybackCache();
-    return true;
-  }
-
-  bool exactMatch = cacheMatchesWindowExactly(cache, cacheCount, fetchStart, totalFrames);
-  bool prefixMatch = cacheMatchesWindowPrefix(cache, cacheCount, fetchStart, totalFrames);
-  int fastShift = detectForwardWindowShift(cache, cacheCount, fetchStart, totalFrames);
-  appendDiagLog("sync: cc=%d rc=%d first=%lld last=%lld start=%lld end=%lld view=%d raw=%d exact=%d prefix=%d shift=%d\n",
-                cacheCount, recentCount,
-                (long long)firstCached, (long long)lastCached,
-                (long long)fetchStart, (long long)fetchEnd,
-                (int)viewMatches, (int)oldRawCurrent,
-                (int)exactMatch, (int)prefixMatch, fastShift);
-
-  if (cacheCount > 0) {
-    time_t newestCached = cache[cacheCount - 1].t;
-    if (cacheCount == totalFrames && exactMatch && newestCached == fetchEnd) {
-      installCacheStateFromEntries(cache, cacheCount);
-      s_zoomSnapshotsRefreshPending = !zoomSnapshotsCurrentAndUsable(newestCached);
-      s_zoomWeatherRefreshNeeded = false;    // no new weather frames downloaded
-      appendDiagLog("sync: latest-current newest=%lld cc=%d tf=%d raw=%d zoomRefresh=%d weatherNeed=%d\n",
-                    (long long)newestCached,
-                    cacheCount, totalFrames,
-                    (int)oldRawCurrent,
-                    (int)s_zoomSnapshotsRefreshPending,
-                    (int)s_zoomWeatherRefreshNeeded);
-
-      if (oldRawCurrent) {
-        if (syncProgressIsActive()) {
-          syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-          syncProgressCompletePhase();
-          syncProgressBeginPhase("raw", (uint32_t)totalFrames);
-          syncProgressCompletePhase();
-        }
-        Serial.println("latest frame current -> skip rolling");
-        showMessage("Cache current", "Newest frame current");
-        delay(700);
-        return true;
-      }
-
-      if (syncProgressIsActive()) {
-        syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-        syncProgressCompletePhase();
-      }
-      Serial.println("latest frame current -> rebuild raw only");
-      buildRawPlaybackCache();
-      return true;
-    }
-  }
-
-  if (exactMatch) {
-    installCacheStateFromEntries(cache, cacheCount);
-    s_zoomSnapshotsRefreshPending =
-      (cacheCount > 0 && !zoomSnapshotsCurrentAndUsable(cache[cacheCount - 1].t));
-    s_zoomWeatherRefreshNeeded = false;                // no new weather frames downloaded
-    appendDiagLog("sync: exact-current raw=%d zoomRefresh=%d weatherNeed=%d\n",
-                  (int)oldRawCurrent, (int)s_zoomSnapshotsRefreshPending,
-                  (int)s_zoomWeatherRefreshNeeded);
-
-    if (cacheCount > 0 && oldRawCurrent) {
-      if (syncProgressIsActive()) {
-        syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-        syncProgressCompletePhase();
-        syncProgressBeginPhase("raw", (uint32_t)totalFrames);
-        syncProgressCompletePhase();
-      }
-      Serial.println("cache current -> skip");
       showMessage("Cache current", "No downloads needed");
       delay(700);
-      return true;
+      appendDiagLog("sync: cache current, no downloads\n");
+      return;
     }
-
+    // Need raw rebuild
     if (syncProgressIsActive()) {
       syncProgressBeginPhase("cache", (uint32_t)totalFrames);
       syncProgressCompletePhase();
     }
-    Serial.println("jpeg current -> rebuild raw");
-    buildRawPlaybackCache();
-    return true;
+    rebuildRawFromStored();
+    appendDiagLog("sync: cache current, rebuilt raw\n");
+    return;
   }
 
-  if (prefixMatch) {
-    if (!syncProgressIsActive()) showMessage("Updating cache...", "NASA GIBS");
-    if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-    Serial.printf("roll tail-fill c=%d miss=%d src=%s cad=%d lag=%d\n",
-                  cacheCount, totalFrames - cacheCount,
-                  s_activeWeatherSource, cadenceMin, lagHours);
-    appendDiagLog("sync: branch=tail-fill cc=%d miss=%d raw=%d\n",
-                  cacheCount, totalFrames - cacheCount, (int)oldRawCurrent);
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.setReuse(true);
-
-    time_t newTimes[MAX_FRAMES] = {};
-    int rawSourceIdx[MAX_FRAMES];
-    for (int i = 0; i < MAX_FRAMES; i++) rawSourceIdx[i] = -1;
-
-    int saved = 0;
-    int reused = 0;
-    int downloaded = 0;
-    for (int i = 0; i < cacheCount; i++) {
-      time_t t = cache[i].t;
-      if (cachedFrameLooksReusable(t)) {
-        newTimes[saved] = t;
-        rawSourceIdx[saved] = cache[i].idx;
-        saved++;
-        reused++;
-        continue;
-      }
-
-      appendDiagLog("sync: tail-fill reuse-invalid t=%lld -> redownload\n",
-                    (long long)t);
-      char finalPath[32];
-      makeFramePathByTime(t, finalPath, sizeof(finalPath));
-      size_t bytes = 0;
-      if (!downloadFrameToPath(http, client, t, finalPath, &bytes)) {
-        appendDiagLog("sync: tail-fill redownload-fail t=%lld\n",
-                      (long long)t);
-        break;
-      }
-      newTimes[saved] = t;
-      rawSourceIdx[saved] = -1;
-      saved++;
-      downloaded++;
-    }
-
-    for (int slot = cacheCount; slot < totalFrames; slot++) {
-      showProgress(slot + 1, totalFrames, "cache");
-      time_t t = fetchStart + (time_t)(slot * cadenceSec);
-      char finalPath[32];
-      makeFramePathByTime(t, finalPath, sizeof(finalPath));
-      size_t bytes = 0;
-      if (!downloadFrameToPath(http, client, t, finalPath, &bytes)) {
-        break;
-      }
-      newTimes[saved] = t;
-      rawSourceIdx[saved] = -1;
-      saved++;
-      downloaded++;
-    }
-    if (syncProgressIsActive()) syncProgressCompletePhase();
-
-    if (saved < totalFrames) {
-      appendDiagLog("sync: tail-fill incomplete saved=%d total=%d reused=%d downloaded=%d -> full-refresh\n",
-                    saved, totalFrames, reused, downloaded);
-      deleteFramesDir();
-      return false;
-    }
-
-    if (syncProgressIsActive()) syncProgressBeginPhase("finalize", 4);
-    removeStaleFrameFiles(newTimes, saved);
-    if (!writeTimesAndInstallCacheState(newTimes, saved)) {
-      if (syncProgressIsActive()) syncProgressCompletePhase();
-      Serial.println("tail-fill write fail -> keep");
-      return true;
-    }
-    if (syncProgressIsActive()) {
-      syncProgressTick(4);
-      syncProgressCompletePhase();
-    }
-
-    s_zoomSnapshotsRefreshPending =
-      (saved > 0 && !zoomSnapshotsCurrentAndUsable(newTimes[saved - 1]));
-    s_zoomWeatherRefreshNeeded = (downloaded > 0);
-    if (downloaded <= 0 && oldRawCurrent) {
-      if (syncProgressIsActive()) {
-        syncProgressBeginPhase("raw", (uint32_t)totalFrames);
-        syncProgressCompletePhase();
-      }
-      Serial.println("tail-fill no new frames -> keep");
-      appendDiagLog("sync: tail-fill none saved=%d downloaded=%d keep=1\n",
-                    saved, downloaded);
-      showMessage("Cache current", "No newer frames");
-      delay(700);
-      return true;
-    }
-
-    bool rebuiltFast = false;
-    if (oldRawCurrent) {
-      rebuiltFast = remapRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, oldRawSlotMap, saved);
-    }
-    if (!rebuiltFast) {
-      buildRawPlaybackCache();
-    }
-
-    appendDiagLog("sync: tail-fill done saved=%d downloaded=%d rebuiltFast=%d zoomRefresh=%d\n",
-                  saved, downloaded, (int)rebuiltFast, (int)s_zoomSnapshotsRefreshPending);
-    Serial.printf("tail-fill done d=%d s=%d\n", downloaded, saved);
-    return true;
-  }
-
-  SD.mkdir(FRAMES_DIR);
-  if (!syncProgressIsActive()) showMessage("Updating cache...", "NASA GIBS");
-  if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-  Serial.printf("roll cache c=%d w=%d src=%s cad=%d lag=%d\n",
-                cacheCount, recentCount, s_activeWeatherSource, cadenceMin, lagHours);
-  appendDiagLog("sync: branch=roll cc=%d rc=%d raw=%d shift=%d\n",
-                cacheCount, recentCount, (int)oldRawCurrent, fastShift);
-
+  // Fetch GIBS available times
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setReuse(true);
-
   fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
 
-  time_t newTimes[MAX_FRAMES] = {};
-  int rawSourceIdx[MAX_FRAMES];
+  // Download frames
+  if (!syncProgressIsActive()) showMessage("Updating cache...", "NASA GIBS");
+  if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
+
+  float bboxWest, bboxSouth, bboxEast, bboxNorth;
+  getActiveWeatherBbox(&bboxWest, &bboxSouth, &bboxEast, &bboxNorth);
+
   int saved = 0;
-  int reused = 0;
-  int downloaded = 0;
+  int skipped = 0;
   int dlFail = 0;
-  for (int i = 0; i < MAX_FRAMES; i++) rawSourceIdx[i] = -1;
+  char url[512];
 
-  if (fastShift > 0) {
-    int fastReuse = cacheCount - fastShift;
-    Serial.printf("roll fast shift=%d reuse=%d\n", fastShift, fastReuse);
-    appendDiagLog("sync: roll-fast shift=%d reuse=%d\n", fastShift, fastReuse);
-    if (cacheCount == totalFrames) {
-      appendDiagLog("sync: branch=tail-only shift=%d raw=%d\n",
-                    fastShift, (int)oldRawCurrent);
+  for (int i = 0; i < (int)s_idx.count; i++) {
+    showProgress(i + 1, (int)s_idx.count, "cache");
+    yield();
 
-      // Assemble new times array: reuse existing frames, download new tail
-      int reuseCount = totalFrames - fastShift;
-      for (int i = 0; i < reuseCount; i++) {
-        time_t t = fetchStart + (time_t)(i * cadenceSec);
-        newTimes[i] = t;
-        // Find old slot that had this timestamp for rawSourceIdx
-        for (int j = 0; j < cacheCount; j++) {
-          if (cache[j].t == t) { rawSourceIdx[i] = cache[j].idx; break; }
+    if (!needsDownload[i]) {
+      saved++;
+      // If JPEG valid but raw invalid, decode from RAM
+      if (s_idx.jpegValid[i] && !s_idx.rawValid[i]) {
+        size_t readLen = 0;
+        if (readJpegFromSlot(i, s_dlBuf, &readLen) && readLen > 0) {
+          decodeAndWriteRawSlot(i, readLen);
         }
-        reused++;
       }
-      saved = reuseCount;
-
-      // Verify reused frames still exist; redownload any that are corrupt
-      bool tailOnlyOk = true;
-      for (int i = 0; i < reuseCount; i++) {
-        time_t t = newTimes[i];
-        if (cachedFrameLooksReusable(t)) continue;
-        appendDiagLog("sync: tail-only reuse-invalid t=%lld -> redownload\n", (long long)t);
-        char finalPath[32];
-        makeFramePathByTime(t, finalPath, sizeof(finalPath));
-        size_t bytes = 0;
-        if (!downloadFrameToPath(http, client, t, finalPath, &bytes)) {
-          appendDiagLog("sync: tail-only redownload-fail t=%lld\n", (long long)t);
-          tailOnlyOk = false;
-          break;
-        }
-        rawSourceIdx[i] = -1;
-        downloaded++;
-        reused--;
-      }
-      if (!tailOnlyOk) { deleteFramesDir(); return false; }
-
-      // Download new tail frames directly to timestamp paths
-      for (int step = 0; step < fastShift; ++step) {
-        showProgress(step + 1, fastShift, "cache");
-        time_t t = lastCached + (time_t)((step + 1) * cadenceSec);
-        if (t > fetchEnd) break;
-        char finalPath[32];
-        makeFramePathByTime(t, finalPath, sizeof(finalPath));
-        size_t bytes = 0;
-        if (!downloadFrameToPath(http, client, t, finalPath, &bytes)) break;
-        newTimes[saved] = t;
-        rawSourceIdx[saved] = -1;
-        saved++;
-        downloaded++;
-      }
-
-      if (downloaded <= 0) {
-        s_zoomSnapshotsRefreshPending =
-          (cacheCount > 0 && !zoomSnapshotsCurrentAndUsable(cache[cacheCount - 1].t));
-        s_zoomWeatherRefreshNeeded = false;
-        if (syncProgressIsActive()) {
-          syncProgressCompletePhase();
-          syncProgressBeginPhase("raw", (uint32_t)totalFrames);
-          syncProgressCompletePhase();
-        }
-        Serial.println("tail-only no new frames -> keep");
-        appendDiagLog("sync: tail-only none shift=%d keep=1\n", fastShift);
-        return true;
-      }
-
-      if (saved < totalFrames) {
-        appendDiagLog("sync: tail-only incomplete total=%d reuse=%d downloaded=%d -> full-refresh\n",
-                      totalFrames, reused, downloaded);
-        deleteFramesDir();
-        return false;
-      }
-
-      showProgress(fastShift + 2, fastShift + 2, "cache");
-      if (syncProgressIsActive()) syncProgressCompletePhase();
-      if (syncProgressIsActive()) syncProgressBeginPhase("finalize", 4);
-      removeStaleFrameFiles(newTimes, totalFrames);
-      if (!writeTimesAndInstallCacheState(newTimes, totalFrames)) {
-        if (syncProgressIsActive()) syncProgressCompletePhase();
-        appendDiagLog("sync: tail-only write-fail downloaded=%d\n", downloaded);
-        return true;
-      }
-      if (syncProgressIsActive()) {
-        syncProgressTick(4);
-        syncProgressCompletePhase();
-      }
-
-      s_zoomSnapshotsRefreshPending =
-        !zoomSnapshotsCurrentAndUsable(newTimes[totalFrames - 1]);
-      s_zoomWeatherRefreshNeeded = (downloaded > 0);
-      bool rebuiltFast = false;
-      if (oldRawCurrent) {
-        rebuiltFast = remapRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, oldRawSlotMap, totalFrames);
-      }
-      if (!rebuiltFast && oldRawCurrent) {
-        rebuiltFast = rebuildRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, totalFrames);
-      }
-      if (!rebuiltFast) {
-        buildRawPlaybackCache();
-      }
-
-      appendDiagLog("sync: tail-only done downloaded=%d reused=%d rebuiltFast=%d zoomRefresh=%d\n",
-                    downloaded, reused, (int)rebuiltFast, (int)s_zoomSnapshotsRefreshPending);
-      Serial.printf("tail-only done d=%d r=%d\n", downloaded, reused);
-      return true;
+      continue;
     }
 
-    // Fast-shift: reuse frames that already exist, download missing ones
-    for (int slot = 0; slot < fastReuse; slot++) {
-      showProgress(slot + 1, totalFrames, "cache");
-      time_t t = fetchStart + (time_t)(slot * cadenceSec);
-      if (cachedFrameLooksReusable(t)) {
-        newTimes[saved] = t;
-        // Find old slot for raw cache remap
-        for (int j = 0; j < cacheCount; j++) {
-          if (cache[j].t == t) { rawSourceIdx[saved] = cache[j].idx; break; }
-        }
-        saved++;
-        reused++;
-        continue;
-      }
-      appendDiagLog("sync: roll-fast reuse-invalid t=%lld -> redownload\n", (long long)t);
-      char dlPath[32];
-      makeFramePathByTime(t, dlPath, sizeof(dlPath));
-      size_t bytes = 0;
-      if (downloadFrameToPath(http, client, t, dlPath, &bytes)) {
-        newTimes[saved] = t;
-        rawSourceIdx[saved] = -1;
-        saved++;
-        downloaded++;
+    time_t t = s_idx.times[i];
+    if (t <= 0) { skipped++; continue; }
+
+    // Build URL and fetch
+    const int fetchCadenceSec = max(60, cadenceMin * 60);
+    time_t snappedTime = snapToNearestGibsTime(t, 2 * fetchCadenceSec);
+    const time_t secondOffsets[] = {0, -60, 60,
+                                    -(time_t)fetchCadenceSec, (time_t)fetchCadenceSec,
+                                    -2*(time_t)fetchCadenceSec, 2*(time_t)fetchCadenceSec};
+    int stepCount;
+    if (snappedTime > 0) {
+      stepCount = 1;
+    } else if (s_gibsAvailCount > 0) {
+      skipped++;
+      continue;
+    } else {
+      stepCount = 7;
+    }
+
+    bool fetchedOk = false;
+    size_t jpegLen = 0;
+    for (int si = 0; si < stepCount && !fetchedOk; ++si) {
+      time_t candT = (snappedTime > 0) ? snappedTime : (t + secondOffsets[si]);
+      if (candT <= 0) continue;
+      if (!buildWeatherFrameUrl(url, sizeof(url), candT,
+                                bboxWest, bboxSouth, bboxEast, bboxNorth)) continue;
+
+      for (int attempt = 0; attempt < 2; ++attempt) {
+        http.begin(client, url);
+        http.setTimeout(5000);
+        int code = http.GET();
+        if (code != HTTP_CODE_OK) { http.end(); continue; }
+        if (!readHttpJpegBodyToDlBuf(http, "SYNC", &jpegLen)) continue;
+        if (!validateBufferedWeatherFrameJpeg(jpegLen, "SYNC")) continue;
+        if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) continue;
+        fetchedOk = true;
+        break;
       }
     }
 
-    for (int slot = fastReuse; slot < totalFrames; slot++) {
-      showProgress(slot + 1, totalFrames, "cache");
-      time_t t = fetchStart + (time_t)(slot * cadenceSec);
-      char dlPath[32];
-      makeFramePathByTime(t, dlPath, sizeof(dlPath));
-      size_t bytes = 0;
-      if (downloadFrameToPath(http, client, t, dlPath, &bytes)) {
-        newTimes[saved] = t;
-        rawSourceIdx[saved] = -1;
-        saved++;
-        downloaded++;
+    if (!fetchedOk) {
+      dlFail++;
+      continue;
+    }
+
+    // Additional validators
+    if (spriteLooksHoldFrameBlockCorrupted() ||
+        spriteLooksCyanWhiteBlockCorrupted() ||
+        spriteLooksBottomBandJunkCorrupted() ||
+        spriteLooksBlackSlabCorrupted()) {
+      dlFail++;
+      continue;
+    }
+
+    // Size outlier check using index jpegLen
+    if ((int)s_idx.count >= 3) {
+      int refA = -1, refB = -1;
+      if (i <= 0) { refA = 1; refB = 2; }
+      else if (i >= (int)s_idx.count - 1) { refA = (int)s_idx.count - 2; refB = (int)s_idx.count - 3; }
+      else { refA = i - 1; refB = i + 1; }
+      if (refA >= 0 && refB >= 0 && refA < (int)s_idx.count && refB < (int)s_idx.count &&
+          s_idx.jpegValid[refA] && s_idx.jpegValid[refB]) {
+        int sizeA = (int)s_idx.jpegLen[refA];
+        int sizeB = (int)s_idx.jpegLen[refB];
+        if (sizeA > 0 && sizeB > 0 && abs(sizeA - sizeB) <= 1500) {
+          int refSize = (sizeA + sizeB) / 2;
+          if ((int)jpegLen + 900 < refSize) {
+            Serial.printf("SYNC sz-outlier i=%d sz=%u ref=%d\n", i, (unsigned)jpegLen, refSize);
+            dlFail++;
+            continue;
+          }
+        }
       }
     }
-  } else {
 
-    // Generic roll: check each timestamp for reuse, download missing
-    for (int slot = 0; slot < totalFrames; slot++) {
-      time_t t = fetchStart + (time_t)(slot * cadenceMin * 60);
-      showProgress(slot + 1, totalFrames, "cache");
+    // Write JPEG to slot first (so we can read it back after semantic check)
+    if (!writeJpegToSlot(i, s_dlBuf, jpegLen)) {
+      dlFail++;
+      continue;
+    }
 
-      int hit = findCacheEntryByTime(cache, cacheCount, t);
-      if (hit >= 0 && cachedFrameLooksReusable(t)) {
-        cache[hit].used = true;
-        rawSourceIdx[saved] = cache[hit].idx;
-        newTimes[saved++] = t;
-        reused++;
-        continue;
+    // Semantic outlier check — compare candidate sprite signature with neighbors.
+    // Candidate sprite is still in the sprite buffer from validateBufferedWeatherFrameJpeg.
+    // Neighbor reads will clobber s_dlBuf and sprite, but the candidate JPEG is
+    // already safe in frames.bin.
+    bool semanticReject = false;
+    if ((int)s_idx.count >= 3 && ensureSprite()) {
+      WeatherSemanticSignature candSig = {};
+      if (captureWeatherSemanticSignatureFromSprite(&candSig)) {
+        int refA = -1, refB = -1;
+        if (i <= 0) { refA = 1; refB = 2; }
+        else if (i >= (int)s_idx.count - 1) { refA = (int)s_idx.count - 2; refB = (int)s_idx.count - 3; }
+        else { refA = i - 1; refB = i + 1; }
+        if (refA >= 0 && refB >= 0 && refA < (int)s_idx.count && refB < (int)s_idx.count &&
+            s_idx.jpegValid[refA] && s_idx.jpegValid[refB]) {
+          // Decode neighbors from frames.bin to capture their signatures
+          WeatherSemanticSignature refSigA = {}, refSigB = {};
+          bool gotA = false, gotB = false;
+          auto decodeSlotSig = [&](int slot, WeatherSemanticSignature* sig) -> bool {
+            size_t rLen = 0;
+            if (!readJpegFromSlot(slot, s_dlBuf, &rLen) || rLen == 0) return false;
+            sprite.fillScreen(TFT_BLACK);
+            LovyanGFX* prev = g_drawTarget;
+            g_drawTarget = &sprite;
+            resetJpegDrawStats();
+            JPEGDEC tj;
+            bool ok = false;
+            if (tj.openRAM(s_dlBuf, (int)rLen, jpegDraw)) {
+              tj.setPixelType(RGB565_BIG_ENDIAN);
+              ok = tj.decode(0, 0, 0);
+              tj.close();
+            }
+            g_drawTarget = prev;
+            return ok && captureWeatherSemanticSignatureFromSprite(sig);
+          };
+          gotA = decodeSlotSig(refA, &refSigA);
+          gotB = decodeSlotSig(refB, &refSigB);
+
+          if (gotA && gotB) {
+            int candA = weatherSemanticDistance(candSig, refSigA);
+            int candB = weatherSemanticDistance(candSig, refSigB);
+            int refAB = weatherSemanticDistance(refSigA, refSigB);
+            int refR = ((int)refSigA.meanR + (int)refSigB.meanR) / 2;
+            int refG = ((int)refSigA.meanG + (int)refSigB.meanG) / 2;
+            int refBM = ((int)refSigA.meanB + (int)refSigB.meanB) / 2;
+            int candColorJump = abs((int)candSig.meanR - refR) +
+                                abs((int)candSig.meanG - refG) +
+                                abs((int)candSig.meanB - refBM);
+            int refMotion = abs((int)refSigA.meanR - (int)refSigB.meanR) +
+                            abs((int)refSigA.meanG - (int)refSigB.meanG) +
+                            abs((int)refSigA.meanB - (int)refSigB.meanB);
+            bool strongDist = (candA >= max(8, refAB + 7) && candB >= max(8, refAB + 7));
+            bool moderateDist = (candA >= max(6, refAB + 5) && candB >= max(6, refAB + 5));
+            int refCyan = max((int)refSigA.cyanTiles, (int)refSigB.cyanTiles);
+            bool colorLift = (candSig.meanG >= refG + 3 && candSig.meanB >= refBM + 4);
+            bool cyanLift = (candSig.cyanTiles >= refCyan + 2 && candSig.cyanTiles >= 3);
+            bool colorJumpOut = (candColorJump >= max(10, refMotion + 6));
+            int refSize = ((int)s_idx.jpegLen[refA] + (int)s_idx.jpegLen[refB]) / 2;
+            bool sizeOut = (refSize > 0 && (int)jpegLen + 900 < refSize);
+            if (moderateDist && (colorLift && (sizeOut || strongDist))) semanticReject = true;
+            if (moderateDist && (cyanLift || colorJumpOut)) semanticReject = true;
+            if (semanticReject) {
+              Serial.printf("SYNC sem-outlier i=%d cA=%d cB=%d rr=%d cj=%d rm=%d\n",
+                            i, candA, candB, refAB, candColorJump, refMotion);
+              appendDiagLog("sync: sem-outlier i=%d\n", i);
+            }
+          }
+        }
       }
-      if (hit >= 0) {
-        appendDiagLog("sync: roll reuse-invalid t=%lld slot=%d -> redownload\n",
-                      (long long)t, slot);
-      }
+    }
+    if (semanticReject) {
+      // Undo the JPEG write by marking slot invalid
+      s_idx.jpegValid[i] = 0;
+      s_idx.jpegLen[i] = 0;
+      dlFail++;
+      continue;
+    }
 
-      char dlPath[32];
-      makeFramePathByTime(t, dlPath, sizeof(dlPath));
-      size_t bytes = 0;
-      if (downloadFrameToPath(http, client, t, dlPath, &bytes)) {
-        rawSourceIdx[saved] = -1;
-        newTimes[saved++] = t;
-        downloaded++;
-      } else {
+    // Re-read candidate from slot and decode for raw (s_dlBuf/sprite were clobbered
+    // by semantic check neighbor reads, or are still valid if check was skipped)
+    {
+      size_t rereadLen = 0;
+      if (!readJpegFromSlot(i, s_dlBuf, &rereadLen) || rereadLen == 0) {
+        s_idx.jpegValid[i] = 0;
         dlFail++;
+        continue;
+      }
+      decodeAndWriteRawSlot(i, rereadLen);
+    }
+
+    saved++;
+    Serial.printf("SYNC %d/%d OK %u B\n", i + 1, (int)s_idx.count, (unsigned)jpegLen);
+    delay(20);  // pace requests
+  }
+  if (syncProgressIsActive()) syncProgressCompletePhase();
+
+  // Gap-fill invalid raw slots by copying raw data from nearest valid neighbor
+  int filled = 0;
+  for (int i = 0; i < (int)s_idx.count; i++) {
+    if (s_idx.rawValid[i]) continue;
+    // Find nearest valid neighbor
+    int src = -1;
+    for (int d = 1; d < (int)s_idx.count && src < 0; d++) {
+      if (i - d >= 0 && s_idx.rawValid[i - d]) src = i - d;
+      else if (i + d < (int)s_idx.count && s_idx.rawValid[i + d]) src = i + d;
+    }
+    if (src >= 0 && s_frameDisplayBuf) {
+      // Copy raw data from neighbor's physical slot to this slot
+      int srcPhys = ((int)s_idx.head + src) % MAX_FRAMES;
+      int dstPhys = ((int)s_idx.head + i)   % MAX_FRAMES;
+      uint32_t srcOff = (uint32_t)srcPhys * SCALED_FRAME_BYTES;
+      uint32_t dstOff = (uint32_t)dstPhys * SCALED_FRAME_BYTES;
+
+      File sf = SD.open(SD_ROOT "/frames/stream.raw", FILE_READ);
+      if (sf) {
+        sf.seek(srcOff);
+        size_t got = sf.read((uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+        sf.close();
+        if (got == SCALED_FRAME_BYTES) {
+          if (writeRawToSlot(i, (const uint8_t*)s_frameDisplayBuf)) {
+            filled++;
+          }
+        }
       }
     }
   }
 
-  if (saved < totalFrames && downloaded == 0 && cacheCount > 0 &&
-      saved == cacheCount && reused == cacheCount) {
-    // Stable partial window: all currently cached frames were reusable, but older
-    // slots are unavailable right now. Keep existing cache instead of forcing a
-    // full refresh every boot (which causes multi-minute loops).
-    installCacheStateFromEntries(cache, cacheCount);
-    s_zoomSnapshotsRefreshPending =
-      (cacheCount > 0 && !zoomSnapshotsCurrentAndUsable(cache[cacheCount - 1].t));
-    s_zoomWeatherRefreshNeeded = false;
-    if (syncProgressIsActive()) {
-      syncProgressCompletePhase(); // cache
-      syncProgressBeginPhase("raw", (uint32_t)totalFrames);
-      syncProgressCompletePhase();
-      syncProgressBeginPhase("finalize", 4);
-      syncProgressCompletePhase();
-    }
-    appendDiagLog("sync: roll partial-stable saved=%d total=%d reused=%d downloaded=%d keep=1\n",
-                  saved, totalFrames, reused, downloaded);
-    return true;
+  // Commit index
+  writeIndex();
+  writeCurrentWeatherViewMeta();
+
+  s_zoomWeatherRefreshNeeded = (downloadCount > 0 && saved > 0);
+  if (s_idx.count > 0) {
+    s_zoomSnapshotsRefreshPending = !zoomSnapshotsCurrentAndUsable(s_idx.times[s_idx.count - 1]);
   }
 
-  if (saved < totalFrames && saved > 0 && downloaded == 0 && reused == saved) {
-    // Reuse-only truncated window
-    removeStaleFrameFiles(newTimes, saved);
-    if (!writeTimesAndInstallCacheState(newTimes, saved)) {
-      appendDiagLog("sync: roll partial-reuse-commit-fail saved=%d total=%d reused=%d downloaded=%d keep=1\n",
-                    saved, totalFrames, reused, downloaded);
-      return true;
-    }
-    {
-      int postCorrupt = verifyCommittedFrameIntegrity(saved);
-      if (postCorrupt > 0) {
-        appendDiagLog("sync: roll partial-reuse post-commit-corrupt=%d/%d -> full-refresh\n",
-                      postCorrupt, saved);
-        deleteFramesDir();
-        return false;
-      }
-    }
-    if (syncProgressIsActive()) {
-      syncProgressCompletePhase(); // cache
-      syncProgressBeginPhase("finalize", 4);
-      syncProgressTick(4);
-      syncProgressCompletePhase();
-    }
-    s_zoomSnapshotsRefreshPending =
-      (saved > 0 && !zoomSnapshotsCurrentAndUsable(newTimes[saved - 1]));
-    s_zoomWeatherRefreshNeeded = false;
-    bool rebuiltFast = false;
-    if (oldRawCurrent) {
-      rebuiltFast = remapRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, oldRawSlotMap, saved);
-    }
-    if (!rebuiltFast && oldRawCurrent) {
-      rebuiltFast = rebuildRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, saved);
-    }
-    if (!rebuiltFast) {
-      buildRawPlaybackCache();
-    }
-    time_t tailGap = (saved > 0) ? (fetchEnd - newTimes[saved - 1]) : 0;
-    appendDiagLog("sync: roll partial-reuse-trim saved=%d total=%d reused=%d downloaded=%d dlFail=%d tailGap=%llds rebuiltFast=%d\n",
-                  saved, totalFrames, reused, downloaded, dlFail, (long long)tailGap, (int)rebuiltFast);
-    return true;
-  }
+  // Rebuild filtered zoom raws
+  rebuildFilteredZoomRawsFromCache();
 
-  if (saved < totalFrames && saved > 0 && saved >= cacheCount - 10) {
-    // Partial roll update
-    removeStaleFrameFiles(newTimes, saved);
-    if (!writeTimesAndInstallCacheState(newTimes, saved)) {
-      appendDiagLog("sync: roll partial-commit-fail saved=%d total=%d reused=%d downloaded=%d keep=1\n",
-                    saved, totalFrames, reused, downloaded);
-      return true;
-    }
-    {
-      int postCorrupt = verifyCommittedFrameIntegrity(saved);
-      if (postCorrupt > 0) {
-        appendDiagLog("sync: roll partial post-commit-corrupt=%d/%d -> full-refresh\n",
-                      postCorrupt, saved);
-        deleteFramesDir();
-        return false;
-      }
-    }
-    if (syncProgressIsActive()) {
-      syncProgressCompletePhase(); // cache
-      syncProgressBeginPhase("finalize", 4);
-      syncProgressTick(4);
-      syncProgressCompletePhase();
-    }
-    s_zoomSnapshotsRefreshPending =
-      (saved > 0 && !zoomSnapshotsCurrentAndUsable(newTimes[saved - 1]));
-    s_zoomWeatherRefreshNeeded = (downloaded > 0);
-    bool rebuiltFast = false;
-    if (oldRawCurrent) {
-      rebuiltFast = remapRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, oldRawSlotMap, saved);
-    }
-    if (!rebuiltFast && oldRawCurrent) {
-      rebuiltFast = rebuildRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, saved);
-    }
-    if (!rebuiltFast) {
-      buildRawPlaybackCache();
-    }
-    appendDiagLog("sync: roll partial-keep saved=%d total=%d reused=%d downloaded=%d "
-                  "shrink=%d rebuiltFast=%d\n",
-                  saved, totalFrames, reused, downloaded, cacheCount - saved, (int)rebuiltFast);
-    return true;
-  }
-
-  if (saved < totalFrames) {
-    appendDiagLog("sync: roll incomplete saved=%d total=%d reused=%d downloaded=%d -> full-refresh\n",
-                  saved, totalFrames, reused, downloaded);
-    deleteFramesDir();
-    return false;
-  }
-
-  if (saved <= 0) {
-    s_zoomSnapshotsRefreshPending =
-      (cacheCount > 0 && !zoomSnapshotsCurrentAndUsable(cache[cacheCount - 1].t));
-    s_zoomWeatherRefreshNeeded = false;
-    if (syncProgressIsActive()) {
-      syncProgressCompletePhase();
-      syncProgressBeginPhase("raw", (uint32_t)totalFrames);
-      syncProgressCompletePhase();
-    }
-    Serial.println("roll no frames -> keep");
-    appendDiagLog("sync: roll none saved=0\n");
-    return true;
-  }
-
-  // Write times and clean up stale files
-  removeStaleFrameFiles(newTimes, saved);
-  if (!writeTimesAndInstallCacheState(newTimes, saved)) {
-    if (syncProgressIsActive()) {
-      syncProgressCompletePhase();
-      syncProgressBeginPhase("finalize", 4);
-      syncProgressCompletePhase();
-    }
-    Serial.println("roll commit fail -> keep");
-    appendDiagLog("sync: roll commit-fail saved=%d reused=%d downloaded=%d\n",
-                  saved, reused, downloaded);
-    return true;
-  }
-
-  {
-    int postCorrupt = verifyCommittedFrameIntegrity(saved);
-    if (postCorrupt > 0) {
-      appendDiagLog("sync: roll post-commit-corrupt=%d/%d -> full-refresh\n",
-                    postCorrupt, saved);
-      deleteFramesDir();
-      return false;
-    }
-  }
-
-  Serial.printf("roll done r=%d d=%d s=%d\n",
-                reused, downloaded, saved);
   if (syncProgressIsActive()) {
-    syncProgressCompletePhase();
-    syncProgressBeginPhase("finalize", 4);
-    syncProgressTick(4);
+    syncProgressBeginPhase("raw", 1);
     syncProgressCompletePhase();
   }
 
-  s_zoomSnapshotsRefreshPending =
-    (saved > 0 && !zoomSnapshotsCurrentAndUsable(newTimes[saved - 1]));
-  s_zoomWeatherRefreshNeeded = (downloaded > 0);
-  bool rebuiltFast = false;
-  if (oldRawCurrent) {
-    rebuiltFast = remapRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, oldRawSlotMap, saved);
+  Serial.printf("sync done saved=%d skip=%d fail=%d fill=%d\n", saved, skipped, dlFail, filled);
+  appendDiagLog("sync: done saved=%d skip=%d fail=%d fill=%d total=%d millis=%lu ms\n",
+                saved, skipped, dlFail, filled, (int)s_idx.count, millis());
+}
+
+static void rebuildRawFromStored() {
+  if (!ensureSprite() || !s_frameDisplayBuf) return;
+  if (s_idx.count <= 0) return;
+
+  bool useUnifiedProgress = syncProgressIsActive();
+  if (useUnifiedProgress) {
+    syncProgressBeginPhase("raw", (uint32_t)s_idx.count);
+  } else {
+    showMessage("Building raw cache...", "Predecode for smooth playback");
   }
-  if (!rebuiltFast && oldRawCurrent) {
-    rebuiltFast = rebuildRawPlaybackCacheRolling(rawSourceIdx, oldRawValid, saved);
+
+  if (s_streamFile) { s_streamFile.close(); }
+  s_streamReady = false;
+  invalidateValidIdxCache();
+
+  int built = 0;
+  int decFail = 0;
+  for (int i = 0; i < (int)s_idx.count; i++) {
+    showProgress(i + 1, (int)s_idx.count, "raw");
+    yield();
+
+    if (s_idx.rawValid[i]) { built++; continue; }
+    if (!s_idx.jpegValid[i]) continue;
+
+    size_t readLen = 0;
+    if (!readJpegFromSlot(i, s_dlBuf, &readLen) || readLen == 0) {
+      decFail++;
+      continue;
+    }
+
+    if (decodeAndWriteRawSlot(i, readLen)) {
+      built++;
+    } else {
+      decFail++;
+    }
   }
-  if (!rebuiltFast) {
-    buildRawPlaybackCache();
+
+  if (useUnifiedProgress) syncProgressCompletePhase();
+
+  // Gap-fill
+  int filled = 0;
+  for (int i = 0; i < (int)s_idx.count; i++) {
+    if (s_idx.rawValid[i]) continue;
+    int src = -1;
+    for (int d = 1; d < (int)s_idx.count && src < 0; d++) {
+      if (i - d >= 0 && s_idx.rawValid[i - d]) src = i - d;
+      else if (i + d < (int)s_idx.count && s_idx.rawValid[i + d]) src = i + d;
+    }
+    if (src >= 0) {
+      s_idx.rawValid[i] = 1;
+      s_streamValid[i] = 1;
+      filled++;
+    }
   }
-  appendDiagLog("sync: roll done saved=%d reused=%d downloaded=%d rebuiltFast=%d zoomRefresh=%d millis=%lu ms\n",
-                saved, reused, downloaded, (int)rebuiltFast, (int)s_zoomSnapshotsRefreshPending, millis());
-  return true;
+
+  writeIndex();
+  rebuildFilteredZoomRawsFromCache();
+
+  Serial.printf("raw-rebuild: built=%d dec=%d fill=%d\n", built, decFail, filled);
+  appendDiagLog("raw-rebuild: built=%d dec=%d fill=%d count=%d\n",
+                built, decFail, filled, (int)s_idx.count);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -8621,9 +7083,7 @@ static void goToSleep(bool buttonOnly = false) {
 
   if (!buttonOnly && s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (connectWifiForSync(false)) {
-      if (!syncFramesRolling()) {
-        downloadFrames();
-      }
+      syncWeatherFrames();
       maybeRefreshPendingZoomSnapshots();
     } else {
       Serial.println("timer refresh skip: no wifi");
@@ -8680,9 +7140,7 @@ static void goToSleep(bool buttonOnly = false) {
 
   if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (connectWifiForSync(false)) {
-      if (!syncFramesRolling()) {
-        downloadFrames();
-      }
+      syncWeatherFrames();
       maybeRefreshPendingZoomSnapshots();
     } else {
       Serial.println("timer refresh skip: no wifi");
@@ -8912,6 +7370,7 @@ void setup() {
   }
   Serial.printf("SD OK  %llu MB\n", SD.totalBytes() / (1024ULL * 1024ULL));
   removeObsoleteGifAssetsIfPresent();
+  initFrameStore();
 #if BOARD_IS_AMOLED_206
   ensureAudioCueWorker();
   preloadSelectedCueToPsram(false);
@@ -8953,11 +7412,9 @@ void setup() {
     s_radarMetaLoaded = false;
     strlcpy(s_displayLocationLabel, DISPLAY_TZ_LABEL, sizeof(s_displayLocationLabel));
     strlcpy(s_displayLocationFull,  DISPLAY_TZ_LABEL, sizeof(s_displayLocationFull));
-    invalidateRawCacheMetaState();
   } else {
     Serial.printf("wake loops=%d ready=%d n=%d\n",
                   loopsDone, framesReady, frameCount);
-    invalidateRawCacheMetaState();
     if (s_weatherGeoValid) {
       selectSatelliteForLon(s_weatherCenterLon, true);
     } else {
@@ -8968,13 +7425,10 @@ void setup() {
 
   loadRadarMetaIfNeeded();
 
-  // Prefer SD cache if present (works for hard boots too).
-  int sdCount = readMetaCount();
-  if (sdCount > 0) {
-    frameCount = sdCount;
-    framesReady = true;
-    s_timesLoaded = false;
-    Serial.printf("SD cache found: %d frames\n", sdCount);
+  // Load frame index from SD
+  loadIndex();
+  if (frameCount > 0) {
+    Serial.printf("SD index: %d frames\n", frameCount);
     if (hardBoot) {
       loadWeatherViewCenterFromCache();
     }
@@ -8988,74 +7442,11 @@ void setup() {
       int chargeState = readAxp2101ChargeState();
       diagF.printf("LogID=%lu date=pending millis=%lu ms\n", (unsigned long)esp_random(), millis());
       diagF.printf("boot: millis=%lu ms\n", millis());
-      diagF.printf("sdCount=%d framesReady=%d frameCount=%d\n", sdCount, (int)framesReady, frameCount);
+      diagF.printf("idxCount=%d framesReady=%d frameCount=%d\n", (int)s_idx.count, (int)framesReady, frameCount);
       diagF.printf("bat=%d%% chargeState=0x%02X resetReason=%d\n",
                    (int)batPct, (unsigned)(chargeState < 0 ? 0xFF : chargeState),
                    (int)esp_reset_reason());
       diagF.close();
-    }
-  }
-
-  // ── Frame resolution check ───────────────────────────────────────────────
-  // If DISP_W/DISP_H changed, cached JPEGs are the wrong size. Delete them so
-  // syncFramesRolling() re-downloads at the new resolution.
-  {
-    SD.mkdir(FRAMES_DIR);
-    char dimBuf[16] = {};
-    bool haveDim = false;
-    File dimF = SD.open(FRAME_DIM_FILE, FILE_READ);
-    if (dimF) {
-      size_t n = dimF.read((uint8_t*)dimBuf, sizeof(dimBuf) - 1);
-      dimF.close();
-      haveDim = (n > 0);
-    }
-    // Trim trailing CR/LF/space so reads are stable across writers/editors.
-    for (int i = (int)strlen(dimBuf) - 1; i >= 0; --i) {
-      char c = dimBuf[i];
-      if (c == '\r' || c == '\n' || c == ' ' || c == '\t') {
-        dimBuf[i] = '\0';
-      } else {
-        break;
-      }
-    }
-    char expected[16];
-    snprintf(expected, sizeof(expected), "%d %d", DISP_W, DISP_H);
-    {
-      File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-      if (diagF) { diagF.printf("dim='%s' expected='%s'\n", dimBuf, expected); diagF.close(); }
-    }
-    int dimW = 0, dimH = 0;
-    bool dimParsed = (sscanf(dimBuf, "%d %d", &dimW, &dimH) == 2);
-    bool dimMatches = dimParsed && (dimW == DISP_W) && (dimH == DISP_H);
-    if (!haveDim || dimBuf[0] == '\0' || !dimParsed) {
-      // Recover metadata without purging frames: dim.cfg can be missing/blank after
-      // abrupt reset or SD write interruption even when cached frames are valid.
-      File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-      if (diagF) {
-        diagF.printf("DIM MISSING/CORRUPT -> REWRITE ONLY\n");
-        diagF.close();
-      }
-      File wf = SD.open(FRAME_DIM_FILE, FILE_WRITE);
-      if (wf) { wf.print(expected); wf.close(); }
-    } else if (!dimMatches) {
-      { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("DIM MISMATCH -> PURGE\n"); diagF.close(); } }
-      Serial.printf("dim mismatch '%s'!='%s' -> purge\n", dimBuf, expected);
-      deleteFramesDir();
-      SD.mkdir(FRAMES_DIR);
-      // Invalidate raw cache so it rebuilds from the newly downloaded JPEGs
-      SD.remove(RAW_CACHE_META_FILE);
-      SD.remove(RAW_STREAM_FILE);
-      invalidateRawCacheMetaState();
-      // Remove old zoom raws (wrong RAW_FRAME_BYTES size)
-      SD.remove(ZOOM1_RAW_FILE);
-      SD.remove(ZOOM2_RAW_FILE);
-      SD.remove(ZOOM3_RAW_FILE);
-      SD.remove(ZOOM_TERRAIN_DAY_RAW);
-      SD.remove(ZOOM_TERRAIN_NIGHT_RAW);
-      frameCount = 0;
-      framesReady = false;
-      File wf = SD.open(FRAME_DIM_FILE, FILE_WRITE);
-      if (wf) { wf.print(expected); wf.close(); }
     }
   }
 
@@ -9102,17 +7493,8 @@ void setup() {
       syncProgressBegin(totalBudget, "Updating cache...", "NASA GIBS");
       syncProgressBeginPhase("sync", 20U);
 
-      bool rolled = syncFramesRolling();
-      { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("syncRolling=%d fc_after=%d\n", (int)rolled, frameCount); diagF.close(); } }
-      if (!rolled) {
-        downloadFrames();
-        { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("downloadFrames done fc=%d rdy=%d rawMeta=%d\n", frameCount, (int)framesReady, (int)rawCacheMetaVersionIsCurrent()); diagF.close(); } }
-        // Inline raw build consumed the raw budget — fast-complete the phase slot
-        if (syncProgressIsActive() && rawCacheMetaVersionIsCurrent()) {
-          syncProgressBeginPhase("raw", 1);
-          syncProgressCompletePhase();
-        }
-      }
+      syncWeatherFrames();
+      { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("syncWeatherFrames done fc=%d rdy=%d\n", frameCount, (int)framesReady); diagF.close(); } }
       maybeRefreshPendingZoomSnapshots();
       noteSuccessfulScanNow();
       disconnectWifiAfterSync();
@@ -9141,7 +7523,6 @@ void setup() {
     if (wifiOk) {
       (void)syncClockFromNtpBestEffort(8);
       refreshDisplayLocationTimeFromIpInfo();
-      if (!s_timesLoaded) loadTimesIfNeeded();
       time_t newestUtc = 0;
       for (int i = frameCount - 1; i >= 0; --i) {
         if (s_frameTimes[i] > 0) { newestUtc = s_frameTimes[i]; break; }
@@ -9158,21 +7539,13 @@ void setup() {
     }
   }
 
-  if (framesReady && frameCount > 0 && !rawCacheMetaVersionIsCurrent()) {
-    Serial.println("raw meta stale -> rebuild");
-    showMessage("Building...", "Preparing frames");
-    buildRawPlaybackCache();
-  }
-
-  // Keep any expensive stream recovery in setup (inside sync progress budget),
-  // not deferred to loop() where it appears as a "100% stuck" boot.
+  // Open stream for playback
   if (framesReady && frameCount > 0) {
     ensureStreamOpen();
     if (!s_streamReady || !s_streamFile) {
-      appendDiagLog("setup: stream open failed after sync -> rebuild raw\n");
-      invalidateRawCacheMetaState();
+      appendDiagLog("setup: stream open failed -> rebuild raw\n");
       showMessage("Building...", "Preparing frames");
-      buildRawPlaybackCache();
+      rebuildRawFromStored();
       ensureStreamOpen();
       appendDiagLog("setup: stream ready after rebuild=%d\n",
                     (int)(s_streamReady && (bool)s_streamFile));
@@ -9200,35 +7573,7 @@ void setup() {
 // ─────────────────────────────────────────────────────────────
 // Load frame timestamps from SD (needed after wake-from-sleep when RTC is intact
 // but the s_frameTimes array in RAM has been cleared)
-static void loadTimesIfNeeded() {
-  if (s_timesLoaded) return;
-  File tf = SD.open(TIMES_FILE, FILE_READ);
-  if (tf) {
-    size_t wantBytes = (size_t)frameCount * sizeof(time_t);
-    size_t haveBytes = tf.size();
-    if (wantBytes == 0) {
-      s_timesLoaded = true;
-    } else if (haveBytes >= wantBytes) {
-      if (haveBytes > wantBytes) {
-        size_t tailOffset = haveBytes - wantBytes;
-        Serial.printf("times play big %u>%u\n",
-                      (unsigned)haveBytes, (unsigned)wantBytes);
-        tf.seek((uint32_t)tailOffset);
-      }
-      size_t got = tf.read((uint8_t*)s_frameTimes, wantBytes);
-      if (got == wantBytes) {
-        s_timesLoaded = true;
-      } else {
-        Serial.printf("times play short %u<%u\n",
-                      (unsigned)got, (unsigned)wantBytes);
-      }
-    } else {
-      Serial.printf("times play miss %u<%u\n",
-                    (unsigned)haveBytes, (unsigned)wantBytes);
-    }
-    tf.close();
-  }
-}
+
 
 static void drawTimestamp(int frameIdx, LovyanGFX* target) {
   if (frameIdx >= frameCount || !s_timesLoaded || !target) return;
@@ -9399,25 +7744,32 @@ static bool spriteLooksHoldFrameBlockCorrupted() {
 // Open the stream file for playback (called once, stays open across loops)
 static void ensureStreamOpen() {
   if (s_streamReady && s_streamFile) return;
-  if (!rawCacheMetaVersionIsCurrent()) return;
+  if (s_idx.count == 0 || !framesReady) return;
+
+  // Check if any raw frames are valid
+  bool anyRaw = false;
+  for (int i = 0; i < (int)s_idx.count; i++) {
+    if (s_idx.rawValid[i]) { anyRaw = true; break; }
+  }
+  if (!anyRaw) {
+    // Try to rebuild from stored JPEGs
+    rebuildRawFromStored();
+    anyRaw = false;
+    for (int i = 0; i < (int)s_idx.count; i++) {
+      if (s_idx.rawValid[i]) { anyRaw = true; break; }
+    }
+    if (!anyRaw) return;
+  }
+
 #if !BOARD_IS_AMOLED_206
-  tft.waitDMA();  // defensive shared-SPI fence before SD.open
+  tft.waitDMA();
 #endif
   s_streamFile = SD.open(RAW_STREAM_FILE, FILE_READ);
   s_streamReady = (bool)s_streamFile;
-  if (!s_streamReady) {
-    Serial.printf("stream open FAIL meta=%d\n", (int)rawCacheMetaVersionIsCurrent());
-  }
   if (s_streamReady) {
     uint32_t actual = (uint32_t)s_streamFile.size();
-    uint32_t expected = (uint32_t)frameCount * (uint32_t)SCALED_FRAME_BYTES;
-    Serial.printf("stream open %u exp %u\n",
-                  (unsigned)actual, (unsigned)expected);
-    if (frameCount > 0 && actual != expected) {
-      Serial.printf("stream sz bad a=%u e=%u d=%ld\n",
-                    (unsigned)actual, (unsigned)expected,
-                    (long)((int32_t)actual - (int32_t)expected));
-    }
+    uint32_t expected = (uint32_t)MAX_FRAMES * (uint32_t)SCALED_FRAME_BYTES;
+    Serial.printf("stream open %u exp %u\n", (unsigned)actual, (unsigned)expected);
   }
 }
 
@@ -10646,11 +8998,10 @@ void loop() {
     return;
   }
 
-  loadTimesIfNeeded();
   ensureStreamOpen();
 
   if (!s_streamReady || !s_streamFile) {
-    buildRawPlaybackCache();
+    rebuildRawFromStored();
     ensureStreamOpen();
   }
 
@@ -10658,7 +9009,7 @@ void loop() {
     // Stream failed to open — show each variable on its own large line
     char l1[32], l2[32];
     snprintf(l1, sizeof(l1), "NO STREAM fc=%d", frameCount);
-    snprintf(l2, sizeof(l2), "rdy=%d meta=%d", (int)s_streamReady, (int)s_rawMetaVersionCurrent);
+    snprintf(l2, sizeof(l2), "rdy=%d meta=%d", (int)s_streamReady, s_idx.count);
     showMessage(l1, nullptr); delay(4000);
     showMessage(l2, nullptr); delay(4000);
     return;
@@ -10682,7 +9033,7 @@ void loop() {
     for (int i = 0; i < frameCount; i++) if (s_streamValid[i]) validInBitmap++;
     char l1[32], l2[32];
     snprintf(l1, sizeof(l1), "0 frames fc=%d", frameCount);
-    snprintf(l2, sizeof(l2), "vbm=%d meta=%d", validInBitmap, (int)s_rawMetaVersionCurrent);
+    snprintf(l2, sizeof(l2), "vbm=%d meta=%d", validInBitmap, s_idx.count);
     showMessage(l1, nullptr); delay(4000);
     showMessage(l2, nullptr); delay(4000);
     return;
@@ -10704,9 +9055,6 @@ void loop() {
   const uint32_t clockOverlayMs      = 7000U;
   uint32_t targetFrameDelayMs = (FRAME_DELAY_MS > 0) ? (uint32_t)FRAME_DELAY_MS : 1U;
   // No slots cap — time-based frame selection self-paces with pre-scaled reads (~120ms/frame)
-  char newestJpegPath[32];
-  makeFramePathByIdx(newestIdx, newestJpegPath, sizeof(newestJpegPath));
-
   bool startCueArmed = s_startCuePending;
 
   static bool s_animStartLogged = false;
@@ -10747,17 +9095,13 @@ void loop() {
           // partial composite at the lag boundary that passed size/decode checks
           // but has a large near-zero black region).
           if (currentScaledFreezeFrameLooksCorrupted()) {
-            // Evict the corrupt frame: delete source JPEG so rolling sync
-            // redownloads it next boot. Invalidate raw meta so raw=0 forces
-            // rolling sync + raw-build instead of the partial-window-current
-            // fast path that would otherwise skip redownload indefinitely.
+            // Evict the corrupt frame from index so next sync re-downloads it.
             {
-              char badPath[32];
-              makeFramePathByIdx(freezeFrameIdx, badPath, sizeof(badPath));
-              SD.remove(badPath);
-              appendDiagLog("raw-del: idx=%d freeze-corrupt\n", freezeFrameIdx);
-              // Remove from in-RAM valid set so this session never re-selects it.
-              if (freezeFrameIdx < MAX_FRAMES) s_streamValid[freezeFrameIdx] = 0;
+              appendDiagLog("raw-evict: idx=%d freeze-corrupt\n", freezeFrameIdx);
+              if (freezeFrameIdx < MAX_FRAMES) {
+                s_streamValid[freezeFrameIdx] = 0;
+                s_idx.rawValid[freezeFrameIdx] = 0;
+              }
             }
             bool foundClean = false;
             for (int back = 1; back <= 12 && (int)srcPos - back >= 0; ++back) {
@@ -10770,11 +9114,11 @@ void loop() {
                   break;
                 }
                 // Also corrupt — evict this one too.
-                char badPath[32];
-                makeFramePathByIdx(backIdx, badPath, sizeof(badPath));
-                SD.remove(badPath);
-                appendDiagLog("raw-del: idx=%d freeze-corrupt\n", backIdx);
-                if (backIdx < MAX_FRAMES) s_streamValid[backIdx] = 0;
+                appendDiagLog("raw-evict: idx=%d freeze-corrupt\n", backIdx);
+                if (backIdx < MAX_FRAMES) {
+                  s_streamValid[backIdx] = 0;
+                  s_idx.rawValid[backIdx] = 0;
+                }
               }
             }
             if (!foundClean) {
@@ -10782,10 +9126,9 @@ void loop() {
               showFrame(freezeFrameIdx);
               appendDiagLog("loop: freeze-back-fail\n");
             }
-            // Invalidate raw meta so next boot triggers rolling sync + rebuild.
-            SD.remove(RAW_CACHE_META_FILE);
-            s_rawMetaVersionCurrent = false;
-            appendDiagLog("raw-meta: invalidated freeze-corrupt\n");
+            // Write updated index so evicted slots get re-downloaded next sync
+            writeIndex();
+            appendDiagLog("idx: updated after freeze-corrupt eviction\n");
             // Force valid-frame index rebuild next loop so evicted frames
             // are excluded for the remainder of this session.
             invalidateValidIdxCache();
