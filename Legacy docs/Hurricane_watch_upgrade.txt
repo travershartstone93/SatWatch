@@ -1,0 +1,588 @@
+Hurricane Watch Upgrade — Draft 2
+Date: 2026-03-09 (engineering spec rewrite)
+Original draft: 2026-03-05
+
+================================================================================
+  OVERVIEW
+================================================================================
+
+Goal: Before weather frame sync, poll NOAA for active named hurricanes in the
+Atlantic basin. If one is found, override the local weather view with a
+storm-centered animation, play an alert chime, and hold that view until
+the user reboots or the storm dissipates.
+
+This is a notification mode — not a permanent mode switch. Reboot returns
+to local weather. The device checks again on the next sync cycle.
+
+
+================================================================================
+  1. NOAA DATA SOURCE
+================================================================================
+
+Primary API: NHC Active Storms GeoJSON
+  URL: https://www.nhc.noaa.gov/CurrentSurfaces/AT.json
+  - Returns all active Atlantic tropical cyclones
+  - Updated every advisory cycle (~6 hours, more often during active storms)
+  - No API key required
+  - Response: GeoJSON FeatureCollection
+
+Each Feature contains:
+  properties.STORMNAME    — "KATRINA", "LEE", etc.
+  properties.STORMTYPE    — "HU" (hurricane), "TS" (tropical storm),
+                            "TD" (depression), "SS" (subtropical), etc.
+  properties.STORMNUM     — Integer storm number within season
+  properties.BASIN        — "AT" (Atlantic), "EP" (East Pacific)
+  properties.LAT          — Current center latitude (float)
+  properties.LON          — Current center longitude (float)
+  properties.INTENSITY    — Max sustained wind in knots
+  properties.MSLP         — Minimum sea-level pressure (mb)
+  properties.SSNUM        — Saffir-Simpson category (1-5, 0 for sub-hurricane)
+  properties.ADVDATE      — Advisory date string
+  properties.WALESSION    — Advisory number
+
+Storm ID construction: "AL" + zero-padded STORMNUM + year
+  Example: Storm 9 of 2025 = "AL092025"
+  This is the ATCF ID, stable across the storm's lifetime.
+
+Fallback API: NHC GIS RSS Feed
+  URL: https://www.nhc.noaa.gov/gis-at.xml
+  - Atom/RSS feed with links to shapefiles, KML, GeoJSON
+  - More complex to parse but richer data (forecast cone, track, wind radii)
+  - Use only if primary JSON endpoint changes format or goes down
+
+Forecast Track (for bbox fitting):
+  URL: https://www.nhc.noaa.gov/storm_graphics/AT{NN}/{stormid}_5day_cone_with_line.kmz
+  - Or use GeoJSON forecast: https://www.nhc.noaa.gov/CurrentSurfaces/AT{NN}_forecasttrack.json
+  - Contains 5-day forecast positions (lat/lon/time/intensity at each point)
+  - Useful for computing a bbox that contains the storm's expected path
+
+
+================================================================================
+  2. TRIGGER LOGIC
+================================================================================
+
+Filter criteria (all must be true):
+  - BASIN == "AT"
+  - STORMTYPE == "HU"
+  - STORMNAME is non-empty (named storm)
+  - SSNUM >= 1 (Saffir-Simpson category 1+)
+
+Trigger flow per sync cycle:
+  1. HTTP GET https://www.nhc.noaa.gov/CurrentSurfaces/AT.json
+  2. Parse JSON, extract features array
+  3. For each feature, check filter criteria above
+  4. Build list of qualifying storms: { stormId, name, lat, lon, category, advDate }
+  5. If list is empty: no hurricane active, proceed with local weather
+  6. If list is non-empty:
+     a. Sort by STORMNUM descending (newest storm = highest number)
+     b. Pick the first (newest) as the active target
+     c. Check NVS suppression list (see section 8)
+     d. If storm is suppressed: skip, try next storm in list
+     e. If all storms suppressed: proceed with local weather
+     f. If unsuppressed storm found: enter hurricane mode
+
+What is NOT a trigger:
+  - Tropical storms (STORMTYPE == "TS")
+  - Tropical depressions (STORMTYPE == "TD")
+  - Subtropical storms (STORMTYPE == "SS")
+  - Potential tropical cyclones (STORMTYPE == "PTC")
+  - Post-tropical cyclones (STORMTYPE == "EX")
+  - Invest areas (no STORMTYPE entry)
+  - Any storm with SSNUM == 0 regardless of STORMTYPE
+
+
+================================================================================
+  3. EXECUTION MODEL
+================================================================================
+
+ESP32 cannot run a separate binary without OTA flashing. The "separate file"
+requirement is implemented as:
+
+  hurricane_watch.h — a header file #included by the main .ino
+  Contains:
+    - NOAA poll + parse functions
+    - Hurricane mode animation loop
+    - Storm bbox computation
+    - Storm bar overlay rendering
+    - Hurricane alert audio trigger
+
+  The main .ino gains:
+    - A mode flag: s_hurricaneMode (RTC_DATA_ATTR, survives light sleep)
+    - A branch in setup() after sync: if hurricane detected, set flag
+    - A branch at top of loop(): if s_hurricaneMode, call hurricaneLoop()
+      instead of the normal animation loop
+
+Code structure:
+
+  // In esp32-LiveSat-s3.ino, after #includes:
+  #include "hurricane_watch.h"
+
+  // In setup(), after syncWeatherFrames():
+  if (s_hurricaneWatchEnabled) {
+    HurricaneInfo storm;
+    if (pollNoaaForHurricane(&storm) && !isStormSuppressed(storm.id)) {
+      enterHurricaneMode(storm);
+    }
+  }
+
+  // In loop():
+  if (s_hurricaneMode) {
+    hurricaneLoop();
+    return;
+  }
+  // ... normal animation loop ...
+
+hurricaneLoop() reuses the existing infrastructure:
+  - Calls syncWeatherFrames() with overridden bbox (storm-centered)
+  - Calls ensureStreamOpen(), showFrame(), etc. — same pipeline
+  - Renders storm info bar instead of location bar
+  - Shows "Reboot for local weather" text at bottom
+  - On each sync cycle: re-polls NOAA, updates storm position/category,
+    triggers re-sync if bbox shifted significantly
+
+
+================================================================================
+  4. STORM-FIT BBOX COMPUTATION
+================================================================================
+
+The bbox must:
+  - Center on the storm's current position
+  - Be wide enough to show the storm structure in satellite imagery
+  - Maintain the display aspect ratio (410:360 = 41:36)
+  - Not exceed the GOES coverage area
+
+Algorithm:
+
+  Input: stormLat, stormLon, category (1-5)
+
+  // Base radius in km — scales with storm category.
+  // Cat 1-2: show regional context. Cat 4-5: tighter on the massive eye.
+  float radiusKm;
+  switch (category) {
+    case 1: radiusKm = 800.0f; break;   // ~1600km wide view
+    case 2: radiusKm = 700.0f; break;
+    case 3: radiusKm = 600.0f; break;
+    case 4: radiusKm = 500.0f; break;
+    case 5: radiusKm = 450.0f; break;
+    default: radiusKm = 800.0f; break;
+  }
+
+  // Convert to degrees (approximate, latitude-dependent)
+  float cosLat = cosf(stormLat * DEG_TO_RAD);
+  if (cosLat < 0.2f) cosLat = 0.2f;
+  float dLat = radiusKm / 111.32f;
+  float dLon = radiusKm / (111.32f * cosLat);
+
+  // Aspect ratio correction: display is wider than tall (41:36)
+  // Expand longitude to match
+  float aspectRatio = 41.0f / 36.0f;
+  if (dLon / dLat < aspectRatio) {
+    dLon = dLat * aspectRatio;
+  } else {
+    dLat = dLon / aspectRatio;
+  }
+
+  float bboxW = stormLon - dLon;
+  float bboxE = stormLon + dLon;
+  float bboxS = stormLat - dLat;
+  float bboxN = stormLat + dLat;
+
+  // Clamp to valid GOES-East/West coverage
+  clampBboxToGoesCoverage(&bboxW, &bboxS, &bboxE, &bboxN);
+
+Zoom levels for the 3-step zoom sequence:
+  - Zoom 1: 70% of base bbox (regional context with storm centered)
+  - Zoom 2: 40% of base bbox (storm structure visible)
+  - Zoom 3: storm-fit tight — radius based on wind radii if available,
+    otherwise category-scaled:
+      Cat 1-2: 200km radius
+      Cat 3:   150km radius
+      Cat 4-5: 120km radius
+    This puts the eye wall and rain bands in frame.
+
+Re-center threshold: if the storm moves more than 100km from the current
+bbox center between sync cycles, re-compute bbox and trigger a view-change
+sync (full refresh). Otherwise, keep the current bbox (avoids unnecessary
+re-downloads for small advisory updates).
+
+
+================================================================================
+  5. SATELLITE IMAGERY SOURCE
+================================================================================
+
+Hurricane mode uses the same GIBS WMS pipeline as normal weather, but with:
+  - Layer: same as current (GOES GeoColor or active layer)
+  - BBox: storm-fit computed above (not user-location)
+  - Satellite: selected by storm longitude
+    - stormLon > -100: GOES-East (covers Atlantic basin)
+    - stormLon <= -100: GOES-West (rare for Atlantic hurricanes)
+  - Cadence: same 10-minute cadence
+  - Lag: same GIBS_LAG_HOURS
+
+The existing selectSatelliteForLon() handles satellite selection.
+The existing syncWeatherFrames() handles the download — the only change
+is the bbox source (storm center instead of user location).
+
+Implementation: before calling syncWeatherFrames(), temporarily override
+s_weatherCenterLat/Lon with the storm position and set a flag so
+getActiveWeatherBbox() returns the storm-fit bbox. Restore after sync
+if returning to local mode.
+
+Cleaner alternative: pass a bbox struct to syncWeatherFrames() as an
+optional parameter, so it doesn't touch global state.
+
+
+================================================================================
+  6. DATA STRUCTURES
+================================================================================
+
+// In hurricane_watch.h:
+
+struct HurricaneInfo {
+  char     id[12];         // ATCF ID: "AL092025"
+  char     name[20];       // "KATRINA"
+  float    lat;            // Current center latitude
+  float    lon;            // Current center longitude
+  uint8_t  category;       // Saffir-Simpson 1-5
+  uint16_t windKt;         // Max sustained wind (knots)
+  uint16_t pressureMb;     // MSLP
+  time_t   advisoryUtc;    // Advisory timestamp
+  uint8_t  advisoryNum;    // Advisory number
+};
+
+// Persisted in NVS (survives reboot):
+//   "hurr_suppress"  — comma-separated list of suppressed storm IDs
+//                       e.g. "AL092025,AL112025"
+//                       Cleared at start of each hurricane season (June 1)
+//   "hurr_enabled"   — bool, hurricane watch on/off
+//   "hurr_vol"       — uint8_t, alert volume (0-255)
+//   "hurr_sound"     — char[32], alert sound filename on SD
+
+// In RAM (RTC_DATA_ATTR for light-sleep persistence):
+RTC_DATA_ATTR static bool s_hurricaneMode = false;
+RTC_DATA_ATTR static HurricaneInfo s_activeStorm = {};
+RTC_DATA_ATTR static char s_hurricaneSuppressedIds[128] = {};
+
+
+================================================================================
+  7. HURRICANE ANIMATION LOOP
+================================================================================
+
+hurricaneLoop() mirrors the normal loop() structure:
+
+  1. ensureStreamOpen()
+  2. Build valid-frame index (same as normal)
+  3. Animation phase (10s) — identical to normal, plays 144 frames
+  4. Freeze + locator cue (2s) — locator rect centered on storm eye
+  5. Zoom 1 (1s) — 70% of storm bbox
+  6. Zoom 2 (1s) — 40% of storm bbox
+  7. Zoom 3 (1s) — tight storm-fit (eye + rain bands)
+  8. Terrain crossfade — skip in hurricane mode (no terrain relevance)
+  9. Clock overlay (7s) — same as normal, but with storm info bar
+
+Storm info bar (replaces location bar):
+  Top bar:  "HURRICANE KATRINA"  +  "CAT 4"
+  Bot bar:  "145 kt  938 mb"  +  "Adv #24  2h ago"
+
+Bottom text overlay (static, always visible during hurricane mode):
+  "Reboot for local weather" — small text, gray, bottom-center
+  Rendered once into the bar buffer, not per-frame.
+
+Per-loop NOAA re-check:
+  Every N loops (e.g. every 3rd loop = every ~72s), re-poll NOAA:
+  - If same storm: update lat/lon/category/wind, re-render bar
+  - If storm dissipated (not in active list): exit hurricane mode,
+    clear s_hurricaneMode, return to normal loop on next iteration
+  - If new storm detected: play alert, re-center, trigger sync
+  - Full re-sync only if bbox center moved >100km
+
+Note: the re-poll happens during the clock overlay phase (7s budget)
+to avoid interrupting the animation. HTTP to NOAA takes ~1-2s on WiFi.
+WiFi is reconnected briefly for the poll, then disconnected.
+
+
+================================================================================
+  8. STORM SUPPRESSION (ACKNOWLEDGE/CLEAR)
+================================================================================
+
+Problem: User reboots to return to local weather. Next sync cycle detects
+the same hurricane and immediately re-enters hurricane mode.
+
+Solution: NVS suppression list.
+
+  When user reboots out of hurricane mode:
+    1. Current storm ID is appended to NVS "hurr_suppress" string
+    2. On next boot, pollNoaaForHurricane() checks each qualifying storm
+       against the suppression list
+    3. Suppressed storms are skipped
+    4. If all active storms are suppressed: normal local weather
+
+  Suppression expiry:
+    - Per-storm: when the storm ID no longer appears in NOAA active list
+      (storm dissipated/became post-tropical), remove from suppression list
+    - Seasonal: clear entire list on June 1 each year (Atlantic season start)
+    - Manual: portal button "Clear hurricane suppression list"
+
+  Storage format in NVS:
+    Key: "hurr_suppress"
+    Value: "AL092025,AL112025" (comma-separated ATCF IDs, max ~128 bytes)
+
+  Suppression cleanup runs at each sync cycle:
+    1. Load suppression list from NVS
+    2. For each ID in list, check if it appears in current NOAA active storms
+    3. If not present: storm has dissipated, remove from list
+    4. Write cleaned list back to NVS
+
+
+================================================================================
+  9. ALERT AUDIO
+================================================================================
+
+Reuses the existing ES8311 audio pipeline (ensureAudioCueWorker,
+preloadSelectedCueToPsram, playStartCueIfEnabled).
+
+New settings:
+  - "hurr_sound": filename on SD, e.g. "/chimes/hurricane_alert.wav"
+    Default: a built-in hurricane siren tone (needs to be created/sourced)
+    Fallback: normal startup chime if hurricane sound file missing
+  - "hurr_vol": 0-255, independent of normal chime volume
+    Default: 200 (louder than typical chime)
+
+Trigger points:
+  - Play ONCE when entering hurricane mode for a new storm
+  - Play ONCE if a different storm ID is detected while already in hurricane mode
+  - Do NOT play on reboot into hurricane mode for the same storm
+    (would be annoying during testing / power cycling)
+  - Do NOT play on advisory updates for the same storm
+
+Implementation:
+  1. Before entering hurricane mode, swap the audio cue:
+     strlcpy(s_selectedCueFile, hurricaneSoundPath, sizeof(s_selectedCueFile));
+     s_selectedCueVolume = hurricaneVolume;
+     preloadSelectedCueToPsram(true);  // force reload
+  2. Set s_startCuePending = true
+  3. The normal animation loop picks it up and plays at first frame
+  4. After hurricane mode exits, restore original chime settings
+
+
+================================================================================
+  10. PORTAL UX
+================================================================================
+
+New section in WiFi portal config page: "Hurricane Watch"
+
+Fields:
+  +----------------------------------------------------------+
+  | Hurricane Watch                                          |
+  |                                                          |
+  |   Enable:        [x] Watch for Atlantic hurricanes       |
+  |                                                          |
+  |   Alert sound:   [ hurricane_alert.wav         ] [Browse]|
+  |                                                          |
+  |   Alert volume:  [====|===============] 200/255          |
+  |                                                          |
+  |   Suppressed:    AL092025, AL112025                      |
+  |                  [ Clear suppression list ]               |
+  |                                                          |
+  +----------------------------------------------------------+
+
+NVS keys:
+  "hurr_enabled" — bool (default: false)
+  "hurr_sound"   — char[32] (default: "/chimes/hurricane_alert.wav")
+  "hurr_vol"     — uint8_t (default: 200)
+  "hurr_suppress"— char[128] (managed automatically, shown read-only)
+
+Portal endpoints:
+  GET  /hurricane-config         — returns current config JSON
+  POST /hurricane-config         — updates config fields
+  POST /hurricane-clear-suppress — clears suppression list
+
+
+================================================================================
+  11. STORM BAR RENDERING
+================================================================================
+
+Top bar (replaces normal location/time bar):
+  Left-aligned:  "HURRICANE {NAME}"
+  Right-aligned: "CAT {N}"
+  Font: same as current top bar, white on dark background
+  If category 4-5: "CAT {N}" rendered in red for visual urgency
+
+Bottom bar (replaces normal timestamp bar):
+  Left-aligned:  "{wind} kt  {pressure} mb"
+  Right-aligned: "Adv #{num}  {age}"
+  Where {age} = time since advisory, e.g. "2h ago", "45m ago"
+
+Persistent bottom text (below bar, over frame):
+  "Reboot for local weather"
+  Font: small (8pt), color: gray (0x7BEF), center-aligned
+  Y position: SCALED_H - 10 (just above display bottom)
+  Rendered into s_frameDisplayBuf after each presentScaledBuf() call
+  so it persists across all animation phases including zoom/clock.
+
+Category-to-color mapping for accent elements:
+  Cat 1: 0xFE60 (yellow-orange)
+  Cat 2: 0xFCC0 (orange)
+  Cat 3: 0xF800 (red)
+  Cat 4: 0xF81F (magenta)
+  Cat 5: 0xF81F (magenta, flashing)
+
+
+================================================================================
+  12. EDGE CASES
+================================================================================
+
+Storm dissipates during animation:
+  - NOAA re-poll returns empty qualifying list
+  - Finish current loop iteration normally
+  - Clear s_hurricaneMode
+  - Next loop() call falls through to normal animation
+  - Do NOT reboot — seamless transition back to local
+
+NOAA endpoint unreachable:
+  - HTTP timeout (5s) or non-200 response
+  - Log to diag, proceed with local weather (or stay in current mode)
+  - Do NOT enter hurricane mode on stale/missing data
+  - Retry on next sync cycle
+
+Storm downgrades from hurricane to tropical storm:
+  - STORMTYPE changes from "HU" to "TS"
+  - No longer meets trigger criteria
+  - Same as dissipation: exit hurricane mode after current loop
+
+Multiple simultaneous hurricanes:
+  - Sort by STORMNUM descending, pick newest
+  - If newest is suppressed, try next
+  - Only one storm displayed at a time
+  - If a new (higher STORMNUM) hurricane forms while viewing an older one:
+    alert fires, view re-centers to the new storm
+
+Storm crosses from Atlantic to East Pacific:
+  - BASIN changes from "AT" to "EP"
+  - Out of scope: exit hurricane mode
+  - (Future: could add EP support as a config option)
+
+WiFi unavailable at sync time:
+  - Cannot poll NOAA
+  - If already in hurricane mode: stay in hurricane mode with cached data
+  - If not in hurricane mode: normal local weather with cached frames
+  - s_hurricaneMode persists in RTC memory across light sleep
+
+First boot of hurricane season with stale suppression list:
+  - Seasonal cleanup: if current month >= 6 and suppression list contains
+    IDs from previous year (year in ID < current year), clear list
+  - Prevents phantom suppression from last season's storms
+
+SD card missing hurricane alert sound file:
+  - Fall back to normal startup chime
+  - Log warning to diag
+  - Do not block hurricane mode entry
+
+
+================================================================================
+  13. IMPLEMENTATION ORDER
+================================================================================
+
+Phase 1 — NOAA poll + trigger detection (standalone test)
+  - Implement pollNoaaForHurricane() with HTTPS GET + JSON parse
+  - Test against live NOAA endpoint (or cached test JSON during off-season)
+  - Verify storm ID construction, filter logic, sort order
+  - Deliverable: function that returns HurricaneInfo or null
+
+Phase 2 — Mode flag + bbox override
+  - Add s_hurricaneMode, s_activeStorm globals
+  - Add hurricane bbox computation function
+  - Wire into setup(): poll after sync, set mode flag
+  - Wire into loop(): branch to hurricaneLoop() stub
+  - Deliverable: device enters/exits hurricane mode, downloads storm-centered frames
+
+Phase 3 — Hurricane animation loop
+  - Implement hurricaneLoop() with storm-centered animation
+  - Storm info bar rendering (top + bottom)
+  - "Reboot for local" overlay text
+  - Zoom sequence with storm-fit zoom3
+  - Skip terrain phase
+  - Deliverable: full storm animation plays on device
+
+Phase 4 — Suppression logic
+  - NVS read/write for suppression list
+  - Suppression check in trigger flow
+  - Suppression cleanup on dissipation
+  - Seasonal expiry
+  - Deliverable: reboot returns to local, same storm doesn't re-trigger
+
+Phase 5 — Alert audio
+  - New NVS keys for hurricane sound/volume
+  - Audio swap on hurricane mode entry
+  - Audio restore on hurricane mode exit
+  - Deliverable: hurricane alert chime plays on new storm detection
+
+Phase 6 — Portal UX
+  - New config section in WiFi portal HTML
+  - GET/POST endpoints for hurricane config
+  - Suppression list display + clear button
+  - Deliverable: all hurricane settings configurable from phone/browser
+
+Phase 7 — Testing + hardening
+  - Test with simulated NOAA JSON (inject test data during off-season)
+  - Test multi-storm scenarios
+  - Test suppression across reboots
+  - Test WiFi-down edge cases
+  - Power-loss mid-hurricane-sync recovery
+  - Diag log coverage for all hurricane events
+
+
+================================================================================
+  14. COMPLETION CRITERIA
+================================================================================
+
+"Done" means:
+  [ ] NOAA poll correctly identifies named Atlantic hurricanes (Cat 1+)
+  [ ] Ignores tropical storms, depressions, invests, post-tropical
+  [ ] Newest storm selected under multi-storm conditions
+  [ ] Storm-fit bbox centers on storm with correct aspect ratio
+  [ ] Zoom3 shows tight storm-eye view
+  [ ] Animation plays full 144-frame loop with storm-centered GIBS frames
+  [ ] Storm info bar shows name, category, wind, pressure, advisory age
+  [ ] "Reboot for local" text visible during hurricane mode
+  [ ] Reboot exits hurricane mode and returns to local weather
+  [ ] Same storm does not re-trigger after reboot (suppression works)
+  [ ] New storm triggers re-alert even if previous storm is suppressed
+  [ ] Dissipated storms auto-clear from suppression list
+  [ ] Alert audio plays once per new storm detection
+  [ ] Alert audio does not play on reboot into existing hurricane mode
+  [ ] Portal shows hurricane config with enable/sound/volume/suppress
+  [ ] Clean fallback to local weather on NOAA failure
+  [ ] No regressions in normal local weather mode
+  [ ] Diag log captures all hurricane events for debugging
+
+
+================================================================================
+  15. ESTIMATED SCOPE
+================================================================================
+
+New code:
+  hurricane_watch.h          — ~400-500 lines
+  Main .ino additions        — ~50 lines (mode branch, #include, globals)
+  Portal HTML additions      — ~40 lines
+
+Functions to add (~12):
+  pollNoaaForHurricane()       — HTTPS GET + JSON parse
+  parseNoaaStormJson()         — extract storm fields from JSON
+  isStormSuppressed()          — check NVS suppression list
+  suppressStorm()              — add storm ID to NVS list
+  cleanupSuppressedStorms()    — remove dissipated storms from list
+  computeStormBbox()           — dynamic bbox from storm position + category
+  enterHurricaneMode()         — set flags, swap audio, trigger sync
+  exitHurricaneMode()          — clear flags, restore audio
+  hurricaneLoop()              — storm-centered animation loop
+  renderStormInfoBars()        — top/bottom bar with storm data
+  renderRebootText()           — "Reboot for local" overlay
+  handleHurricaneConfig()      — portal GET/POST endpoints
+
+Existing functions modified:
+  setup()                      — add hurricane check after sync
+  loop()                       — add mode branch at top
+  getActiveWeatherBbox()       — accept optional bbox override
+  loadWifiPortalConfig()       — load hurricane NVS keys
+  setupPortalRoutes()          — register hurricane endpoints

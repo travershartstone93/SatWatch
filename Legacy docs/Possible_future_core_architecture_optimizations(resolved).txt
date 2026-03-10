@@ -1,0 +1,126 @@
+Possible Future Core Architecture Optimizations
+================================================
+Noted during the pre-allocated binary frame store refactor (March 2025).
+
+
+1. [RESOLVED] rebuildRawFromStored() gap-fill doesn't copy data (BUG — latent)
+-----------------------------------------------------------------------
+Location: esp32-LiveSat-s3.ino ~line 6915
+The gap-fill loop in rebuildRawFromStored() marks rawValid[i]=1 and
+s_streamValid[i]=1 without actually copying pixel data from the neighbor's
+physical slot to the target slot. The identical bug in syncWeatherFrames()
+was fixed (that version reads from stream.raw and calls writeRawToSlot),
+but this one was missed. It only fires when the device boots with zero
+valid raw frames (e.g. power loss wiped stream.raw but JPEGs survived).
+Fix: mirror the syncWeatherFrames gap-fill logic.
+
+
+2. [MOOT] Slab detector is extremely verbose in diag
+-----------------------------------------------------------------------
+Location: slab detector appendDiagLog calls
+Every frame logs 2+ lines of slab stats (darkPct, edgePct, col/cnt/run)
+even when well below threshold. For 144 frames that's 300+ lines of noise
+in /diag. Consider only logging when the slab detector actually rejects
+a frame, or when values exceed 50% of the rejection threshold.
+
+
+3. [RESOLVED] Semantic outlier check clobbers s_dlBuf then re-reads from slot
+-----------------------------------------------------------------------
+Location: syncWeatherFrames() semantic outlier section
+After writing the candidate JPEG to its slot, the semantic check decodes
+neighbor frames via readJpegFromSlot into s_dlBuf, which clobbers the
+candidate. Then it has to re-read the candidate from the slot for the raw
+decode pass. This costs one extra 64KB SD read per frame that triggers
+the check. Could be avoided by:
+  - Using a separate smaller buffer for neighbor signature extraction
+  - Or capturing the candidate's semantic signature before clobbering
+    s_dlBuf (partially done, but the raw decode still needs the re-read)
+
+
+4. [MOOT] Duplicate slab checks (2x per frame during sync)
+-----------------------------------------------------------------------
+Location: syncWeatherFrames() download loop
+Each frame runs the slab detector twice — once in validateBufferedWeatherFrameJpeg()
+and once in the explicit post-decode slab check. The second check catches
+scaled-frame artifacts the first might miss, but in practice they fire on
+the same frames. Could consolidate into a single check after scale, or
+skip the pre-scale check if the post-scale one is reliable enough.
+
+
+5. [RESOLVED] Gap-filled frames have wrong timestamps in the animation bar
+-----------------------------------------------------------------------
+The gap-fill copies raw pixel data from a neighbor, but the timestamp in
+s_idx.times[i] still reflects the original (failed) time. The bottom bar
+timestamp overlay will show e.g. "5:30 PM" for a frame that visually shows
+5:20 PM data. Options:
+  - Copy the source frame's timestamp to the gap-filled slot
+  - Mark gap-filled slots distinctly so the bar can show "~5:20" or skip
+  - Accept as-is (current behavior, minor cosmetic issue)
+
+
+6. [RESOLVED] First-boot pre-allocation takes ~30s with no visual feedback detail
+-----------------------------------------------------------------------
+Location: initFrameStore()
+The 9MB frames.bin + 42MB stream.raw zero-fill at first boot shows
+"Initializing frame store..." but no progress bar. Adding a progress
+callback (bytes written / total bytes) would improve the first-boot
+experience, especially since it only happens once.
+
+
+7. [RESOLVED] writeIndex() does remove+rename (not atomic on FAT)
+-----------------------------------------------------------------------
+Location: writeIndex()
+The SD.remove(INDEX_BIN_FILE) + SD.rename(tmp, bin) sequence has a tiny
+window where neither file exists. If power is lost between remove and
+rename, loadIndex() will find no index and trigger a full re-download.
+This is safe (no corruption, just a 5-min re-download), but could be
+improved by keeping both old and new index files and using a generation
+counter, or by writing index.bin in-place with a CRC footer.
+
+
+8. [Trivial/Did not do] Stream file stays open across entire animation loop
+-----------------------------------------------------------------------
+Location: ensureStreamOpen() / closeStream()
+s_streamFile is opened once and held for the entire animation session
+(potentially 3+ loops = 75+ seconds). If SD has any transient issues,
+the file handle goes stale with no recovery path until sleep/wake.
+Could add a periodic health check (seek to known offset, verify read)
+or reopen the file between loops.
+
+
+9. [MOOT] GOES-West left-edge darkness is inherent, not a defect
+-----------------------------------------------------------------------
+The slab detector consistently logs darkPct l=45-50% for BC/Canada frames
+because the GOES-West disk edge cuts through the left side of the bbox.
+This is geography, not corruption. A location-aware slab threshold
+adjustment (widen left-edge tolerance when bbox is near satellite limb)
+would reduce false-alarm logging and prevent future over-tuning of
+thresholds that breaks detection for other regions.
+
+
+10. [Trivial/Did not do] No incremental index writes during sync
+-----------------------------------------------------------------------
+Location: syncWeatherFrames() — writeIndex() called once at end
+If the device loses power mid-sync after downloading 80/144 frames,
+all 80 frames are lost because the index was never committed. An
+incremental write (e.g. every 20 frames) would preserve partial progress
+at the cost of ~20 extra SD writes per sync. The atomic tmp+rename
+pattern already handles this safely.
+
+
+11. [Trivial/Did not do] showZoomSnapshotFrame uses path-based JPEG decode
+-----------------------------------------------------------------------
+Location: showZoomSnapshotFrame() and the zoom pipeline
+The zoom/terrain pipeline still uses individual .jpg files on SD
+(vz1.jpg, vz2.jpg, vz3.jpg, terrain.jpg). These could eventually be
+folded into the pre-allocated file approach — e.g. a small zoom.bin
+with fixed slots — to eliminate the last remaining per-file SD writes.
+Low priority since there are only 3-4 zoom files and they change
+infrequently.
+
+
+12. [Trivial/Did not do] activeCadenceMin() / activeLagHours() called repeatedly
+-----------------------------------------------------------------------
+These compute the same values from config every time. Minor, but
+syncWeatherFrames could cache them once at the top. Already done for
+cadenceMin/lagHours locals, but other functions recompute independently.

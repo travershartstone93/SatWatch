@@ -1,0 +1,101 @@
+Bugs + Optimizations Review — 2026-03-10
+==========================================
+Full top-to-bottom crawl of esp32-LiveSat-s3.ino (~10,400 lines).
+
+
+═══════════════════════════════════════════════════════════════════
+  BUGS
+═══════════════════════════════════════════════════════════════════
+
+B1.  [RESOLVED] rebuildRawFromStored() gap-fill now copies raw data via writeRawToSlot().
+B2.  [RESOLVED] delay(600) → vTaskDelay() in handleWifiPortalSave/handleClearFrames.
+B3.  [RESOLVED] gmtime() → gmtime_r() in toISO() and writePcf85063().
+B4.  [RESOLVED] f.flush() added before f.close() in all 5 locations.
+B5.  [RESOLVED] 10-second stall timeout added to moon download loop.
+B6.  [RESOLVED] cleanupSuppressedStorms() seasonal logic restructured.
+B7.  [RESOLVED] tmpPath buffer increased from 64 to 128.
+B8.  [RESOLVED] loadIndex() now checks f.read() return value.
+B9.  [RESOLVED] writeIndex() now checks validCount > 0 before setting framesReady.
+B10. [RESOLVED] Revalidation loop skips slots already in needsDownload[].
+B11. [RESOLVED] initQmiShakeToWake() clears flag on entry + sticky failure guard.
+B12. [RESOLVED] FrameStoreIndex struct marked __attribute__((packed)).
+
+
+═══════════════════════════════════════════════════════════════════
+  PERFORMANCE
+═══════════════════════════════════════════════════════════════════
+
+P1. 128 KB static download buffer in internal DRAM
+---------------------------------------------------
+Line: 4360
+Severity: HIGH
+static uint8_t s_dlBuf[DL_BUF_BYTES] = 131,072 bytes in BSS (internal
+DRAM). On ESP32-S3 with PSRAM, this is a massive waste of scarce ~512 KB
+internal DRAM that competes with WiFi/SSL/BLE stack allocations.
+Fix: Allocate from PSRAM at init via heap_caps_malloc(DL_BUF_BYTES,
+     MALLOC_CAP_SPIRAM). PSRAM speed is fine for download/decode use.
+
+
+P2. restoreFrame lambda calls showFrame + presentScaledBuf (double blit)
+------------------------------------------------------------------------
+Lines: 7247-7251 (runFreezeZoom3LocatorCue)
+Severity: MEDIUM
+showFrame() already calls presentScaledBuf() internally. The lambda
+calls presentScaledBuf() again, pushing 295,200 bytes of SPI data
+to the display twice per frame. This runs 6-8 times during the
+locator cue sequence.
+Fix: Remove the redundant presentScaledBuf() from the lambda, or
+     use a version of showFrame that skips the final present.
+
+
+P3. Terrain JPEG decoded twice in runTerrainCrossfadeSegment()
+--------------------------------------------------------------
+Lines: 9475 + 9567
+Severity: MEDIUM
+ensureTerrainCrossfadeRawFromJpeg() decodes terrain JPEG and scales it.
+Then decodeTerrainCompositeToSprite() decodes the same JPEG again for
+the clock overlay fallback path. ~100-200ms wasted.
+Fix: Populate sprite from the already-decoded buffer instead of
+     re-decoding from JPEG.
+
+
+P4. 2560 bytes of static BSS for applyGentleLowPassOnSprite
+------------------------------------------------------------
+Lines: 4704-4707
+Severity: LOW
+Four static uint16_t[DISP_W] arrays permanently consume 2560 bytes of
+internal DRAM even when the function isn't executing. Only used during
+zoom raw rebuild.
+Fix: Make stack-local or heap-allocate from PSRAM and free after use.
+
+
+P5. [RESOLVED] handleGravity removed — gravity pipeline eliminated.
+
+
+P6. Unbounded strlen + String::substring in NOAA JSON parser
+------------------------------------------------------------
+Lines: 3523-3525
+Severity: LOW
+When nextProp is null (last block), strlen() scans the entire remaining
+JSON body. Then substring() copies it into a new String. Heap-wasteful
+and slow for the last iteration.
+Fix: Find the closing } of the properties block instead of grabbing
+     everything to the end, or limit blockLen to 4096.
+
+
+P7. connectWifiForSync re-loads NVS config on every call
+---------------------------------------------------------
+Line: 5375
+Severity: LOW
+loadWifiPortalConfig() reads NVS/SD each time. Config cannot change
+while the device is running.
+Fix: Add a loaded-flag to skip redundant NVS reads.
+
+
+P8. 144 individual seek+read(2) calls in loadIndex SOI check
+-------------------------------------------------------------
+Line: 5029
+Severity: LOW
+Each frame's SOI marker is checked with an individual seek+read on SD.
+With 144 frames the transaction overhead adds up at boot.
+Fix: Batch or sequential pass reading all SOI markers at once.

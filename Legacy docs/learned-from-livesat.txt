@@ -1,0 +1,150 @@
+What We Learned — LiveSat Project
+===================================
+Reflections on skills demonstrated and grown since the January 2026 evaluation.
+
+
+1. C++ / Arduino Is No Longer "Limited Evidence"
+-------------------------------------------------
+The January eval rated C++ at 6/10 with "limited evidence." LiveSat is a
+~10,000-line production Arduino/C++ firmware running on an ESP32-S3. It
+includes custom JPEG pipelines, circular buffer frame stores, raw binary
+cache management, I2C peripheral orchestration (RTC, IMU, PMIC, touch),
+AMOLED display compositing, WiFi portal configuration, and a full weather
+satellite imagery sync engine. That's not limited evidence anymore — it's
+a flagship C++ project.
+
+
+2. Embedded Systems Leveled Up Significantly
+---------------------------------------------
+The eval rated hardware/embedded at 7/10, citing Raspberry Pi cameras and
+RGB LED control. LiveSat operates at a fundamentally different level:
+
+  - ESP32-S3 SoC programming with PSRAM vs internal DRAM memory architecture
+  - heap_caps_malloc for targeted memory region allocation
+  - Light sleep with GPIO level-triggered wakeup (QMI8658 WoM)
+  - GPIO pin multiplexing conflicts (AMOLED_PWR_EN vs IMU INT1 on GPIO21)
+  - AXP2101 PMIC power management
+  - PCF85063A RTC timekeeping
+  - SD card I/O optimization (sequential vs random access patterns)
+  - NVS (non-volatile storage) for persistent configuration
+  - SPI AMOLED display pipeline with sprite compositing
+  - Binary frame store with circular buffer indexing
+
+This is bare-metal embedded work, not Raspberry Pi scripting.
+
+
+3. Performance Optimization Now Includes Memory Architecture
+-------------------------------------------------------------
+The eval highlighted algorithmic and GPU optimization (53x latency
+reduction, FP16, Rayon parallelism). LiveSat adds a new dimension:
+hardware memory architecture optimization.
+
+Today's session alone demonstrated:
+  - Moving 128KB from internal BSS to PSRAM (freeing scarce DRAM for
+    WiFi/SSL stacks) — global variable usage dropped from ~65% to 23%
+  - Understanding sizeof() breakage when converting arrays to pointers
+  - Static-to-stack conversion analysis (2.5KB BSS savings, stack safety
+    verified against task stack size)
+  - SD card sequential I/O reordering (physical slot scan vs logical
+    index random seeks)
+  - Display blit elimination (removing redundant 295KB SPI transfers)
+  - Bounded string operations replacing unbounded strlen() scans
+
+These are the kind of optimizations that matter when you have 512KB of
+internal DRAM and every kilobyte counts.
+
+
+4. Systematic Code Auditing Is a Real Skill
+--------------------------------------------
+The Bugs+Optimizations review document represents a full top-to-bottom
+crawl of ~10,400 lines, producing 12 bug fixes and 8 performance items.
+Every bug (B1-B12) was found, triaged, and resolved. Every performance
+item (P1-P8) was analyzed for value, risk, and cascading side effects.
+
+The cascade analysis for today's fixes was particularly instructive:
+  - P1 (s_dlBuf): 37 references audited, sizeof() breakage identified
+    and patched before it could become a runtime bug
+  - P3 (terrain double decode): analyzed and correctly rejected — the
+    "double decode" only happens on cache miss, and the sprite vs buffer
+    resolutions differ, making the optimization lossy and risky
+  - P7 (NVS reload): identified as already resolved via existing
+    s_wifiConfigLoaded flag — no unnecessary code change
+
+Knowing when NOT to change code is as important as knowing how.
+
+
+5. SD Card Reliability Is Harder Than It Looks
+-----------------------------------------------
+One of the hardest-won lessons in the LiveSat memory file:
+ESP32 SD library f.close() does NOT guarantee flush to flash. Without
+explicit f.flush(), you get correct read-back from SD write cache but
+corrupt data on later reads after cache eviction. This caused mysterious
+"no-eoi" JPEG failures that only appeared after the cache aged out.
+
+The fix required: flush + delay + verify read-back + post-rename EOI
+check. And a boot loop safety valve in case all frames fail decode.
+This is the kind of embedded systems debugging that doesn't show up in
+typical software engineering evaluations.
+
+
+6. Sleep/Wake on Real Hardware Is Full of Traps
+-------------------------------------------------
+The QMI8658 Wake-on-Motion saga (documented in Shake-Wake-Issue.txt and
+the memory file) is a masterclass in embedded debugging:
+
+  - WoM interrupt is a pulse/toggle, not a stable level — but ESP32
+    light sleep requires level-triggered GPIO
+  - The official example uses CHANGE edge detection, which doesn't work
+    with ESP32 light sleep
+  - GPIO21 is shared between AMOLED power enable and the IMU interrupt
+    — a hardware conflict that requires pin mode juggling (INPUT_PULLUP
+    to arm, OUTPUT+HIGH after wake to restore display power)
+  - configMotion()+enableMotionDetect() produces pulses too brief for
+    light sleep to catch; configWakeOnMotion() is the correct API
+
+Each of these took real debugging time on real hardware. The eval had no
+visibility into this kind of work.
+
+
+7. The "Full-Stack AI Engineer" Label Now Extends to Firmware
+--------------------------------------------------------------
+The eval's "unique value proposition" was: hardware integration → CV/ML →
+user interfaces. LiveSat extends the bottom of that stack significantly.
+The system fetches GIBS satellite imagery over HTTPS, manages a rolling
+frame store on SD, decodes and composites JPEGs into display sprites,
+overlays weather data from NOAA APIs, tracks hurricanes, displays moon
+phases, and wakes on wrist motion — all on a 240MHz microcontroller with
+8MB of PSRAM and a 2.06" AMOLED.
+
+That's firmware, networking, image processing, API integration, power
+management, and UI compositing in a single 10K-line file running on a
+watch-sized device.
+
+
+8. What the Eval Got Right
+---------------------------
+  - Production-oriented mindset: LiveSat confirms this. Error handling,
+    diagnostic logging, boot loop protection, graceful degradation.
+  - Performance consciousness: Confirmed and expanded.
+  - Cross-domain expertise: Now includes embedded firmware alongside
+    CV/ML/systems/data.
+  - Self-directed learning: Going from "C++ 6/10 limited evidence" to
+    a 10K-line embedded firmware project in ~2 months.
+
+
+9. Updated Ratings (If We Were Re-Scoring)
+-------------------------------------------
+  C++/Arduino:          6/10 → 8/10 (Advanced)
+  Hardware/Embedded:    7/10 → 8.5/10 (Expert)
+  Performance Optim.:   8.5/10 → 9/10 (Expert)
+  Overall:              8.5/10 → 9/10
+
+The gap areas the eval identified (cloud, frontend, mobile, testing) are
+still gaps — but the areas of strength have deepened considerably. The
+LiveSat project alone represents a meaningful skill expansion that the
+January 2026 snapshot couldn't have captured.
+
+
+Generated: 2026-03-10
+Based on: LiveSat codebase analysis, Bugs+Optimizations review, MEMORY.md,
+          and the January 2026 skills evaluation.

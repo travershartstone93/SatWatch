@@ -435,7 +435,7 @@ static time_t s_frameTimes[MAX_FRAMES];
 static bool   s_timesLoaded = false;
 static uint8_t s_sourceBlackLogged[MAX_FRAMES];
 
-struct FrameStoreIndex {
+struct __attribute__((packed)) FrameStoreIndex {
   uint32_t magic;
   uint16_t head;
   uint16_t count;
@@ -474,7 +474,10 @@ static bool s_zoomSnapshotsRefreshPending = false;
 // ── Moon phase complication ──────────────────────────────────────────────
 #define MOON_FRAME_COUNT  30
 #define MOON_DECODED_PX   54   // 216 / 4 = 54 (JPEG_SCALE_QUARTER)
+#define MOON_FLANK_STEP    2   // ±2 frames offset (~2 days before/after)
 static uint16_t* s_moonBuf = nullptr;      // PSRAM, MOON_DECODED_PX² pixels
+static uint16_t* s_moonPrevBuf = nullptr;  // PSRAM, MOON_DECODED_PX² pixels
+static uint16_t* s_moonNextBuf = nullptr;  // PSRAM, MOON_DECODED_PX² pixels
 static bool      s_moonDrawn = false;       // one-shot: AMOLED retains pixels
 // Weather zoom stages only refresh when new weather frames were downloaded
 // in this sync cycle (or when zoom assets are missing/stale).
@@ -571,6 +574,7 @@ static uint16_t s_shakeEntryIgnoreMs = 2000;  // ignore WoM for this long after 
 static uint16_t s_shakeConfirmMs     = 600;   // after settle: require 2nd WoM event within this window (0=any single event wakes)
 static SensorQMI8658 s_qmi;
 static bool s_qmiInitialized = false;
+static bool s_qmiInitFailed = false;  // sticky — prevents infinite retry on hardware failure
 #if BOARD_IS_AMOLED_206
 static I2SClass s_audioI2s;
 static es8311_handle_t s_audioCodec = nullptr;
@@ -762,10 +766,7 @@ static void loadWifiPortalConfig() {
       const char* modePath = cuePathForMode(s_startCueMode);
       snprintf(s_startCuePath, sizeof(s_startCuePath), "%s",
                (modePath && modePath[0]) ? modePath : "/power_up.raw");
-      int vol = prefs.getUChar("chmv", 80);
-      if (vol < 0) vol = 0;
-      if (vol > 100) vol = 100;
-      s_chimeVolume = (uint8_t)vol;
+      s_chimeVolume = prefs.getUChar("chmv", 80);
       s_sleepModeEnabled = prefs.getBool("slp", true);
       s_autoUpdateInSleep = prefs.getBool("ausl", true);
       int lbsl = prefs.getInt("lbsl", LOOPS_BEFORE_SLEEP);
@@ -791,10 +792,7 @@ static void loadWifiPortalConfig() {
 #endif
       s_hurricaneIncludeTS = prefs.getBool("hwts", false);
       s_hurricaneIncludeTD = prefs.getBool("hwtd", false);
-      int hwvol = prefs.getUChar("hwvol", 200);
-      if (hwvol < 0) hwvol = 0;
-      if (hwvol > 255) hwvol = 255;
-      s_hurricaneAlertVolume = (uint8_t)hwvol;
+      s_hurricaneAlertVolume = prefs.getUChar("hwvol", 200);
       prefs.getString("hwsnd", s_hurricaneAlertSound, sizeof(s_hurricaneAlertSound));
       if (s_hurricaneAlertSound[0] == '\0')
         strlcpy(s_hurricaneAlertSound, "/hurricane_alert.raw", sizeof(s_hurricaneAlertSound));
@@ -835,8 +833,11 @@ static const char* cuePathForMode(StartCueMode mode) {
 }
 
 static void initQmiShakeToWake() {
+  if (s_qmiInitFailed) return;  // don't retry after hardware failure
+  s_qmiInitialized = false;
   if (!s_qmi.begin(Wire, QMI8658_ADDRESS, SDA, SCL)) {
     appendDiagLog("qmi: init fail\n");
+    s_qmiInitFailed = true;
     return;
   }
   // WoM hardware path: resets sensor, arms dedicated threshold comparator.
@@ -850,6 +851,7 @@ static void initQmiShakeToWake() {
                                      0x20); // 32-sample blanking (~250ms)
   if (ret != 0) {
     appendDiagLog("qmi: WoM init fail %d\n", ret);
+    s_qmiInitFailed = true;
     return;
   }
   s_qmiInitialized = true;
@@ -1040,7 +1042,7 @@ static String wifiPortalRootUrl() {
 
 static void sendWifiPortalPage() {
   String html;
-  html.reserve(5800);
+  html.reserve(9000);
   html += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Sat Watch Setup</title><style>"
             "body{font-family:Arial,sans-serif;background:#111827;color:#f9fafb;margin:0;padding:16px;}"
@@ -1263,7 +1265,7 @@ static void sendWifiPortalPage() {
               "<div class='hint' style='margin-top:4px;'>Alert sound SD path: </div>"
               "<input type='text' name='hwsnd' value='"
   );
-  html += String(s_hurricaneAlertSound);
+  html += htmlEscape(s_hurricaneAlertSound);
   html += F(
               "' style='width:100%;'>"
   );
@@ -1401,7 +1403,7 @@ static void handleWifiPortalSave() {
   s_wifiPortalServer.send(200, "text/html",
                           "<!doctype html><html><body style='font-family:Arial;background:#111827;color:#f9fafb;padding:24px;'>"
                           "<h2>Saved</h2><p>Settings stored. Rebooting now.</p></body></html>");
-  delay(600);
+  vTaskDelay(pdMS_TO_TICKS(600));
   SD_MMC.end();
   ESP.restart();
 }
@@ -1448,7 +1450,7 @@ static void handleClearFrames() {
     "<h2>Cache Cleared</h2>"
     "<p>Frame cache invalidated. Rebooting now to re-download all frames.</p>"
     "</body></html>");
-  delay(600);
+  vTaskDelay(pdMS_TO_TICKS(600));
   SD_MMC.end();
   ESP.restart();
 }
@@ -1488,49 +1490,6 @@ static void handleServeFrame() {
     remaining -= n;
   }
   f.close();
-}
-
-static void handleGravity() {
-  // Temporarily configure QMI8658 for normal accel reads (WoM mode doesn't allow it)
-  SensorQMI8658 grav;
-  if (!grav.begin(Wire, QMI8658_ADDRESS, SDA, SCL)) {
-    s_wifiPortalServer.send(500, "application/json", "{\"error\":\"qmi init fail\"}");
-    return;
-  }
-  grav.configAccelerometer(SensorQMI8658::ACC_RANGE_2G,
-                           SensorQMI8658::ACC_ODR_1000Hz,
-                           SensorQMI8658::LPF_MODE_3);
-  grav.enableAccelerometer();
-  delay(50);  // let filter settle
-
-  const int N = 4000;
-  double sx = 0, sy = 0, sz = 0;
-  int good = 0;
-  for (int i = 0; i < N; i++) {
-    float x, y, z;
-    if (grav.getAccelerometer(x, y, z)) {
-      sx += x; sy += y; sz += z;
-      good++;
-    }
-    delayMicroseconds(500);  // ~2 kHz polling for 1 kHz ODR
-  }
-  // Restore WoM if it was active
-  if (s_qmiInitialized) initQmiShakeToWake();
-
-  if (good == 0) {
-    s_wifiPortalServer.send(500, "application/json", "{\"error\":\"no readings\"}");
-    return;
-  }
-  double ax = sx / good;
-  double ay = sy / good;
-  double az = sz / good;
-  double mag = sqrt(ax * ax + ay * ay + az * az);
-
-  char json[256];
-  snprintf(json, sizeof(json),
-    "{\"samples\":%d,\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,\"magnitude_g\":%.6f,\"magnitude_ms2\":%.6f}",
-    good, ax, ay, az, mag, mag * 9.80665);
-  s_wifiPortalServer.send(200, "application/json", json);
 }
 
 static void sendLsHandler() {
@@ -1593,7 +1552,7 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/clearframes", HTTP_POST, handleClearFrames);
   s_wifiPortalServer.on("/hwclearsup", HTTP_POST, handleClearHurricaneSuppression);
   s_wifiPortalServer.on("/frame", HTTP_GET, handleServeFrame);
-  s_wifiPortalServer.on("/gravity", HTTP_GET, handleGravity);
+
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
   s_wifiPortalHandlersReady = true;
 }
@@ -2639,7 +2598,6 @@ static bool jpegDrawLooksFullFrame() {
 // ─────────────────────────────────────────────────────────────
 static void showMessage(const char* line1, const char* line2 = nullptr) {
 #if BOARD_IS_AMOLED_206
-  int screenW = s_amoledOut ? s_amoledOut->width() : AMOLED_WIDTH;
   int screenH = s_amoledOut ? s_amoledOut->height() : AMOLED_HEIGHT;
   uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;  // visible dark red or black
   if (s_amoledOut) s_amoledOut->fillScreen(bg);
@@ -2656,7 +2614,6 @@ static void showMessage(const char* line1, const char* line2 = nullptr) {
   }
   s_amoledClearBeforeNextPresent = true;
 #else
-  int screenW = tft.width();
   int screenH = tft.height();
   tft.fillScreen(TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
@@ -3520,7 +3477,7 @@ static bool parseNoaaStormJson(const String& body, HurricaneInfo* storms,
     if (!braceOpen) break;
     // Find the next "properties" or end to bound the search
     const char* nextProp = strstr(braceOpen + 1, "\"properties\"");
-    int blockLen = nextProp ? (int)(nextProp - braceOpen) : (int)(strlen(braceOpen));
+    int blockLen = nextProp ? (int)(nextProp - braceOpen) : (int)((s + body.length()) - braceOpen);
     // Create a substring for this feature's properties
     String block = body.substring((int)(braceOpen - s), (int)(braceOpen - s) + blockLen);
 
@@ -3684,12 +3641,16 @@ static void cleanupSuppressedStorms(const HurricaneInfo* activeStorms, int activ
     for (int i = 0; i < activeCount; i++) {
       if (strcmp(tok, activeStorms[i].id) == 0) { keep = true; break; }
     }
-    // Seasonal check: extract year from last 4 chars
+    // Seasonal check: extract year from last 4 chars of storm ID
     size_t tokLen = strlen(tok);
     if (!keep && tokLen >= 4) {
       int idYear = atoi(tok + tokLen - 4);
-      if (idYear < curYear && tmNow.tm_mon >= 5) keep = false;  // expired
-      else if (idYear == curYear) keep = true;  // same year, storm just not in current list — keep for safety
+      if (idYear == curYear) {
+        keep = true;  // current-year storm not in active list — keep for safety
+      } else if (idYear < curYear && tmNow.tm_mon < 5) {
+        keep = true;  // previous-year, off-season (before June) — keep through winter
+      }
+      // else: previous-year AND past June → expired, keep stays false
     }
     if (keep) {
       if (cleaned[0] != '\0') strlcat(cleaned, ",", sizeof(cleaned));
@@ -3868,24 +3829,28 @@ static float computeMoonPhase(time_t utc) {
   // Reference new moon: Jan 6 2000 18:14 UTC (J2000 lunation 0)
   const double refNewMoon = 947182440.0;  // Unix epoch of that new moon
   const double synodicMonth = 29.53058770576;  // days
-  double daysSinceRef = difftime((double)utc, refNewMoon) / 86400.0;
+  double daysSinceRef = ((double)utc - refNewMoon) / 86400.0;
   double phase = fmod(daysSinceRef / synodicMonth, 1.0);
   if (phase < 0.0) phase += 1.0;
   return (float)phase;
 }
 
-// JPEGDEC draw callback for moon — renders into s_moonBuf
+// JPEGDEC draw callback for moon — target buffer and size set before decode
+static uint16_t* s_moonDecTarget = nullptr;
+static int        s_moonDecTargetPx = 0;
+
 static int moonJpegDraw(JPEGDRAW* pDraw) {
-  if (!s_moonBuf) return 0;
+  if (!s_moonDecTarget) return 0;
+  const int tpx = s_moonDecTargetPx;
   int drawW = (pDraw->iWidthUsed > 0) ? pDraw->iWidthUsed : pDraw->iWidth;
   uint16_t* src = (uint16_t*)pDraw->pPixels;
   for (int row = 0; row < pDraw->iHeight; row++) {
     int dstY = pDraw->y + row;
-    if (dstY < 0 || dstY >= MOON_DECODED_PX) continue;
+    if (dstY < 0 || dstY >= tpx) continue;
     for (int col = 0; col < drawW; col++) {
       int dstX = pDraw->x + col;
-      if (dstX < 0 || dstX >= MOON_DECODED_PX) continue;
-      s_moonBuf[dstY * MOON_DECODED_PX + dstX] = src[row * pDraw->iWidth + col];
+      if (dstX < 0 || dstX >= tpx) continue;
+      s_moonDecTarget[dstY * tpx + dstX] = src[row * pDraw->iWidth + col];
     }
   }
   return 1;
@@ -3933,7 +3898,9 @@ static void downloadMoonFramesIfMissing() {
         if (f) {
           uint8_t buf[512];
           int total = 0;
+          uint32_t lastProgress = millis();
           while (total < len) {
+            if (millis() - lastProgress > 10000) break;  // 10s stall timeout
             int avail = stream->available();
             if (avail <= 0) { delay(5); continue; }
             int toRead = (avail < (int)sizeof(buf)) ? avail : (int)sizeof(buf);
@@ -3942,6 +3909,7 @@ static void downloadMoonFramesIfMissing() {
             if (got <= 0) break;
             f.write(buf, got);
             total += got;
+            lastProgress = millis();
           }
           f.flush();
           f.close();
@@ -3956,7 +3924,42 @@ static void downloadMoonFramesIfMissing() {
   Serial.printf("moon: downloaded %d/%d frames\n", ok, MOON_FRAME_COUNT);
 }
 
-// Decode the appropriate moon phase JPEG from SD into s_moonBuf.
+// Decode a single moon frame JPEG into the given buffer at the given scale.
+static bool decodeMoonFrameInto(int frameIdx, uint16_t* buf, int px, int scale) {
+  char path[32];
+  snprintf(path, sizeof(path), "/moon/moon_%02d.jpg", frameIdx);
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+  size_t fSize = (size_t)f.size();
+  if (fSize == 0 || fSize > 20000) { f.close(); return false; }
+  uint8_t* jpegBuf = (uint8_t*)heap_caps_malloc(fSize, MALLOC_CAP_SPIRAM);
+  if (!jpegBuf) { f.close(); return false; }
+  size_t got = f.read(jpegBuf, fSize);
+  f.close();
+  if (got != fSize) { heap_caps_free(jpegBuf); return false; }
+
+  memset(buf, 0, px * px * 2);
+  s_moonDecTarget = buf;
+  s_moonDecTargetPx = px;
+
+  JPEGDEC moonJpeg;
+  bool ok = false;
+  if (moonJpeg.openRAM(jpegBuf, (int)fSize, moonJpegDraw)) {
+    moonJpeg.setPixelType(RGB565_BIG_ENDIAN);
+    ok = moonJpeg.decode(0, 0, scale);
+    moonJpeg.close();
+  }
+  heap_caps_free(jpegBuf);
+  s_moonDecTarget = nullptr;
+
+  if (ok) {
+    int npx = px * px;
+    for (int i = 0; i < npx; i++) buf[i] = __builtin_bswap16(buf[i]);
+  }
+  return ok;
+}
+
+// Decode current, previous, and next moon phase JPEGs from SD.
 static bool decodeMoonPhase() {
   time_t now = time(nullptr);
   if (now < 1000000000) {
@@ -3967,54 +3970,52 @@ static bool decodeMoonPhase() {
   float phase = computeMoonPhase(now);
   int frameIdx = (int)(phase * MOON_FRAME_COUNT + 0.5f) % MOON_FRAME_COUNT;
 
-  char path[32];
-  snprintf(path, sizeof(path), "/moon/moon_%02d.jpg", frameIdx);
-
-  File f = SD.open(path, FILE_READ);
-  if (!f) { appendDiagLog("moon: %s not found\n", path); return false; }
-  size_t fSize = (size_t)f.size();
-  if (fSize == 0 || fSize > 20000) { f.close(); return false; }
-
-  uint8_t* jpegBuf = (uint8_t*)heap_caps_malloc(fSize, MALLOC_CAP_SPIRAM);
-  if (!jpegBuf) { f.close(); return false; }
-  size_t got = f.read(jpegBuf, fSize);
-  f.close();
-  if (got != fSize) { heap_caps_free(jpegBuf); return false; }
-
+  // Allocate buffers
   if (!s_moonBuf) {
     s_moonBuf = (uint16_t*)heap_caps_malloc(MOON_DECODED_PX * MOON_DECODED_PX * 2, MALLOC_CAP_SPIRAM);
-    if (!s_moonBuf) { heap_caps_free(jpegBuf); return false; }
+    if (!s_moonBuf) return false;
   }
-  memset(s_moonBuf, 0, MOON_DECODED_PX * MOON_DECODED_PX * 2);
+  if (!s_moonPrevBuf) {
+    s_moonPrevBuf = (uint16_t*)heap_caps_malloc(MOON_DECODED_PX * MOON_DECODED_PX * 2, MALLOC_CAP_SPIRAM);
+  }
+  if (!s_moonNextBuf) {
+    s_moonNextBuf = (uint16_t*)heap_caps_malloc(MOON_DECODED_PX * MOON_DECODED_PX * 2, MALLOC_CAP_SPIRAM);
+  }
 
-  JPEGDEC moonJpeg;
-  bool ok = false;
-  if (moonJpeg.openRAM(jpegBuf, (int)fSize, moonJpegDraw)) {
-    moonJpeg.setPixelType(RGB565_BIG_ENDIAN);
-    ok = moonJpeg.decode(0, 0, JPEG_SCALE_QUARTER);
-    moonJpeg.close();
-  }
-  heap_caps_free(jpegBuf);
-  // Convert from JPEGDEC big-endian to native little-endian RGB565
-  if (ok) {
-    int npx = MOON_DECODED_PX * MOON_DECODED_PX;
-    for (int i = 0; i < npx; i++) s_moonBuf[i] = __builtin_bswap16(s_moonBuf[i]);
-    s_moonDrawn = false;  // force redraw
-  }
-  appendDiagLog("moon: frame=%d phase=%.2f decode=%s buf=%p\n",
-                frameIdx, (double)phase, ok ? "ok" : "FAIL", (void*)s_moonBuf);
+  // Decode center (current phase)
+  bool ok = decodeMoonFrameInto(frameIdx, s_moonBuf, MOON_DECODED_PX, JPEG_SCALE_QUARTER);
+  if (ok) s_moonDrawn = false;  // force redraw
+
+  // Decode flanking phases (±MOON_FLANK_STEP frames ≈ ±2 days)
+  int prevIdx = (frameIdx - MOON_FLANK_STEP + MOON_FRAME_COUNT) % MOON_FRAME_COUNT;
+  int nextIdx = (frameIdx + MOON_FLANK_STEP) % MOON_FRAME_COUNT;
+  if (s_moonPrevBuf) decodeMoonFrameInto(prevIdx, s_moonPrevBuf, MOON_DECODED_PX, JPEG_SCALE_QUARTER);
+  if (s_moonNextBuf) decodeMoonFrameInto(nextIdx, s_moonNextBuf, MOON_DECODED_PX, JPEG_SCALE_QUARTER);
+
+  appendDiagLog("moon: frame=%d(±%d) phase=%.2f decode=%s\n",
+                frameIdx, MOON_FLANK_STEP, (double)phase, ok ? "ok" : "FAIL");
   return ok;
 }
 
-// Draw moon phase icon in the AMOLED bottom border (Y=431-502).
-// s_moonBuf must already be converted to native little-endian RGB565.
-// Uses s_moonDrawn flag: AMOLED retains pixels so we draw once.
+// Draw moon phase triptych in the AMOLED bottom border (Y=431-502).
+// Layout: [prev 54×54] —gap— [center 54×54] —gap— [next 54×54]
+// Previous phase on left, current center, next phase on right.
+// Lets user see at a glance whether the moon is waxing or waning.
 static void drawMoonComplication() {
   if (!s_amoledOut || !s_moonBuf || s_hurricaneMode || s_moonDrawn) return;
   const int borderY = (AMOLED_HEIGHT - SCALED_H) / 2 + SCALED_H; // 71 + 360 = 431
-  const int moonX = (SCALED_W - MOON_DECODED_PX) / 2;              // horizontally centered
-  const int moonY = borderY + (AMOLED_HEIGHT - borderY - MOON_DECODED_PX) / 2; // vertically centered in border
-  s_amoledOut->draw16bitRGBBitmap(moonX, moonY, s_moonBuf, MOON_DECODED_PX, MOON_DECODED_PX);
+  const int borderH = AMOLED_HEIGHT - borderY;                     // 71
+  const int mp = MOON_DECODED_PX;
+  const int gap = mp / 2;               // half a moon width (27px)
+  const int totalW = mp * 3 + gap * 2;  // 54+27+54+27+54 = 216
+  const int baseX = (SCALED_W - totalW) / 2;
+  const int moonY = borderY + (borderH - mp) / 2;
+
+  if (s_moonPrevBuf)
+    s_amoledOut->draw16bitRGBBitmap(baseX, moonY, s_moonPrevBuf, mp, mp);
+  s_amoledOut->draw16bitRGBBitmap(baseX + mp + gap, moonY, s_moonBuf, mp, mp);
+  if (s_moonNextBuf)
+    s_amoledOut->draw16bitRGBBitmap(baseX + mp * 2 + gap * 2, moonY, s_moonNextBuf, mp, mp);
   s_moonDrawn = true;
 }
 
@@ -4316,8 +4317,9 @@ static time_t roundToCadence(time_t t) {
 
 // Build an ISO-8601 UTC string for a given time_t
 static void toISO(time_t t, char* out, size_t len) {
-  struct tm* ti = gmtime(&t);
-  strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", ti);
+  struct tm ti;
+  gmtime_r(&t, &ti);
+  strftime(out, len, "%Y-%m-%dT%H:%M:%SZ", &ti);
 }
 
 static bool buildWeatherFrameUrl(char* out, size_t outLen,
@@ -4357,7 +4359,7 @@ static size_t jpegEffectiveLength(const uint8_t* data, size_t len) {
 
 // Download buffer — reused for every frame fetch and for showFrame playback
 #define DL_BUF_BYTES  MAX_JPEG_BYTES
-static uint8_t s_dlBuf[DL_BUF_BYTES];
+static uint8_t* s_dlBuf = nullptr;
 
 class FixedBufferWriteStream : public Stream {
 public:
@@ -4616,6 +4618,7 @@ static void writeCurrentWeatherViewMeta() {
   File f = SD.open(WEATHER_VIEW_META_FILE, FILE_WRITE);
   if (!f) return;
   f.print(sig);
+  f.flush();
   f.close();
 }
 
@@ -4677,6 +4680,7 @@ static void writeZoomSnapshotMeta(time_t newestUtc) {
   File f = SD.open(ZOOM_SNAPSHOT_META_FILE, FILE_WRITE);
   if (!f) return;
   f.print(buf);
+  f.flush();
   f.close();
 }
 
@@ -4701,10 +4705,10 @@ static void applyGentleLowPassOnSprite() {
   uint16_t* px = (uint16_t*)sprite.getBuffer();
   if (!px || DISP_W < 3 || DISP_H < 3) return;
 
-  static uint16_t rowPrev[DISP_W];
-  static uint16_t rowCurr[DISP_W];
-  static uint16_t rowNext[DISP_W];
-  static uint16_t rowOut[DISP_W];
+  uint16_t rowPrev[DISP_W];
+  uint16_t rowCurr[DISP_W];
+  uint16_t rowNext[DISP_W];
+  uint16_t rowOut[DISP_W];
 
   auto loadRowCanonical = [&](int y, uint16_t* dst) {
     uint16_t* src = px + ((size_t)y * (size_t)DISP_W);
@@ -4809,6 +4813,7 @@ static void writeRadarMeta(time_t radarUtc) {
   char buf[32];
   snprintf(buf, sizeof(buf), "%lld\n", (long long)radarUtc);
   f.print(buf);
+  f.flush();
   f.close();
 }
 
@@ -4873,6 +4878,14 @@ static void appendDiagLog(const char* fmt, ...) {
 // ─────────────────────────────────────────────────────────────
 
 static void initFrameStore() {
+  if (!s_dlBuf) {
+    s_dlBuf = (uint8_t*)heap_caps_malloc(DL_BUF_BYTES, MALLOC_CAP_SPIRAM);
+    if (!s_dlBuf) {
+      showMessage("PSRAM ALLOC FAIL", "s_dlBuf");
+      while (1) delay(5000);
+    }
+  }
+
   SD.mkdir(FRAMES_DIR);
 
   // Delete legacy per-frame files if any exist
@@ -5009,8 +5022,16 @@ static bool loadIndex() {
     s_timesLoaded = true;
     return false;
   }
-  f.read((uint8_t*)&s_idx, sizeof(s_idx));
+  size_t got = f.read((uint8_t*)&s_idx, sizeof(s_idx));
   f.close();
+  if (got != sizeof(s_idx)) {
+    appendDiagLog("loadIndex: short read %u/%u\n", (unsigned)got, (unsigned)sizeof(s_idx));
+    memset(&s_idx, 0, sizeof(s_idx));
+    frameCount = 0;
+    framesReady = false;
+    s_timesLoaded = true;
+    return false;
+  }
 
   if (s_idx.magic != INDEX_MAGIC) {
     appendDiagLog("loadIndex: bad magic 0x%08X\n", s_idx.magic);
@@ -5022,16 +5043,24 @@ static bool loadIndex() {
   }
 
   // SOI sanity check: verify jpegValid slots have valid JPEG headers
+  // Scan in physical slot order (0..143) for sequential SD reads
   File fb = SD.open(FRAMES_BIN_FILE, FILE_READ);
   if (fb) {
+    int physToLogical[MAX_FRAMES];
+    memset(physToLogical, -1, sizeof(physToLogical));
     for (int i = 0; i < (int)s_idx.count; i++) {
       if (!s_idx.jpegValid[i]) continue;
       int phys = ((int)s_idx.head + i) % MAX_FRAMES;
+      physToLogical[phys] = i;
+    }
+    for (int phys = 0; phys < MAX_FRAMES; phys++) {
+      if (physToLogical[phys] < 0) continue;
       uint32_t off = (uint32_t)phys * JPEG_SLOT_BYTES;
       uint8_t hdr[2] = {0, 0};
       fb.seek(off);
       fb.read(hdr, 2);
       if (hdr[0] != 0xFF || hdr[1] != 0xD8) {
+        int i = physToLogical[phys];
         appendDiagLog("loadIndex: SOI fail slot %d phys %d\n", i, phys);
         s_idx.jpegValid[i] = 0;
         s_idx.rawValid[i] = 0;
@@ -5091,7 +5120,11 @@ static void writeIndex() {
     s_streamValid[i] = 0;
   }
   frameCount = (int)s_idx.count;
-  framesReady = (frameCount > 0);
+  int vc = 0;
+  for (int i = 0; i < (int)s_idx.count && i < MAX_FRAMES; i++) {
+    if (s_idx.rawValid[i]) vc++;
+  }
+  framesReady = (frameCount > 0 && vc > 0);
   s_timesLoaded = true;
   invalidateValidIdxCache();
 }
@@ -5199,7 +5232,7 @@ static bool copyFrameFile(const char* srcPath, const char* dstPath) {
 
   bool ok = true;
   while (src.available()) {
-    size_t n = src.read(s_dlBuf, sizeof(s_dlBuf));
+    size_t n = src.read(s_dlBuf, DL_BUF_BYTES);
     if (n == 0) {
       ok = false;
       break;
@@ -5239,7 +5272,7 @@ static bool installValidatedWeatherJpegToPath(const char* finalPath,
   (void)skipStoredValidate;
   if (!finalPath || jpegLen == 0 || jpegLen > DL_BUF_BYTES) return false;
 
-  char tmpPath[64];
+  char tmpPath[128];
   snprintf(tmpPath, sizeof(tmpPath), "%s.part", finalPath);
   SD.remove(tmpPath);
 
@@ -5465,7 +5498,8 @@ static uint8_t pcfBcdEnc(int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); 
 static int pcfBcdDec(uint8_t b) { return ((b >> 4) & 0x0F) * 10 + (b & 0x0F); }
 
 static bool writePcf85063(time_t t) {
-  struct tm* gmt = gmtime(&t);
+  struct tm tmBuf;
+  struct tm* gmt = gmtime_r(&t, &tmBuf);
   if (!gmt) return false;
   // Halt oscillator during write
   Wire.beginTransmission(0x51);
@@ -6201,6 +6235,7 @@ static bool decodeTerrainCompositeToSprite() {
         File wf = SD.open(ZOOM_TERRAIN_RADAR_RAW_TMP_FILE, FILE_WRITE);
         if (wf) {
           size_t wrote = wf.write((const uint8_t*)radarPx, RAW_FRAME_BYTES);
+          wf.flush();
           wf.close();
           radarRawReady = (wrote == RAW_FRAME_BYTES);
         }
@@ -6976,6 +7011,7 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
     appendDiagLog("zoom: blk-corr %s\n", path);
     return false;
   }
+  // IMPORTANT: save/restore — no early return between set and restore
   bool prevTopBarRadarMode = s_topBarUseRadarScanTime;
   if (isTerrainStage) s_topBarUseRadarScanTime = true;
   updateBarBufs(newestIdx);
@@ -7053,7 +7089,8 @@ static void drawScaledOutlineRect(uint16_t* buf,
   }
 }
 
-static bool computeZoom3LocatorRectScaled(int* outX, int* outY, int* outW, int* outH) {
+static bool computeZoomLocatorRectScaled(float wKm, float hKm,
+                                         int* outX, int* outY, int* outW, int* outH) {
   if (!outX || !outY || !outW || !outH) return false;
   if (!s_weatherGeoValid) return false;
 
@@ -7065,8 +7102,7 @@ static bool computeZoom3LocatorRectScaled(int* outX, int* outY, int* outW, int* 
 
   float zoomW, zoomS, zoomE, zoomN;
   computeBboxFromCenterKm(s_weatherCenterLat, s_weatherCenterLon,
-                          ZOOM3_FINAL_W_KM, ZOOM3_FINAL_H_KM,
-                          &zoomW, &zoomS, &zoomE, &zoomN);
+                          wKm, hKm, &zoomW, &zoomS, &zoomE, &zoomN);
 
   auto clamp01 = [](float v) -> float {
     if (v < 0.0f) return 0.0f;
@@ -7098,6 +7134,10 @@ static bool computeZoom3LocatorRectScaled(int* outX, int* outY, int* outW, int* 
   *outW = (x1 - x0) + 1;
   *outH = (y1 - y0) + 1;
   return true;
+}
+
+static bool computeZoom3LocatorRectScaled(int* outX, int* outY, int* outW, int* outH) {
+  return computeZoomLocatorRectScaled(ZOOM3_FINAL_W_KM, ZOOM3_FINAL_H_KM, outX, outY, outW, outH);
 }
 
 static bool scaledFrameLooksHoldBlockCorrupted() {
@@ -7206,50 +7246,78 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
     return;
   }
 
-  int rx, ry, rw, rh;
-  if (!computeZoom3LocatorRectScaled(&rx, &ry, &rw, &rh)) {
+  // Compute all three zoom level rects using same geometric-mean formula as zoom refresh
+  float baseW, baseS, baseE, baseN;
+  getActiveWeatherBbox(&baseW, &baseS, &baseE, &baseN);
+  float cosLat = cosf(s_weatherCenterLat * 0.01745329252f);
+  if (cosLat < 0.2f) cosLat = 0.2f;
+  float baseWKm = fabsf(baseE - baseW) * 111.32f * cosLat;
+  float baseHKm = fabsf(baseN - baseS) * 111.32f;
+  if (baseWKm < 25.0f) baseWKm = 25.0f;
+  if (baseHKm < 25.0f) baseHKm = 25.0f;
+  float z2wKm = sqrtf(baseWKm * ZOOM3_FINAL_W_KM);
+  float z2hKm = sqrtf(baseHKm * ZOOM3_FINAL_H_KM);
+  float z1wKm = sqrtf(baseWKm * z2wKm);
+  float z1hKm = sqrtf(baseHKm * z2hKm);
+
+  struct ZoomRect { int x, y, w, h; bool valid; };
+  ZoomRect z1 = {}, z2 = {}, z3 = {};
+  z1.valid = computeZoomLocatorRectScaled(z1wKm, z1hKm, &z1.x, &z1.y, &z1.w, &z1.h);
+  z2.valid = computeZoomLocatorRectScaled(z2wKm, z2hKm, &z2.x, &z2.y, &z2.w, &z2.h);
+  z3.valid = computeZoom3LocatorRectScaled(&z3.x, &z3.y, &z3.w, &z3.h);
+
+  if (!z3.valid) {
     delay(remainingMs);
     return;
-  }
-  size_t saveBytes = (size_t)rw * (size_t)rh * 2U;
-  if (saveBytes == 0 || saveBytes > DL_BUF_BYTES) {
-    delay(remainingMs);
-    return;
-  }
-  uint16_t* saved = (uint16_t*)s_dlBuf;
-  for (int row = 0; row < rh; ++row) {
-    memcpy(saved + (size_t)row * (size_t)rw,
-           s_frameDisplayBuf + (size_t)(ry + row) * (size_t)SCALED_W + (size_t)rx,
-           (size_t)rw * 2U);
   }
 
-  const uint32_t flashSlotMs = (remainingMs >= 500U) ? 125U : (remainingMs / 4U);
-  if (flashSlotMs == 0) {
+  const uint32_t dahMs = (remainingMs >= 500U) ? 125U : (remainingMs / 4U);  // zoom3 flash duration
+  const uint32_t ditMs = 25U;                                                  // zoom1/2 quick flash
+  const uint32_t gapMs = 12U;                                                  // inter-element gap
+  if (dahMs == 0) {
     delay(remainingMs);
     return;
   }
 
-  auto restoreRect = [&]() {
-    for (int row = 0; row < rh; ++row) {
-      memcpy(s_frameDisplayBuf + (size_t)(ry + row) * (size_t)SCALED_W + (size_t)rx,
-             saved + (size_t)row * (size_t)rw,
-             (size_t)rw * 2U);
-    }
+  // Helper: restore clean frame
+  int holdIdx = (s_newestCachedIdx >= 0) ? s_newestCachedIdx : 0;
+  auto restoreFrame = [&]() {
+    showFrame(holdIdx);
   };
 
   uint32_t consumedMs = 0;
-  for (int i = 0; i < 4; ++i) {
-    restoreRect();
-    if ((i & 1) == 0) {
-      drawScaledOutlineRect(s_frameDisplayBuf, rx, ry, rw, rh, 0xF800);
-    }
+
+  // dit: zoom1 bbox — quick flash
+  if (z1.valid) {
+    drawScaledOutlineRect(s_frameDisplayBuf, z1.x, z1.y, z1.w, z1.h, 0xF800);
     presentScaledBuf(s_frameDisplayBuf);
-    delay(flashSlotMs);
-    consumedMs += flashSlotMs;
+    delay(ditMs);
+    restoreFrame();
+    delay(gapMs);
+    consumedMs += ditMs + gapMs;
   }
 
-  restoreRect();
-  presentScaledBuf(s_frameDisplayBuf);
+  // dit: zoom2 bbox — quick flash (no trailing gap before zoom3)
+  if (z2.valid) {
+    drawScaledOutlineRect(s_frameDisplayBuf, z2.x, z2.y, z2.w, z2.h, 0xF800);
+    presentScaledBuf(s_frameDisplayBuf);
+    delay(ditMs);
+    consumedMs += ditMs;
+  }
+
+  // dah dah: zoom3 bbox — two longer flashes
+  for (int i = 0; i < 4; ++i) {
+    restoreFrame();
+    if ((i & 1) == 0) {
+      drawScaledOutlineRect(s_frameDisplayBuf, z3.x, z3.y, z3.w, z3.h, 0xF800);
+    }
+    presentScaledBuf(s_frameDisplayBuf);
+    delay(dahMs);
+    consumedMs += dahMs;
+  }
+
+  // Final clean frame
+  restoreFrame();
   if (remainingMs > consumedMs) {
     delay(remainingMs - consumedMs);
   }
@@ -7421,6 +7489,7 @@ static void refreshZoomSnapshotsForLatestFrame() {
 //  + syncFramesRolling + all branch logic.
 // ─────────────────────────────────────────────────────────────
 static void syncWeatherFrames() {
+  memset(s_sourceBlackLogged, 0, sizeof(s_sourceBlackLogged));
   if (!syncProgressIsActive()) showMessage("Syncing time...", "pool.ntp.org");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   struct tm ti;
@@ -7536,9 +7605,9 @@ static void syncWeatherFrames() {
       }
       s_idx.count = (uint16_t)totalFrames;
     }
-    // Check for invalid slots
+    // Check for invalid slots (skip those already marked from tail expansion)
     for (int i = 0; i < (int)s_idx.count; i++) {
-      if (!s_idx.jpegValid[i]) {
+      if (!s_idx.jpegValid[i] && !needsDownload[i]) {
         s_idx.times[i] = fetchStart + (time_t)(i * cadenceSec);
         needsDownload[i] = true;
         downloadCount++;
@@ -7893,10 +7962,18 @@ static void rebuildRawFromStored() {
       if (i - d >= 0 && s_idx.rawValid[i - d]) src = i - d;
       else if (i + d < (int)s_idx.count && s_idx.rawValid[i + d]) src = i + d;
     }
-    if (src >= 0) {
-      s_idx.rawValid[i] = 1;
-      s_streamValid[i] = 1;
-      filled++;
+    if (src >= 0 && s_frameDisplayBuf) {
+      int srcPhys = ((int)s_idx.head + src) % MAX_FRAMES;
+      uint32_t srcOff = (uint32_t)srcPhys * SCALED_FRAME_BYTES;
+      File sf = SD.open(RAW_STREAM_FILE, FILE_READ);
+      if (sf) {
+        sf.seek(srcOff);
+        size_t rd = sf.read((uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+        sf.close();
+        if (rd == SCALED_FRAME_BYTES && writeRawToSlot(i, (const uint8_t*)s_frameDisplayBuf)) {
+          filled++;
+        }
+      }
     }
   }
 
@@ -8009,6 +8086,19 @@ static void goToSleep(bool buttonOnly = false) {
     // immediately from that settling motion. After the window any single
     // wrist flick wakes normally. Button press (topButtonPressed()) always
     // bypasses this regardless of timing.
+    // Button bounce guard: if GPIO woke us within 500ms of sleep entry
+    // and the boot button is still LOW, it's bounce from the press that
+    // triggered sleep. Wait for release, then re-sleep.
+    bool isButtonWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && topButtonPressed();
+    if (isButtonWake) {
+      uint64_t elapsedMs = (esp_timer_get_time() - sleepEntryUs) / 1000ULL;
+      if (elapsedMs < 500ULL) {
+        while (topButtonPressed()) delay(10);  // wait for release
+        delay(50);                              // debounce settle
+        continue;                               // re-enter sleep
+      }
+    }
+
     bool isShakeWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && !topButtonPressed();
     if (isShakeWake && s_shakeToWakeEnabled && s_qmiInitialized) {
       int int1Now = digitalRead(QMI8658_INT1);
@@ -8088,6 +8178,7 @@ static void goToSleep(bool buttonOnly = false) {
   if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(0xFF);
   s_buttonSleepTransition = false;
+  s_moonDrawn = false;          // border was cleared — redraw moon
   return;
 #endif
 
@@ -8315,8 +8406,6 @@ void setup() {
   tft.setBrightness(255);
   tft.fillScreen(TFT_BLACK);
 #endif
-
-  loadWifiPortalConfig();
 
 #if BOARD_IS_AMOLED_206 || BOARD_HAS_PHYSICAL_BOOT_WAKE
   pinMode(BOOT_BTN_GPIO, INPUT_PULLUP);  // keep BOOT ready for wake-from-sleep
@@ -8558,11 +8647,6 @@ void setup() {
     if (wifiOk) {
       (void)syncClockFromNtpBestEffort(8);
       refreshDisplayLocationTimeFromIpInfo();
-      time_t newestUtc = 0;
-      for (int i = frameCount - 1; i >= 0; --i) {
-        if (s_frameTimes[i] > 0) { newestUtc = s_frameTimes[i]; break; }
-      }
-      (void)newestUtc;
       s_zoomSnapshotsRefreshPending = true;
       s_zoomWeatherRefreshNeeded = false;
       downloadMoonFramesIfMissing();
@@ -8595,6 +8679,7 @@ void setup() {
   if ((needSync || hardBoot) && framesReady && frameCount > 0) {
     s_startCuePending = true;
   }
+
 
   // ── Decode moon phase for bottom border complication ──────
 #if BOARD_IS_AMOLED_206
@@ -9403,6 +9488,7 @@ static bool ensureTerrainCrossfadeRawFromJpeg() {
   File wf = SD.open(rawPath, FILE_WRITE);
   if (!wf) return false;
   size_t wrote = wf.write((const uint8_t*)s_terrainDisplayBuf, SCALED_FRAME_BYTES);
+  wf.flush();
   wf.close();
   if (wrote != SCALED_FRAME_BYTES) {
     SD.remove(rawPath);
@@ -9454,6 +9540,7 @@ static bool runTerrainCrossfadeSegment(int newestIdx, bool baseAlreadyShown) {
   }
 
   // Terrain wipe should show radar scan time + minutes-old in the top bar.
+  // IMPORTANT: save/restore — no early return between set and restore
   bool prevTopBarRadarMode = s_topBarUseRadarScanTime;
   s_topBarUseRadarScanTime = true;
   updateBarBufs(newestIdx);
@@ -10118,7 +10205,6 @@ void loop() {
   }
 
   uint32_t loopStartMs = millis();
-  bool preFreezeShown = false;
   int lastDisplayedFrameIdx = -1;
   // Time-based frame selection over the valid-frame list.
   // This keeps playback monotonic even when the raw validity map has holes.
@@ -10144,7 +10230,7 @@ void loop() {
             }
           }
           lastDisplayedFrameIdx = freezeFrameIdx;
-          preFreezeShown = true;
+
           // Walk back if the freeze frame looks slab-corrupted (e.g. a GIBS
           // partial composite at the lag boundary that passed size/decode checks
           // but has a large near-zero black region).
@@ -10188,8 +10274,6 @@ void loop() {
             invalidateValidIdxCache();
           }
         }
-      } else if (lastDisplayedFrameIdx >= 0) {
-        preFreezeShown = true;
       }
       uint32_t el2 = millis() - loopStartMs;
       if (el2 < animationDurationMs) delay(animationDurationMs - el2);
@@ -10204,16 +10288,13 @@ void loop() {
         }
       }
       lastDisplayedFrameIdx = validIdx[srcPos];
-      preFreezeShown = true;
     }
   }
 
   // Freeze on the already-displayed final animation frame.
   // Avoid any extra frame push at freeze entry (that's where transfer tear occurs).
   int holdFrameIdx = (lastDisplayedFrameIdx >= 0) ? lastDisplayedFrameIdx : newestIdx;
-  bool holdFrameShown = preFreezeShown;
-  if (!holdFrameShown) holdFrameShown = true;  // keep current panel frame as freeze base
-  if (holdFrameShown && s_frameDisplayBuf) {
+  if (s_frameDisplayBuf) {
     // Re-present the exact current frame buffer once so the start of the freeze
     // and the locator-cue redraws are guaranteed to use the same image.
     presentScaledBuf(s_frameDisplayBuf);
@@ -10222,8 +10303,8 @@ void loop() {
 
   // Zoom + terrain stages — each step is wall-clock governed so decode time is
   // included in the step budget, keeping the total loop time predictable.
-  bool baseForClockOverlay = holdFrameShown;
-  if (holdFrameShown) {
+  bool baseForClockOverlay = true;
+  {
     uint32_t zStepStart = millis();
     bool z1Shown = showZoomSnapshotFrame(ZOOM1_FILE, newestIdx);
     if (z1Shown) {

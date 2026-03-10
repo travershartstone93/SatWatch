@@ -1,0 +1,488 @@
+System Outline — LiveSat S3 (esp32-LiveSat-s3.ino)
+Date: 2026-03-10
+
+1) Top-Level Runtime Model
+--------------------------
+- The app is a state machine with two major phases:
+  1. Sync/prepare phase (WiFi + SD + cache update/rebuild).
+  2. Playback phase (weather animation + zoom/terrain/clock sequence).
+- Entry points:
+  - `setup()` initializes hardware, storage, config, and sync decisions.
+  - `loop()` runs playback continuously and handles periodic update/sleep triggers.
+
+
+2) Core Data Layers (what is stored and used)
+---------------------------------------------
+- Pre-allocated binary frame store: `/frames/frames.bin`
+  - 144 slots × 64KB = 9MB. Each slot holds one compressed JPEG.
+  - Circular buffer: `head` pointer + `count` define the active window.
+  - Physical slot = `(head + logicalIndex) % 144`.
+- Raw playback stream: `/frames/stream.raw`
+  - 144 slots × 295,200 bytes (410×360×RGB565) = ~43MB pre-allocated.
+  - Pre-decoded frames for smooth AMOLED playback without runtime JPEG decode.
+- Binary index: `/frames/index.bin`
+  - `FrameStoreIndex` struct: head, count, times[], jpegValid[], rawValid[], jpegLen[].
+  - Written atomically via tmp+rename pattern (`index.tmp` → `index.bin`).
+- Frame-dimension guard: `/frames/dim.cfg`
+- Weather view/bbox metadata: `/frames/view.meta`
+- Raw stream metadata: `/frames/raw.meta` (version + validity bitmap + slot map)
+- Cache validation metadata: `/frames/validate.meta`
+- Zoom snapshot metadata: `/frames/zoom.meta`
+- Radar timestamp metadata: `/frames/radar.meta`
+- Runtime diagnostics log: `/diag.txt`
+- Zoom snapshots: `/frames/vz1.jpg`, `vz2.jpg`, `vz3.jpg` + `.raw` counterparts
+- Terrain assets:
+  - `/frames/terrain_day.jpg`, `/frames/terrain_night.jpg` + `.raw` counterparts
+  - `/frames/terrain_radar_z3.jpg`
+- Moon phase frames: `/moon/moon_00.jpg` through `/moon/moon_29.jpg` (216×216)
+
+
+3) Setup Phase Stages
+---------------------
+Stage A — Hardware bring-up
+- Serial, I2C, PMIC/power key setup.
+- Display init (board-specific path).
+- SD mount and mandatory asset checks.
+- PSRAM allocation for scaled frame buffers, top/bottom bar buffers, download
+  buffer (s_dlBuf — 128KB via heap_caps_malloc from PSRAM), and moon phase buffer.
+
+Stage B — Configuration load
+- Loads portal/user config (WiFi slots, 12/24h, update mode, start cue, sleep mode,
+  hurricane watch settings, shake-to-wake settings).
+- Initializes button poll task (top button handling on separate task/core path).
+- Preloads selected start cue audio into PSRAM.
+
+Stage C — Boot classification
+- Detects wake cause:
+  - hard boot,
+  - timer wake,
+  - shake-to-wake (QMI8658 WoM interrupt on GPIO21),
+  - or regular wake.
+- Loads existing SD cache via loadIndex() and dimension compatibility check.
+- If dimension mismatch is detected, purges incompatible frame/cache artifacts.
+
+Stage D — Sync decision trigger
+- `needSync` is computed from:
+  - timer wake,
+  - empty cache,
+  - auto-update boundary due (in auto mode),
+  - hard boot logic.
+- If WiFi connect fails during sync-needed path, portal mode is started.
+
+Stage E — Sync execution path
+- Primary path: `syncWeatherFrames()` (circular buffer rolling sync).
+- After weather sync, pending zoom/terrain refresh may run.
+- Raw cache is built inline during download (no separate rebuild pass).
+- Hurricane watch check runs if enabled (NOAA poll).
+- Moon phase frames downloaded on first boot if not cached.
+- Start cue is armed when boot/sync produced playable frames.
+
+
+4) Sync Layering (weather, raw cache, zoom, terrain, radar)
+------------------------------------------------------------
+This section is the core of refresh behavior. The system uses a circular buffer
+model with slot-based storage — no individual frame files are created, renamed,
+or deleted during normal sync.
+
+4.1 Window model used for every sync pass
+- `targetFrameCount()` defines desired window size (dynamic by active source/cadence).
+- `fetchEnd = roundToCadence(now - lagHours)`.
+- `fetchStart = fetchEnd - (targetFrameCount-1)*cadence`.
+- Existing index is loaded from `index.bin` as `FrameStoreIndex` (head, count,
+  times[], jpegValid[], rawValid[], jpegLen[]).
+
+4.2 First gate: immediate full-refresh conditions
+- If weather view/bbox signature changed (`view.meta` mismatch) → full refresh.
+- If no cached timestamps overlap the new window → full refresh.
+- If rolling cannot produce a coherent result → full refresh.
+
+4.3 Fast no-download paths (cache-current paths)
+- `latest-current` branch:
+  - cache count equals target, exact timeline match, newest cached == fetchEnd.
+  - If raw cache current too: skip sync entirely.
+  - If raw stale: inline raw rebuild only.
+- `exact-current` branch:
+  - full exact timeline match.
+  - Same decision: keep if raw current, otherwise raw rebuild only.
+- Result: quick boot/update path with no weather JPEG network activity.
+
+4.4 Rolling sync (circular buffer rotation)
+- Compute shift: how many cadence steps the window has advanced since last sync.
+- Advance `head` pointer by shift amount (modular arithmetic, no data movement).
+- Overlapping slots retain their jpegValid/rawValid flags — data stays in place.
+- New slots entering the window are marked `needsDownload[]`.
+- For each slot needing download:
+  1. Fetch JPEG from NASA GIBS with timestamp-offset retry (±3 minutes).
+  2. Validate: size, decode viability, structural pixel checks, semantic neighbor checks.
+  3. Write validated JPEG to physical slot in `frames.bin` via `writeJpegToSlot()`.
+  4. Immediately decode and write raw to `stream.raw` via `decodeAndWriteRawSlot()`
+     (inline raw build — no separate pass).
+- This eliminates the old file-rename staging (`nNNN.jpg` → `fNNN.jpg`).
+
+4.5 Gap-fill (raw data recovery)
+- After download loop, any slots with jpegValid but !rawValid get gap-filled:
+  - Find nearest valid neighbor (bidirectional search).
+  - Read neighbor's raw pixel data from `stream.raw`.
+  - Write copy to target slot via `writeRawToSlot()`.
+- Ensures smooth animation even when some frames failed decode.
+
+4.6 Partial-window tolerance logic
+- `partial-stable keep`:
+  - all currently cached frames are still reusable,
+  - source does not expose full target window now,
+  - system keeps current cache and avoids full-refresh loop.
+- `partial-keep`:
+  - assembled set is partial but improved/usable,
+  - commits that partial set and continues.
+- Cache can remain < target count intentionally without being treated as failure.
+
+4.7 Download validation and install contract
+- Each downloaded weather frame is validated before slot write:
+  - HTTP/body/JPEG integrity checks (SOI/EOI).
+  - Decode viability checks (geometry, draw coverage).
+  - Structural pixel anomaly checks (black frame, partial decode, band corruption).
+  - Temporal-neighbor semantic + compressed-size outlier checks.
+- Timestamp offset retry: up to 7 offsets {0, -60, 60, -120, 120, -180, 180} seconds.
+- Minimum JPEG byte floor enforced to reject known placeholder payloads.
+- Only validated frames are written to slot.
+
+4.8 Inline raw build coupling
+- Raw frames are decoded and written during the same loop iteration as JPEG download.
+- For reused slots that have jpegValid but !rawValid: decoded inline during sync.
+- Fallback: `rebuildRawFromStored()` runs only if all JPEGs valid but some raw invalid
+  and no new downloads occurred (cache-current with stale raw).
+- Eliminates the separate ~155s buildRawPlaybackCache() phase.
+
+4.9 Zoom/terrain/radar refresh coupling
+- `s_zoomWeatherRefreshNeeded` is set when weather downloads occurred.
+- `s_zoomSnapshotsRefreshPending` is set when newest snapshot set is stale/missing.
+- Zoom refresh may run without weather redownload if only derived assets are stale.
+- Terrain/radar stage is refreshed in the same sync cycle, with tolerant terrain
+  pair handling (single-layer success can still keep stage alive).
+
+
+5) Playback Stages (loop sequence)
+----------------------------------
+Stage 1 — Main weather animation (time-based)
+- Uses valid frame index map from `stream.raw` via `s_streamValid[]`.
+- Runs ~10s animation window with monotonic slot progression.
+- Final displayed frame is retained for freeze base.
+
+Stage 2 — Freeze + locator cue
+- Holds latest frame and runs Morse-code visual locator cue (bounding box
+  outlines at zoom1/zoom2/zoom3 levels) before zoom stage.
+
+Stage 3 — Zoom progression
+- Shows zoom1 → zoom2 → zoom3 in fixed step durations.
+
+Stage 4 — Terrain/radar transition
+- Uses terrain composite stage and top-bar mode switch to radar-time context.
+
+Stage 5 — Clock sweep overlay
+- Draws large local-time overlay with sweep reveal/fade timing.
+- Returns to clean terrain base after overlay segment ends.
+
+Stage 6 — Moon phase complication
+- Draws current lunar phase image (216×216, selected from 30-frame set) in the
+  71px AMOLED border below the frame area (Y=431-502).
+- Uses one-shot flag (AMOLED retains pixels); resets on screen clear.
+- Not shown during hurricane mode.
+
+Stage 7 — Sleep/update checks
+- Auto-update boundary check can trigger reboot/rescan.
+- Hurricane watch re-check runs periodically (every 3 loops if enabled).
+- Loop counter and sleep mode policy can enter sleep state.
+
+
+6) Overlay/Bar Layers (what is drawn over content)
+--------------------------------------------------
+- Top bar (2 rows, rendered into s_topBarBuf):
+  - Row 0: WiFi signal bars + SSID, sleep mode glyph, battery icon + percent.
+  - Row 1: Dynamic timestamp — frame UTC time with "h ago" in normal mode,
+    or radar scan time with "min ago" in terrain/radar stage.
+  - Background: dark red (0xA800) in hurricane mode, black otherwise.
+- Bottom bar (rendered into s_botBarBuf):
+  - Line 1: Location label (city/region/country).
+  - Line 2: Radar status — "Clear MMm" with age, "no sig", or "n/a".
+  - Background: dark red in hurricane mode, black otherwise.
+- Bars are rendered into dedicated PSRAM buffers and stamped over every presented frame.
+- Hurricane reboot hint ("Reboot for local weather") drawn after chunk blit loop
+  using one-shot flag pattern.
+
+
+7) Hurricane Watch System
+--------------------------
+7.1 Data source
+- Polls NOAA Atlantic hurricane advisory: `https://www.nhc.noaa.gov/CurrentSurfaces/AT.json`
+- Parses JSON to extract: storm name, type, category, lat/lon, wind speed, pressure.
+- Maintains array of `HurricaneInfo` structs (up to 6 concurrent storms).
+
+7.2 Activation criteria
+- Configurable via WiFi portal:
+  - Watch for Cat 1+ hurricanes (default threshold).
+  - Optional: include tropical storms.
+  - Optional: include tropical depressions.
+- Checks run on boot (during sync) and periodically during playback.
+
+7.3 Hurricane mode behavior
+- When qualifying storm detected:
+  - Enters `s_hurricaneMode` (RTC-backed, survives sleep).
+  - Re-centers weather view bounding box on storm location.
+  - UI changes: dark red background on bars and progress screens.
+  - Plays hurricane alert sound (configurable path, default `/hurricane_alert.raw`).
+  - Disables sleep until storm passes or is suppressed.
+  - Re-checks NOAA every 3 animation loops (~3 minutes).
+- Storm suppression: user can suppress specific storms via NVS (key `"hwsup"`).
+
+7.4 Exit criteria
+- Storm dissipates or moves out of advisory.
+- All active storms suppressed.
+- Returns to normal weather view on next sync.
+
+
+8) Sleep / Wake Model
+---------------------
+8.1 Sleep modes
+- Light sleep (`esp_light_sleep_start()`): used on AMOLED 2.06 board.
+  - Preserves RTC, keeps PSRAM alive, maintains GPIO state.
+- Deep sleep: available on alternative boards (C6/1.47) with physical BOOT button.
+
+8.2 Wake sources
+- Timer wake: enabled if `s_autoUpdateInSleep=true`. Duration from SLEEP_HOURS config.
+- GPIO wake (BOOT button): always armed.
+- GPIO wake (QMI8658 INT1, GPIO21): shake-to-wake via IMU Wake-on-Motion.
+
+8.3 Shake-to-wake (QMI8658 WoM)
+- Arms QMI8658 WoM comparator via `configWakeOnMotion()` (100mg threshold).
+- INT1 is a pulse/toggle signal, not a stable level. Firmware reads current pin
+  state and arms the opposite level to catch the next toggle.
+- Two-layer filtering:
+  - Settle window (2000ms): ignores motion immediately after sleep entry to avoid
+    waking from arm-settling during button press.
+  - Confirm window (600ms): requires a 2nd WoM pulse within window to distinguish
+    deliberate raise-to-wake from accidental bumps. Configurable (0 = any single event).
+- GPIO21 is shared with AMOLED_PWR_EN: gpio_reset_pin()+INPUT_PULLUP before arming,
+  pinMode(OUTPUT)+HIGH after wake to restore display power.
+
+8.4 Sleep entry triggers
+- Loop counter reaches `loopsBeforeSleep` threshold.
+- Top button short press: immediate sleep.
+- Top button long press: toggles sleep-enabled vs always-on mode.
+- AXP power-key short press: software reboot.
+- AXP power-key long hold (~4s): hardware power-off.
+- Hurricane mode: blocks sleep entirely while storm active.
+
+
+9) Runtime Safety/Validation Layers
+-----------------------------------
+The system has multiple validation gates so a single weak check does not
+poison playback.
+
+9.1 Transport/body integrity gate (HTTP → RAM buffer)
+- Function: `readHttpJpegBodyToDlBuf(...)`
+- Checks: HTTP body fits in s_dlBuf (128KB PSRAM), starts with SOI (FFD8),
+  contains EOI (FFD9) via `jpegEffectiveLength(...)`.
+- Output: canonical JPEG effective length, trimming trailing noise bytes.
+
+9.2 Decode-viability gate (RAM JPEG → sprite)
+- Functions: `validateBufferedWeatherFrameJpeg(...)`, `decodeJpegPathToSprite(...)`.
+- Checks: jpeg.openRAM success, expected width/height, full-frame draw coverage.
+
+9.3 Structural pixel anomaly detectors (sprite-level)
+- `spriteLooksCompletelyBlack()`: exact-zero blank frame.
+- `spriteLooksNearlyBlack()`: visually-black tolerant to JPEG noise.
+- `spriteLooksPartialDecode()`: large zero ratio + quadrant concentration.
+- `spriteLooksHorizontallyCorrupted()`: horizontal band half-empty pattern.
+- `spriteLooksVerticallyCorrupted()`: left/right half-empty split.
+- `spriteLooksHoldFrameBlockCorrupted()`: 16×16 MCU-hole/band detector.
+- `spriteLooksCyanWhiteBlockCorrupted()`: cyan/white tiled artifact detector.
+- `spriteLooksBlackSlabCorrupted()`: dark slab cluster detector.
+  Note: slab detector is currently DISABLED due to GOES-West disk-edge false
+  positives. Code present but not called from validation pipeline.
+
+9.4 Atomic install gate (slot write correctness)
+- JPEG written to slot in `frames.bin` via `writeJpegToSlot()`.
+- SOI sanity check on load: `loadIndex()` scans all jpegValid slots in physical
+  order (sequential SD reads) and invalidates any without FFD8 header.
+
+9.5 Temporal-neighbor outlier checks (semantic + compressed-size)
+- `weatherFrameLooksCompressedSizeOutlier(...)`: size vs neighbors.
+- `weatherFrameLooksSemanticOutlier(...)`: per-tile color signatures + cyan metrics.
+- Used in download validation and cache repair flows.
+
+9.6 Cache-repair validators (post-download maintenance)
+- `validateAndRepairCachedFrames(...)`, `validateAndRepairFullCacheIfNeeded(...)`.
+- Repair: re-download exact timestamp, or heal by nearest good neighbor copy.
+- Tracked via `CACHE_VALIDATE_META_FILE`.
+
+9.7 Raw-cache admission control
+- Raw builders re-run structural + semantic checks before writing each slot.
+- Failed slots are zeroed then gap-filled from nearest valid neighbor.
+
+9.8 Playback-time guards
+- `showFrame(...)` validates stream slot mapping and read length.
+- Short/invalid reads invalidate slot and raw meta, forcing rebuild.
+- Zero valid frames shows explicit error rather than drawing garbage.
+
+9.9 Metadata coherency guards
+- `raw.meta`: version + validity bitmap; rejects meta=1 with zero valid slots.
+- `dim.cfg`: display geometry guard prevents cross-resolution cache reuse.
+- `view.meta`: weather bbox/source signature; mismatch triggers full refresh.
+- `zoom.meta` / `radar.meta`: derived asset freshness and radar scan-time coherence.
+
+
+10) Known Operational Dependencies
+---------------------------------
+- Accurate "ago" values depend on valid UTC/NTP; best-effort sync and RTC fallback used.
+- Terrain/radar availability depends on external service responses.
+- Fast boot path relies on metadata consistency (index.bin, raw.meta, view.meta, dim.cfg).
+- SD integrity is critical; corrupt writes can surface as frame anomalies or stale cache.
+- Hurricane watch depends on NOAA endpoint availability.
+- Moon phase depends on NASA SVS endpoint availability (first-boot download only).
+
+
+11) Network/Portal Control Plane
+--------------------------------
+- Portal host is always `satwatch.local` (mDNS host `satwatch`).
+- AP fallback credentials:
+  - SSID: `Sat Watch`
+  - Password: `123456789`
+- If normal WiFi cannot connect, device enters captive AP portal mode and displays
+  join instructions on-screen.
+- Auto-retry loop: while connection guide is displayed, retries connectWifiForSync()
+  every 60 seconds. On success calls ESP.restart(). On failure restores AP mode.
+- Tap-to-skip: when cached frames exist, touch (GPIO38) or AXP PKEY short press
+  dismisses portal and plays cached animation. Guide shows amber prompt.
+- When normal WiFi is connected, portal server runs on LAN (satwatch.local + local IP).
+  AP is NOT broadcast in STA-connected mode.
+
+
+12) User Configuration Model (Portal + NVS)
+-------------------------------------------
+- Stored in `Preferences` namespace `satwatch`.
+- WiFi credentials: 1 primary + 4 fallback networks.
+- Time format: 12-hour or 24-hour.
+- Update mode: Manual / Auto (clock-boundary schedule).
+- Auto schedule presets:
+  - every 15 minutes (:00/:15/:30/:45)
+  - every 30 minutes (:00/:30)
+  - top of hour (:00)
+- Start cue: Off / Chime / Chime 2 / Chime 3 / Vibe pulse.
+  - Volume configurable. Path derived from mode.
+- Hurricane watch:
+  - Watch for Cat 1+ hurricanes (enable/disable).
+  - Include tropical storms (optional).
+  - Include tropical depressions (optional).
+- Sleep / shake-to-wake:
+  - Sleep mode enabled/disabled.
+  - Shake-to-wake enabled/disabled.
+  - Settle window and confirm window configurable.
+- Save action: persists config, then triggers reboot.
+
+
+13) Source Selection + Dynamic Window Profile
+---------------------------------------------
+- Weather source is selected from longitude with hysteresis:
+  - GOES-West
+  - GOES-East
+  - Himawari IR (APAC fallback region)
+- Active profile drives: layer name, cadence minutes, lag hours.
+- `targetFrameCount()` is dynamic from `hoursBack/cadence`, clamped to MAX_FRAMES (144).
+- Frame count can be < 144 due to source holes and validation rejection;
+  rolling logic treats that as valid partial state when timeline anchors remain coherent.
+
+
+14) Geolocation Pipeline
+--------------------------
+14.1 BSSID geolocation (primary)
+- Scans visible WiFi APs, encodes BSSIDs + RSSI into protobuf format.
+- POSTs to Apple's BSSID geolocation API.
+- Returns lat/lon accurate to ~tens of metres.
+- Used as primary method when WiFi scan data is available.
+
+14.2 IP-based geolocation (fallback)
+- HTTP GET to `http://ip-api.com/json/?fields=status,lat,lon,timezone,regionName,countryCode,offset`.
+- Returns lat/lon (~city level), timezone offset, location labels.
+- Used when BSSID scan fails or is unavailable.
+
+14.3 Usage
+- Drives weather source selection (GOES-West vs East vs Himawari).
+- Provides display location label for bottom bar.
+- Provides UTC offset for local time display (persisted in NVS key `utcoff`).
+- Small drift tolerance suppresses cache invalidation for minor BSSID position jitter.
+
+
+15) Progress Pipeline Semantics
+-------------------------------
+- Unified progress tracker spans full sync pipeline:
+  1) sync clock/network stage
+  2) cache stage (rolling download)
+  3) inline raw decode stage (merged with download)
+  4) finalize stage (index/meta/state writes)
+  5) zoom/terrain refresh stage
+- Progress UI can only complete after all phases commit, not just JPEG network loop.
+- If progress appears to pause near completion, it usually indicates tail finalize
+  work (raw/meta/derived assets), not deadlock.
+
+
+16) Clock and Time Sources
+--------------------------
+16.1 Primary source: NTP
+- `syncClockFromNtpBestEffort()` queries pool.ntp.org + time.nist.gov.
+- On success, sets system time via settimeofday() and writes to PCF85063A RTC.
+
+16.2 Hardware RTC: PCF85063A
+- I2C address 0x51, shares bus with touch IC and IMU (SDA=GPIO15, SCL=GPIO14).
+- `writePcf85063(time_t)`: halts oscillator, writes BCD time, resumes.
+- `readPcf85063(time_t*)`: reads 7 bytes, checks OS flag, reconstructs epoch.
+- `tryApplyPcf85063Time()`: called before portal so local time is set without internet.
+- Effect: after first successful sync, watch keeps correct time across power-off cycles.
+
+16.3 UTC offset persistence
+- `s_displayUtcOffsetSec` is RTC_DATA_ATTR (survives deep sleep only).
+- Additionally persisted in NVS (key `utcoff`):
+  - Written by IP geolocation after success.
+  - Restored on hard boot via `loadUtcOffsetFromNvs()`.
+- Ensures local time display is correct after power-off without internet.
+
+16.4 Priority order on boot
+  1. RTC (PCF85063A) — applied before portal if OS flag is clear.
+  2. NTP (during sync phase) — overwrites RTC reading; writes back to RTC.
+  3. NVS UTC offset — restores timezone for display even without IP geolocation.
+  4. IP geolocation (ip-api.com) — provides refined offset + saves to NVS.
+
+
+17) Diagnostics (`/diag.txt`) Reading Guide
+-------------------------------------------
+- Core boot header:
+  - `sdCount`, `framesReady`, `frameCount`, `needSync`
+- Sync branch markers:
+  - `sync: branch=roll`
+  - `sync: branch=tail-fill`
+  - `sync: latest-current`
+  - `sync: exact-current`
+  - `sync: ... -> full-refresh`
+- Completion markers:
+  - `syncRolling=1` means rolling path completed without full refresh.
+  - `syncRolling=0` followed by `download:` means full refresh path was taken.
+  - `post-sync:` is end-of-sync state committed to runtime.
+- Frame count drift across cycles is expected if source window has holes
+  and validators reject bad payloads; this is not automatically a logic fault.
+
+
+KNOWN ISSUE 1 — Battery glyph flip near 99%
+-------------------------------------------
+- Symptom:
+  - At ~99% SOC, charging/full battery glyph can appear to flip intermittently.
+- Current behavior:
+  - UI uses raw AXP2101 STATUS2 (0x01) charge-phase bits per render pass, and
+    that phase can oscillate near full/top-off boundaries.
+- Why it happens:
+  - Near charge-complete, PMIC legitimately transitions between charge phases
+    (top-off/done), so direct per-frame mapping produces visible icon state flips.
+- Constraint:
+  - User requirement is truthful status display; no fake/forced stable state.
+- Planned direction (not yet implemented):
+  - Keep truthful hardware-state semantics while reducing visual jitter by using a
+    power-present + phase-aware mapping with stable top-off representation, without
+    falsifying charge state.

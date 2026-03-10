@@ -1,0 +1,116 @@
+Direct-to-Raw Refactor: Eliminate JPEG Storage Entirely
+========================================================
+Status: NOT YET IMPLEMENTED — design notes captured here.
+
+
+Overview
+--------
+Currently the sync pipeline does:
+  1. Download GIBS JPEG tile → store in s_dlBuf (64KB RAM)
+  2. Write JPEG to SD slot in frames.bin (for cache reuse on next boot)
+  3. Decode JPEG → scale to 410×360 → write raw RGB565 to stream.raw slot
+  4. On playback, read raw from stream.raw → present to display
+
+The refactor eliminates step 2 entirely. No JPEGs are ever written to SD.
+The only persistent file is stream.raw (pre-allocated, 42MB, 144 slots of
+295,200 bytes each = raw RGB565 at 410×360).
+
+
+How It Works
+------------
+1. Download GIBS JPEG tile into s_dlBuf (RAM only, never touches SD).
+
+2. Decode JPEG in-memory using JPEGDEC → scale callback writes directly
+   into the target raw slot buffer (s_frameDisplayBuf or a dedicated
+   decode buffer in PSRAM).
+
+3. Write the decoded raw RGB565 pixels directly to the corresponding
+   stream.raw slot via writeRawToSlot(). One sequential SD write of
+   295,200 bytes per frame.
+
+4. Mark slot valid in s_streamValid[] and update index metadata.
+
+5. On next boot, rolling sync checks which time slots already have valid
+   raw data in stream.raw (via index + timestamp matching). Only downloads
+   new/shifted frames. Stale slots are overwritten in-place.
+
+
+What Gets Deleted
+-----------------
+- frames.bin (9MB pre-allocated JPEG store) — gone entirely
+- All JPEG read-back functions: readJpegFromSlot(), jpegEffectiveLength()
+  verification, EOI checks, the "verify committed frame integrity" pass
+- The separate "build raw playback cache" phase (already partially merged
+  into inline raw build, but this finishes the job)
+- cachedFrameLooksReusable() JPEG-based checks — replaced by raw slot
+  validity (just check s_streamValid[] + timestamp match)
+- The s_dlBuf → SD → s_dlBuf round-trip for semantic outlier checking
+  (decode both candidate and neighbor directly from RAM/raw)
+
+
+What Changes
+------------
+- syncWeatherFrames(): download loop decodes to raw inline (already 90%
+  there with the "inline raw build" optimization). Remove the JPEG write
+  and the post-write JPEG verification. The raw write IS the commit.
+
+- Rolling sync reuse check: instead of "does this JPEG slot have valid
+  data?", check "does this stream.raw slot have the right timestamp AND
+  is s_streamValid[slot] true?". The raw data is self-contained.
+
+- Gap-fill: currently copies raw from neighbor slot. No change needed —
+  it already operates on raw data in stream.raw.
+
+- Semantic outlier detection: currently decodes neighbor JPEGs from
+  frames.bin to extract brightness signatures. After refactor, read
+  neighbor raw pixels directly from stream.raw (already decoded). This
+  is actually simpler and avoids the s_dlBuf clobbering issue (item #3
+  in Possible_future_core_architecture_optimizations.txt).
+
+- initFrameStore(): only allocates stream.raw (42MB). No frames.bin.
+  First boot save ~9MB of SD pre-allocation time (~8 seconds faster).
+
+- Zoom/terrain pipeline: unchanged (still uses separate .jpg files on SD
+  since those are individually downloaded at different resolutions).
+
+
+Benefits
+--------
+- ~9MB less SD usage (frames.bin eliminated)
+- ~8 seconds faster first boot (no frames.bin allocation)
+- Eliminates all JPEG write + verify + re-read overhead during sync
+  (~15 seconds saved per full 144-frame sync)
+- Simpler code: no dual-format storage, no JPEG integrity checks
+- Fixes the s_dlBuf clobber issue for semantic outlier checks (item #3)
+- Reduces SD wear (half the writes per frame: was JPEG+raw, now raw only)
+
+
+Risks / Considerations
+----------------------
+- No JPEG fallback: if stream.raw gets corrupted, there's no source JPEG
+  to rebuild from. Must re-download from GIBS. Current behavior with
+  frames.bin provides a rebuild path via rebuildRawFromStored(). After
+  refactor, corruption = full re-download. Acceptable since GIBS is
+  always available and re-download takes ~3-5 minutes.
+
+- Semantic outlier detection needs raw pixel access instead of JPEG
+  decode. The brightness signature extraction must work on raw RGB565
+  buffers instead of decoded JPEG. Straightforward — just read the
+  relevant rows from stream.raw.
+
+- The "verify committed frame integrity" pass (full sequential JPEG read
+  + EOI check) has no equivalent for raw. Raw slots are validated by
+  successful decode + write. Could add a simple checksum per slot if
+  paranoid, but probably not needed.
+
+
+Migration Path
+--------------
+On first boot after flash with this refactor:
+- loadIndex() finds no change (index format stays the same)
+- frames.bin exists but is never opened → harmless, can be deleted
+  manually or by a one-time cleanup in initFrameStore()
+- stream.raw exists with valid data → playback works immediately
+- Rolling sync proceeds normally, just writes raw instead of JPEG+raw
+
+No breaking change. Old frames.bin is simply orphaned.
