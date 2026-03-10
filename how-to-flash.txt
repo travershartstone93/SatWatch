@@ -1,0 +1,55 @@
+LiveSat ESP32-S3 — Compile & Flash Guide
+=========================================
+
+Board:    Waveshare ESP32-S3-Touch-AMOLED-2.06
+Tool:     arduino-cli
+Port:     /dev/ttyACM0
+FQBN:     esp32:esp32:waveshare_esp32_s3_touch_amoled_206
+Options:  PSRAM=enabled, PartitionScheme=max_app_32MB
+Sketch:   /home/whisper/Desktop/LiveSat/esp32-LiveSat-s3
+Build:    /tmp/s3-build
+
+
+Step 1 — Compile
+-----------------
+  arduino-cli compile \
+    --fqbn "esp32:esp32:waveshare_esp32_s3_touch_amoled_206:PSRAM=enabled,PartitionScheme=max_app_32MB" \
+    --build-path /tmp/s3-build \
+    /home/whisper/Desktop/LiveSat/esp32-LiveSat-s3
+
+
+Step 2 — Upload
+----------------
+  arduino-cli upload \
+    --fqbn "esp32:esp32:waveshare_esp32_s3_touch_amoled_206:PSRAM=enabled,PartitionScheme=max_app_32MB" \
+    --build-path /tmp/s3-build \
+    -p /dev/ttyACM0 \
+    /home/whisper/Desktop/LiveSat/esp32-LiveSat-s3
+
+
+One-liner (compile + upload)
+------------------------------
+  arduino-cli compile \
+    --fqbn "esp32:esp32:waveshare_esp32_s3_touch_amoled_206:PSRAM=enabled,PartitionScheme=max_app_32MB" \
+    --build-path /tmp/s3-build \
+    /home/whisper/Desktop/LiveSat/esp32-LiveSat-s3 \
+  && arduino-cli upload \
+    --fqbn "esp32:esp32:waveshare_esp32_s3_touch_amoled_206:PSRAM=enabled,PartitionScheme=max_app_32MB" \
+    --build-path /tmp/s3-build \
+    -p /dev/ttyACM0 \
+    /home/whisper/Desktop/LiveSat/esp32-LiveSat-s3
+
+
+Monitor serial output
+----------------------
+  arduino-cli monitor -p /dev/ttyACM0 -c baudrate=115200
+
+
+Notes
+------
+- Commands use absolute paths — run from any directory.
+- Board must be connected via USB before upload.
+- If /dev/ttyACM0 is wrong, list ports with:
+    arduino-cli board list
+- PSRAM=enabled is required (firmware uses PSRAM for frame buffers).
+- PartitionScheme=max_app_32MB required (sketch exceeds default app partition size).

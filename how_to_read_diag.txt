@@ -1,0 +1,322 @@
+How to Read the LiveSat Diagnostic Log
+=======================================
+Retrieved via: curl -s http://satwatch.local/diag
+
+Each boot creates a fresh diag file (FILE_WRITE truncates at boot).
+All subsequent entries are appended (FILE_APPEND) during that boot.
+A single boot may contain MULTIPLE sync cycles (initial boot sync + auto-update).
+
+=====================================
+HEADER (written once at boot)
+=====================================
+
+LogID=3589141959 date=pending millis=1299 ms
+  - LogID: random uint32, unique per boot. Use to distinguish boots.
+  - date=pending: placeholder (NTP not yet synced)
+  - millis: ms since boot
+
+boot: millis=1299 ms
+  - Timestamp of boot init completion
+
+sdCount=144 framesReady=1 frameCount=144
+  - sdCount: number of fNNN.jpg files found on SD at boot
+  - framesReady: 1 if cache is playable
+  - frameCount: number of frames loaded into memory
+
+bat=100% chargeState=0x14 resetReason=11
+  - bat: AXP2101 battery percentage
+  - chargeState: AXP2101 charge register (0x14=not charging, 0x55=charging, 0x32=discharging)
+  - resetReason: ESP32 reset reason
+      1=power-on, 3=software, 8=deep-sleep, 11=USB/JTAG (flash)
+
+dim='320 176' expected='320 176'
+  - Frame resolution check. Mismatch triggers re-download.
+
+hardBoot=1 timerWake=0 framesReady=1 frameCount=144 skipOnce=0 needSync=1
+  - hardBoot: 1=cold boot or flash, 0=wake from sleep
+  - timerWake: 1=woke from sleep timer
+  - skipOnce: 1=skip sync this cycle
+  - needSync: 1=sync will run
+
+=====================================
+WIFI + NTP + GEOLOCATION
+=====================================
+
+wifi: ok ssid=TELUS7556 ip=192.168.1.91 rssi=-55 millis=3998 ms
+  - rssi: WiFi signal strength (dBm, closer to 0 = stronger)
+
+sync: ntp utc=1773082313 (2026-03-09T18:51:53Z) millis=4066 ms
+  - NTP time sync result with ISO timestamp
+
+ip-geo: off=-25200 loc=BC, CA lat=50.2600 lon=-119.2700 src=GOES-West cad=10 g=1 millis=11454 ms
+  - off: UTC offset in seconds (-25200 = UTC-7 = PDT)
+  - src: satellite source selected (GOES-East, GOES-West, Himawari)
+  - cad: cadence in minutes (time between frames)
+  - g: geolocation valid flag
+
+=====================================
+SYNC DECISION
+=====================================
+
+sync: cad=10 lag=2 tf=144 cc=143 start=1772991000 end=1773076800
+  - cad: frame cadence (minutes)
+  - lag: GIBS lag hours (imagery delay behind real-time)
+  - tf: total frames target (typically 144 = 24h / 10min)
+  - cc: cache count (frames currently on SD)
+  - start/end: target time window (epoch seconds)
+
+sync: partial cache -> rolling cc=143 tf=144 first=... last=... start=... end=...
+  - Decided to do a rolling sync (reuse + download delta)
+  - first/last: timestamps of first/last cached frame
+  - start/end: target window
+
+sync: cc=122 rc=118 ... view=1 raw=0 exact=0 prefix=0 shift=2
+  - rc: recent count (frames in cache that overlap with target window)
+  - view: 1=view meta matches (same bbox/layer/cadence)
+  - raw: 1=raw stream cache is current and reusable
+  - exact: 1=cache timestamps exactly match target window
+  - prefix: 1=cache is a prefix of target window
+  - shift: forward window shift in slots (-1=no shift detected)
+
+sync: branch=roll cc=122 rc=118 raw=0 shift=2
+  - Which sync branch was taken: roll, tail-fill, tail-only, full-refresh
+
+sync: full-refresh reason=no-window
+  - Full download triggered. Reasons: no-window, view, dim-mismatch, etc.
+
+=====================================
+ROLLING SYNC PATHS
+=====================================
+
+sync: roll-fast shift=2 reuse=141
+  - Fast-path rolling: shift N frames forward, reuse (cc-shift) frames
+  - reuse: number of frames attempted for reuse
+
+sync: branch=tail-only shift=2 raw=1
+  - Optimal case: just download N new tail frames, shift existing
+
+sync: roll partial-stable saved=... keep=1
+  - All cached frames reusable but some slots unavailable. Keep as-is.
+
+=====================================
+GIBS AVAILABILITY
+=====================================
+
+gibs: describeDomains count=91
+  - Number of available time slots from GIBS WMS DescribeDomains
+
+gibs: avail[0]=2026-03-08T17:00:00Z avail[90]=2026-03-09T16:40:00Z
+  - First and last available timestamps
+
+gibs: epoch avail[0]=1772989200 avail[last]=1773074400 start=... end=...
+  - Same in epoch seconds for comparison with target window
+
+=====================================
+DOWNLOAD (full refresh path)
+=====================================
+
+download: start total=144 end=... cad=10 lag=2 src=GOES-West heap=66168 millis=19609 ms
+  - Download loop starting
+
+frame0 url=https://gibs.earthdata.nasa.gov/...
+frame0 code=200 err=
+frame0 freeHeap=14332
+frame0 total=16070 jpegLen=16070
+frame0 hdr=ffd8ffe0
+  - First frame diagnostic (URL, HTTP code, size, JPEG header bytes)
+  - hdr should always be ffd8ffe0 (JPEG SOI + JFIF)
+
+dl-fail: i=14 HTTP--11 heap=63128
+  - Frame i failed. HTTP error codes:
+      200=OK, -1=CONNECTION_REFUSED, -4=NOT_CONNECTED,
+      -5=CONNECTION_LOST, -11=READ_TIMEOUT
+  - Only first 3 failures logged (to avoid flooding)
+
+download: miss i=14 t=1773004800
+  - Frame i completely missed (all retries exhausted)
+
+download: done saved=144 snapMiss=0 http=0 fetch=0 val=0 inst=0 total=144 millis=137433 ms
+  - Final download summary:
+    saved: frames successfully saved to SD
+    snapMiss: frames skipped (not in GIBS avail times)
+    http: HTTP error count
+    fetch: body read failures
+    val: JPEG validation failures
+    inst: SD install failures
+    total: target frame count
+
+=====================================
+INSTALL DIAGNOSTICS (if enabled)
+=====================================
+
+inst: FRAME-000 PRE buf=ffd8ffe0 len=16070 sync=258 heap=19028
+  - Pre-write diagnostic: s_dlBuf header, length, esp_cache_msync result, heap
+  - sync=258 means ESP_ERR_INVALID_ARG (normal on S3)
+
+inst: FRAME-000 POST file=ffd8ffe0 fsz=16070
+  - Post-write read-back: first 4 bytes of .part file, file size
+  - If POST hdr differs from PRE buf, FatFs wrote wrong data
+
+inst: FRAME-001 VERIFY-FAIL len=16070
+  - Written file failed SOI/EOI verification (data corruption)
+
+=====================================
+RAW CACHE BUILD
+=====================================
+
+raw-build: built=144/144 dec=0 sb=0 wr=0 vr=0 fill=0
+  - Full raw cache build from JPEGs:
+    built: successfully decoded and written
+    dec: JPEG decode failures
+    sb: source-black (all-black frames skipped)
+    wr: stream write failures
+    vr: stream verify failures
+    fill: gap-filled slots (copied from nearest valid neighbor)
+
+raw-remap: reuse=118 build=0 dec=26 sb=0 wr=0 fill=26 millis=51285 ms
+  - Rolling raw cache remap:
+    reuse: slots reused from old raw stream (no decode needed)
+    build: freshly decoded slots
+    dec: decode failures
+    fill: gap-filled from neighbors
+
+raw-meta: invalidated remap-dec=26 redownload-next-boot
+  - Raw cache meta invalidated due to decode failures
+  - Next boot will rebuild raw cache from scratch
+
+raw-del: f010 remap-dec
+  - JPEG file deleted because it failed decode during remap
+  - NOTE: this is destructive — file may be fine for playback
+
+dec-fail: /frames/f010.jpg no-eoi
+  - JPEG file read into buffer but no EOI (FF D9) marker found
+  - File data may be garbage (FatFs read corruption) or truly corrupt
+
+dec-fail: /frames/f010.jpg no-file
+  - JPEG file doesn't exist (previously deleted by raw-del)
+
+dec-fail: /frames/f010.jpg short=1234/16070
+  - File read returned fewer bytes than file size
+
+dec-fail: /frames/f010.jpg sz=0
+  - File is empty or exceeds MAX_JPEG_BYTES
+
+=====================================
+COMMIT + INTEGRITY
+=====================================
+
+cache-meta: dim write OK '320 176'
+  - Frame dimension metadata written during commit
+
+post-commit: corrupt idx=5 got=15000/16070
+  - Frame file corrupt AFTER commitTempFrames rename operations
+  - got < size means truncated read; jpegEffectiveLength=0 means bad data
+
+post-commit: bad-sz idx=5 sz=614
+  - File too small (< 7000 bytes) — likely a GIBS "no data" tile
+
+post-commit: 3/144 frames corrupt
+  - Summary of post-commit integrity check
+
+=====================================
+ANIMATION
+=====================================
+
+anim-start: millis=311187 ms
+  - Animation playback started
+
+loop: 1/3 valid=144 fc=144 newest=143 elapsed=26280 expected=23000 drift=3280 ms
+  - Loop N of LOOPS_BEFORE_SLEEP:
+    valid: playable frames in raw cache
+    fc: total frame count
+    newest: index of newest frame
+    elapsed: actual loop time (ms)
+    expected: target loop time (fc * FRAME_DELAY_MS)
+    drift: elapsed - expected (positive = slower than target)
+
+=====================================
+SLEEP + WAKE
+=====================================
+
+qmi: shake-to-wake WoM init ok INT1=GPIO21
+  - QMI8658 wake-on-motion initialized
+
+qmi: shake-wake armed INT1=1 wakeOn=LOW
+  - Sleep armed. INT1=current pin state, wakeOn=trigger level
+  - INT1 and wakeOn should be opposite (idle vs trigger)
+
+=====================================
+SYNC COMPLETION
+=====================================
+
+sync: roll done saved=144 reused=118 downloaded=26 rebuiltFast=1 zoomRefresh=1 millis=51300 ms
+  - Rolling sync completed:
+    saved: total frames in cache now
+    reused: frames kept from previous cache
+    downloaded: freshly downloaded frames
+    rebuiltFast: 1=remap/roll succeeded, 0=fell back to full rebuild
+    zoomRefresh: 1=zoom snapshots need refresh
+
+syncRolling=1 fc_after=144
+  - syncRolling: 1=was a rolling sync, 0=was full refresh
+  - fc_after: frame count after sync
+
+downloadFrames done fc=144 rdy=1 rawMeta=0
+  - Full download path completion
+  - rawMeta: 1=raw cache meta was already current (skipped rebuild)
+
+zoom: weather ok millis=143087 ms
+  - Zoom snapshots generated
+
+terrain: ok d=1 n=1
+  - Terrain tiles: d=day available, n=night available
+
+terrain-snap: ok millis=148995 ms
+  - Terrain snapshot saved
+
+post-sync: framesReady=1 frameCount=144
+  - Final state after all sync work
+
+=====================================
+COMMON PATTERNS
+=====================================
+
+HEALTHY BOOT (full download):
+  LogID → boot → wifi → ntp → ip-geo → sync: full-refresh →
+  download: done saved=144 → raw-build: built=144/144 → anim-start
+
+HEALTHY BOOT (rolling sync):
+  LogID → boot → wifi → ntp → ip-geo → sync: branch=roll →
+  sync: roll done saved=144 reused=141 downloaded=3 → anim-start
+
+PROBLEM: HTTP timeouts
+  dl-fail: i=14 HTTP--11 → download: done saved=122 http=22
+  Cause: GIBS server slow or ESP32 WiFi congestion
+  Fix: HTTP retry + request pacing
+
+PROBLEM: VERIFY-FAIL during download
+  inst: FRAME-001 POST file=d1c1ab55 (wrong data)
+  inst: FRAME-001 VERIFY-FAIL
+  Cause: Large file open during download corrupts FatFs reads
+  Fix: Removed rawInline path (stream file no longer open during downloads)
+
+PROBLEM: no-eoi during raw remap
+  dec-fail: /frames/f010.jpg no-eoi
+  raw-del: f010 remap-dec
+  Cause: Under investigation — JPEG reads return wrong data during remap
+  Note: JPEGs play fine in animation; only raw cache decode affected
+
+=====================================
+QUICK REFERENCE: ERROR CODES
+=====================================
+
+HTTP -1  = CONNECTION_REFUSED
+HTTP -4  = NOT_CONNECTED
+HTTP -5  = CONNECTION_LOST
+HTTP -11 = READ_TIMEOUT (most common)
+sync=258 = ESP_ERR_INVALID_ARG (esp_cache_msync, normal on S3)
+
+resetReason 1  = power-on
+resetReason 3  = software reset
+resetReason 8  = deep-sleep wake
+resetReason 11 = USB/JTAG (flash upload)

@@ -1,0 +1,521 @@
+THE FUCKUP SO FAR
+=================
+A field guide for incoming AI (or humans) to not repeat every mistake already made.
+Covers every confirmed pitfall, wrong assumption, and counterintuitive behaviour in the
+LiveSat / ESP32-S3-Touch-AMOLED-2.06 firmware as of 2026-03-08.
+
+Main firmware: /home/whisper/Desktop/LiveSat/esp32-LiveSat-s3/esp32-LiveSat-s3.ino
+Pipeline map:  /home/whisper/.claude/projects/-home-whisper-Desktop-LiveSat/memory/frame-pipeline.md
+Fixes log:     /home/whisper/Desktop/LiveSat/S3-Fixes.txt
+WoM debug log: /home/whisper/Desktop/LiveSat/Shake-Wake-Issue.txt
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 1 — HARDWARE & BOARD
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 1.1: GPIO21 is shared between AMOLED_PWR_EN and QMI8658_INT1 ───
+
+pins_arduino.h defines:
+  #define AMOLED_PWR_EN  21   (LGFX drives this OUTPUT HIGH at init)
+  #define QMI8658_INT1   21   (IMU wants to toggle this as push-pull output)
+
+Two push-pull drivers on the same physical pin. The ESP32 holds GPIO21 HIGH for
+display power and never lets it go. The QMI8658 cannot toggle a pin that the host
+is actively driving. ALL shake-to-wake failures until this was found were at the
+electrical level — configuration, threshold, and polarity were irrelevant.
+
+Fix: before arming GPIO wakeup, release the pin:
+  gpio_reset_pin((gpio_num_t)QMI8658_INT1);
+  pinMode(QMI8658_INT1, INPUT_PULLUP);     // pullup keeps display power ~HIGH
+After wake, restore:
+  pinMode(LCD_PWR, OUTPUT);
+  digitalWrite(LCD_PWR, HIGH);
+
+DO NOT try to fix shake-to-wake by adjusting threshold, polarity, defaultPinValue,
+or CTRL9 ACK. Those are not the problem.
+
+─── PITFALL 1.2: digitalRead() on an OUTPUT pin lies ───
+
+When GPIO21 is configured OUTPUT, digitalRead(QMI8658_INT1) returns the ESP32's
+own output register, not the physical line level. Any toggle-arming logic that reads
+the pin level while it is configured OUTPUT is reading stale/wrong data.
+
+─── PITFALL 1.3: This board has 32 MB flash, not 4 MB ───
+
+The generic FQBN esp32:esp32:esp32s3 defaults to 4 MB flash. Compiling with it and
+flashing produces a bootloader header that tells the ROM the flash is 4 MB. On this
+32 MB chip, the bootloader silently hangs after entry (no UART output). The correct
+FQBN is:
+  esp32:esp32:waveshare_esp32_s3_touch_amoled_206:PSRAM=enabled,PartitionScheme=max_app_32MB
+
+Also: erase_flash destroys the bootloader at 0x0 and partition table at 0x8000.
+arduino-cli upload alone does NOT restore them. After a full erase, flash the entire
+merged.bin via esptool.
+
+─── PITFALL 1.4: SD card uses SDMMC, not SPI ───
+
+Do NOT use SD.begin(CS_PIN, SPI, freq). The board routes SD to SDMMC pins
+(CLK=2, CMD=1, D0=3, CS=17). Use SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_*).
+
+─── PITFALL 1.5: SD path prefix double-prepend ───
+
+SD_MMC is mounted at "/sdcard". VFSImpl internally prepends "/sdcard" to every path
+you pass. If your paths already include "/sdcard/frames/f000.jpg", VFS produces
+"/sdcard/sdcard/frames/f000.jpg" — every file open fails silently.
+
+Define: #define SD_ROOT ""
+All file paths start at card root: "/frames/f000.jpg", "/frames/stream.raw", etc.
+
+─── PITFALL 1.6: No INT2 on the QMI8658 on this board ───
+
+Only INT1 (GPIO21) is defined and connected. INT2 is absent. Any code path that
+tries to use INTERRUPT_PIN_2 or INT2 does nothing on this hardware.
+
+─── PITFALL 1.7: DISP_W and DISP_H must be multiples of 16 ───
+
+JPEGDEC processes images in 16×16 MCU blocks. When image width is not a multiple
+of 16, the last MCU column is partial: pDraw->iWidthUsed < pDraw->iWidth. If you
+call pushImage() with iWidthUsed as the width, LovyanGFX uses it as the row stride
+but the pixel buffer has stride iWidth — every row after the first reads from the
+wrong offset and you get horizontal smearing.
+
+Current safe values: DISP_W=320 (20×16), DISP_H=176 (11×16). Do not change these
+to non-multiples of 16 without handling the partial-column case in jpegDraw.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 2 — MEMORY & INTERNAL DRAM
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 2.1: WiFiClientSecure (mbedTLS) needs ~35-40 KB contiguous internal DRAM ───
+
+SSL handshake fails with "connection refused" when internal DRAM free heap drops
+below ~50 KB. This happened when a 26 KB static display buffer (s_chunkBuf) was
+placed in BSS. Moving it to PSRAM restored SSL.
+
+Rule: NEVER put large static display or pixel buffers in global BSS / internal DRAM.
+Use heap_caps_malloc(size, MALLOC_CAP_SPIRAM) for anything > a few KB that isn't
+on a DMA path. Keep global BSS under ~200 KB to leave headroom for WiFi + SSL.
+
+─── PITFALL 2.2: PSRAM is safe for sequential display reads, not DMA ───
+
+The QSPI display driver reads pixel data sequentially. PSRAM buffers work fine.
+However, DMA-driven peripherals (I2S, some SPI modes) CANNOT source data from
+PSRAM — they require MALLOC_CAP_DMA which is internal DRAM only.
+
+─── PITFALL 2.3: LovyanGFX color type routing — uint32_t routes through RGB888 ───
+
+LovyanGFX fillRect / drawPixel are templated on the color argument type.
+  uint16_t fillColor → getSwap16() → correct RGB565 path
+  int fillColor      → getSwap16() → correct RGB565 path
+  uint32_t fillColor → color_convert<swap565_t, rgb888_t>() → interprets as RGB888
+
+TFT_GREEN = 0x07E0 (RGB565). Passed as uint32_t:
+  R=0x00=0, G=0x07=7, B=0xE0=224 → dominant blue on screen.
+
+Always declare color variables as uint16_t or int when holding RGB565 constants.
+Never uint32_t.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 3 — FRAME PIPELINE: DOWNLOAD & VALIDATION
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 3.1: GIBS serves partial composites at the lag boundary ───
+
+The most recent frame slot is the most likely to be corrupt. GIBS caches the
+satellite scan in progress; at the lag boundary the composite is incomplete.
+This produces a structurally valid, fully-decodable JPEG with a large black region
+in one or more corners. It passes SOI/EOI and minimum size checks.
+
+The download retry loop tries alternate timestamps (±60s, ±120s, ±180s). Validation
+rejection at download time causes fallback to an earlier fully-composited scan.
+
+Min size was raised from 5500 → 7000 bytes because a known-bad partial composite
+was 7265B — above the old threshold.
+
+─── PITFALL 3.2: Structural JPEG validity ≠ weather content validity ───
+
+cachedFrameLooksReusable() checks: file exists, size ≥ 7000, SOI marker, EOI marker.
+That is all. It does NOT decode the JPEG.
+
+Frames that pass this check can still:
+  - Fail the JPEG decoder (bad Huffman tables, truncated MCU stream) → dec-fail
+  - Decode to a black frame, cyan/white blocks, horizontal bands, slab corruption
+  - Be a semantically wrong image (yellow wash, wrong geographic content)
+
+Every layer of validation is necessary. Structural checks are the first gate only.
+
+─── PITFALL 3.3: validateBufferedWeatherFrameJpeg() and validateStoredWeatherFramePath() must stay in sync ───
+
+Any new pixel-level corruption detector must be wired into BOTH functions.
+Wiring it only at playback time (freeze-check) means corrupt frames enter the SD cache.
+Wiring it only at download time means stored/repaired frames bypass it.
+Check the validation coverage matrix in frame-pipeline.md §9 after adding any new detector.
+
+─── PITFALL 3.4: The botband corruption threshold was wrong for years ───
+
+spriteLooksBottomBandJunkCorrupted() originally required >= 3 dark/light MCU-row
+transitions in the bottom third. The actual corruption pattern produces exactly 2
+transitions. The bug let corrupted frames through download validation indefinitely.
+Current threshold: >= 2.
+
+If you adjust any corruption threshold, verify it against real corrupted frames
+from diag, not just against logic. Off-by-one in a threshold == months of bad frames.
+
+─── PITFALL 3.5: Slab detection thresholds false-positive on dark ocean ───
+
+scaledFrameLooksBlackSlabCorrupted() (playback) uses tighter thresholds than
+spriteLooksBlackSlabCorrupted() (download). The playback version originally used
+maxCh <= 8, which triggered on real dark Pacific Ocean pixels (maxCh ~6-8 per tile)
+causing every recent frame to fail freeze-check — animation jumped back 5 hours
+on every loop.
+
+Current playback thresholds: maxCh <= 5, spread <= 2, darkish ratio >= 50%.
+Download thresholds are calibrated separately.
+If you see false positives: check the maxCh distribution in diag before widening.
+
+─── PITFALL 3.6: dim.cfg must be written after every cache install ───
+
+/frames/dim.cfg records the current frame dimensions ("320 176").
+If it is missing, setup() sees a dimension mismatch and purges the entire frame cache.
+The cache-install path must call writeCurrentFrameDimMeta() on every successful install.
+meta.txt alone is not enough.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 4 — FRAME PIPELINE: RAW-BUILD & ROLLING SYNC
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 4.1: The partial-window-current fast path bypasses everything ───
+
+When sync determines:
+  cc == tf (cache count matches target frame count)
+  raw == 1 (raw cache meta is current)
+  keep == 1 (window overlap is full)
+
+...it skips rolling sync entirely. Any corrupt frames baked into stream.raw at that
+point are permanent until either:
+  a. A freeze-back detection fires and evicts them + invalidates raw meta.
+  b. A manual cache clear forces raw=0.
+
+Fixing only the buildRawPlaybackCache() path is not enough. Corruption that survives
+into stream.raw while raw=1 is sticky.
+
+─── PITFALL 4.2: Meta invalidation in buildRawPlaybackCache() causes a boot loop ───
+
+Adding "if (decFail > 0) SD.remove(RAW_CACHE_META_FILE)" to buildRawPlaybackCache()
+creates an infinite loop when decFail includes missing-file failures:
+
+  Boot N: 59 files are missing → decFail=59 → meta invalidated
+  Boot N+1: raw=0 → buildRawPlaybackCache again → same 59 files still missing
+            (rolling sync hasn't run yet because raw=0 triggers raw-build first)
+            → decFail=59 → meta invalidated again → repeat forever
+
+SD.remove of the corrupt source file is the correct eviction mechanism.
+Rolling sync will redownload the missing file via the reuse-invalid path — BUT ONLY
+if raw meta is current so the sync can run BEFORE any raw-build is triggered.
+
+DO NOT add meta invalidation to buildRawPlaybackCache().
+Meta invalidation is ONLY safe in remapRawPlaybackCacheRolling() and
+rebuildRawPlaybackCacheRolling() where decFail is typically 1-2 frames, not 59.
+
+─── PITFALL 4.3: Rolling sync only redownloads files that are MISSING from SD ───
+
+cachedFrameLooksReusable() checks file existence, SOI/EOI, and size. If a file is
+present but internally corrupt, it passes and is reused WITHOUT redownload.
+
+To force a redownload: SD.remove() the corrupt source file. After the file is gone,
+cachedFrameLooksReusable() returns false → reuse-invalid → rolling sync redownloads.
+
+Keeping corrupt files on SD = permanent reuse loop. Deleting them = automatic recovery.
+
+─── PITFALL 4.4: The remap copy pass reuses old stream slots, including gap-fills ───
+
+remapRawPlaybackCacheRolling() has two passes:
+  Pass 1: copy old stream slots by validity map (fast path, reuses existing raw data)
+  Pass 2: decode fNNN.jpg for any slot not covered by Pass 1
+
+If a file was deleted (SD.remove'd) then redownloaded by rolling sync, Pass 1 will
+try to copy the OLD gap-filled slot from the old stream — not the fresh file.
+The file-existence check (if !frameFileExists(i, 'f') continue) in Pass 1 is what
+forces those slots to fall through to Pass 2 where they get decoded fresh.
+If that check is removed, redownloaded frames get the old corrupt gap-fill data instead.
+
+─── PITFALL 4.5: decFail counts include "no-file" failures, not just decode errors ───
+
+When buildRawPlaybackCache() calls decodeJpegFrameToSprite() and the file is missing,
+it returns false (failure). That increments decFail. So decFail is not "N frames had
+bad JPEG data" — it is "N frames could not be decoded for any reason including missing."
+
+─── PITFALL 4.6: Gap-fill is a feature, not an error ───
+
+gapFillInvalidStreamSlotsInFile() copies nearest valid neighbor into zero-fill slots.
+This is intentional: rather than showing a black frame, the animation shows a repeated
+neighbor. A diag of "fill=65" does not mean the animation will be broken — it means
+65 slots are showing their neighbor. It may mean 65 source files are missing/corrupt.
+
+─── PITFALL 4.7: commitTempFrames() is non-transactional ───
+
+Rolling sync promotes temp frames ('n' prefix) to final ('f' prefix) by:
+  1. Deleting ALL existing fNNN.jpg files
+  2. Renaming all nNNN.jpg files to fNNN.jpg
+
+If the device loses power or crashes between steps 1 and 2, the cache is in a
+partially-destroyed state: some fNNN.jpg files are gone and the nNNN.jpg replacements
+have not been promoted. The device will see a partial cache on next boot.
+This is a known structural risk — not yet fixed. Do not assume commits are atomic.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 5 — QMI8658 WAKE-ON-MOTION
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 5.1: WoM interrupt is a toggle, not a stable level ───
+
+The official SensorLib example comment:
+  "When the QMI8658 is configured as Wom, the interrupt level is arbitrary,
+   not absolute high or low, and it is in the jump transition state."
+
+The INT1 pin TOGGLES on each WoM event, it does not latch high or low. This is
+why the official example uses attachInterrupt(pin, fn, CHANGE) — edge detection.
+
+ESP32 light sleep only supports level-triggered GPIO wakeup (GPIO_INTR_HIGH_LEVEL or
+GPIO_INTR_LOW_LEVEL). Edge-triggered wakeup is NOT available for light sleep.
+
+Working strategy: read current INT1 level, arm the OPPOSITE level. When the next
+WoM event fires, INT1 toggles to the armed level and wakes the ESP32.
+
+─── PITFALL 5.2: configMotion()+enableMotionDetect() does not work for light sleep ───
+
+The any-motion interrupt generates a pulse that is too brief for the ESP32 to catch
+at the level-triggered wakeup stage. Use configWakeOnMotion() which is designed for
+low-power WoM operation with a latching toggle output.
+
+─── PITFALL 5.3: ret==0 from configWakeOnMotion() is reliable ───
+
+There was a hypothesis that the CTRL9 ACK handshake might not be completing.
+It is not the problem. SensorLib performs a proper CTRL9 done/ACK handshake at
+SensorQMI8658.hpp line 1941. ret==0 means the configuration was accepted.
+
+─── PITFALL 5.4: getStatusRegister() does NOT clear the WoM latch ───
+
+Calling s_qmi.getStatusRegister() (reads STATUS1 / 0x2F only) does not clear the
+WoM toggle state. s_qmi.update() (reads STATUS_INT 0x2D + STATUS0 + STATUS1) also
+does not reset the pin to a stable level because WoM is a toggle, not a latch.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 6 — ANIMATION PLAYBACK
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 6.1: Slot-based frame selection causes timeline truncation ───
+
+If the animation loop maps slot number → frame position, and the loop runs N iterations
+at T ms/frame:
+  only (N * T / total_duration) of the timeline is shown.
+
+With 100 slots and frames taking 130 ms, only ~77 complete before the 10 s deadline —
+showing only the first 77% of the weather timeline. The last 23% is never shown.
+
+Fix: use TIME-based position mapping at each iteration:
+  srcPos = elapsed * validCount / animationDurationMs
+Even if only 77 iterations complete, they are distributed across 0–100% of the timeline.
+
+─── PITFALL 6.2: Loop time budget must use wall-clock deadlines ───
+
+Assuming each frame takes targetFrameDelayMs is wrong — decode time is variable.
+Use millis() comparisons at the top of each loop iteration. The loop should break
+when wall-clock elapsed >= animationDurationMs, not after N iterations.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 7 — WIFI & NETWORKING
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 7.1: s_wifiSyncInProgress is false during playback ───
+
+Gating WiFi RSSI display on (s_wifiSyncInProgress && WiFi.status() == WL_CONNECTED)
+always evaluates false during playback. The flag is cleared when sync ends.
+
+Use s_wifiRssi < 0 instead. s_wifiRssi is set to the measured RSSI (always negative
+dBm) after a successful connection and stays negative until power cycle. Zero means
+"never connected this session."
+
+─── PITFALL 7.2: disconnectWifiAfterSync() with AP mode keeps broadcasting ───
+
+Calling startWifiPortalServer(true) after sync enables AP+STA dual mode and keeps
+the "Sat Watch" AP visible to other devices even while the watch plays normally.
+Use startWifiPortalServer(false) to run the portal server on STA only.
+
+─── PITFALL 7.3: Portal WiFi does not auto-retry by default ───
+
+Without an explicit retry loop, the portal screen shows indefinitely and only
+connects if the user manually submits credentials. If you know the credentials
+are saved in NVS, the portal should retry known SSIDs on a periodic timer
+(currently: re-try every 60 seconds, restart on success).
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 8 — ZOOM SNAPSHOTS & TERRAIN
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 8.1: 2x supersampled zoom requests can fail at deeper zoom stages ───
+
+Requesting ZOOM_FETCH_W × ZOOM_FETCH_H (2x resolution) can fail at ZOOM2/ZOOM3 when
+the crop bounding box maps to a small pixel count that exceeds GIBS size limits.
+A failed 2x request must fall back to 1x — never abort the zoom stage entirely.
+
+─── PITFALL 8.2: Terrain and zoom share the same bbox but must not share the same fetch height ───
+
+Using ZOOM_FETCH_H (e.g. 344px) for terrain downloads only decodes half of the
+terrain rows (172/344 at 2x scale), padding the rest. The result is north-biased —
+the geographic center pin appears too far south on the terrain overlay.
+
+Terrain needs TERRAIN_FETCH_H = DISP_H * 2 (full height at 2x). Do not reuse
+the zoom fetch dimensions for terrain.
+
+─── PITFALL 8.3: Terrain day/night are NOT an all-or-nothing pair ───
+
+If one terrain layer (day or night) fails to download, the other should still be
+used. If the pair check is strict, a single transient failure collapses both the
+terrain wipe stage and the radar overlay. Copy the successful side into the missing
+slot, keep prior usable copies, only fail when neither side is available.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 9 — CACHE METADATA & VERSIONING
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 9.1: There are multiple metadata files with different scopes ───
+
+  RAW_CACHE_META_FILE:        controls whether stream.raw is valid and current
+                              raw=1 enables the fast path (skips full rebuild)
+                              raw=0 forces buildRawPlaybackCache() or rebuild
+
+  CACHE_VALIDATE_META_FILE:   controls whether the full stored-frame repair scan
+                              (validateAndRepairFullCacheIfNeeded) needs to run.
+                              Does NOT control raw-build decisions.
+
+  FRAME_DIM_FILE (dim.cfg):   records frame dimensions "320 176".
+                              Missing = dimension mismatch = entire cache purged.
+
+  meta.txt:                   records frame count and timestamps.
+                              Does NOT replace dim.cfg.
+
+Invalidating the wrong meta file does nothing for the problem you are trying to fix.
+
+─── PITFALL 9.2: RAW_CACHE_VERSION bump is required after any raw-format change ───
+
+Changing DISP_W, DISP_H, SCALED_W, SCALED_H, or raw slot layout without bumping
+RAW_CACHE_VERSION causes old stream.raw data to be played back at wrong dimensions.
+Bump the version any time the raw stream binary format or frame resolution changes.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 10 — FREEZE-BACK & EVICTION
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 10.1: Freeze-back detection does NOT evict by default ───
+
+The freeze-back loop (currentScaledFreezeFrameLooksCorrupted()) detects corruption
+at playback time and walks back to a clean frame. Without explicitly:
+  - SD.remove(fNNN.jpg) for each corrupt frame detected
+  - SD.remove(RAW_CACHE_META_FILE) + s_rawMetaVersionCurrent=false
+
+...the corrupt frames survive in stream.raw indefinitely. The walk-back only skips
+them THIS boot; next boot they are still there. Detection without eviction is useless
+for persistent corruption.
+
+─── PITFALL 10.2: Freeze-back only fires if you reach the freeze frame ───
+
+Corruption at the lag boundary (newest frames) is detected at freeze-hold time.
+Corruption in the middle of the animation (earlier frames) is NOT detected by
+freeze-back — it passes through animation without triggering the check.
+
+─── PITFALL 10.3: Eviction during freeze-back is safe; eviction during raw-build is a loop risk ───
+
+Freeze-back evicts 1-2 lag-boundary frames. The remaining ~140 frames are clean.
+On next boot, rolling sync redownloads 1-2 missing slots and raw-build completes
+cleanly (decFail=0 or 1 after redownload).
+
+In contrast, eviction during buildRawPlaybackCache (meta invalidation on decFail)
+was unsafe because decFail=59 missing-file failures persisted every boot, making
+raw=0 permanent and preventing rolling sync from ever running.
+Scale of eviction matters. 1-2 frames: safe. 59 frames: loop.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+SECTION 11 — MISC / DO NOT REPEAT
+═══════════════════════════════════════════════════════════════════════════════
+
+─── PITFALL 11.1: ESP.restart() without SD_MMC.end() corrupts the SD filesystem ───
+
+FatFS maintains an in-memory sector cache for the FAT allocation table. Calling
+ESP.restart() without first calling SD_MMC.end() leaves the FAT dirty sectors
+uncommitted on the physical card. After reboot, SD_MMC.begin() reads the stale
+FAT from disk — file data that was written this boot may appear truncated (no-eoi)
+or internally corrupt (decode failures) because the FAT chain pointing to those
+clusters was never written.
+
+This caused 78 of 141 cached JPEG files to corrupt after every auto-update reboot.
+
+There are 5 restart sites in the firmware. ALL of them require SD_MMC.end() first:
+  1. Portal settings-saved handler
+  2. Portal clear-frames handler
+  3. Portal WiFi-retry success path
+  4. AXP2101 PKEY short-press handler
+  5. autoUpdateDueNow() in loop()
+
+SD_MMC.end() is already correctly called before light sleep entry. Only the
+restart paths were missing it.
+
+Rule: SD_MMC.end() before ESP.restart(), always. No exceptions.
+
+─── Battery indicator color ───
+Declare color variables as uint16_t or int. Never uint32_t with RGB565 constants.
+uint32_t routes through LovyanGFX's RGB888 path and all colors are wrong.
+
+─── Audio cue must have a fallback ───
+If the configured cue file is missing, preload fails silently and no chime plays.
+Always fall back to /power_up.raw if selected cue file cannot be opened.
+
+─── vld: MISS BLOCK-CORR appears every boot ───
+This diag line predates all current fixes and its origin is unknown. It is not
+blocking anything. Do not chase it as the cause of unrelated symptoms.
+
+─── AP broadcasting after sync ───
+startWifiPortalServer(true) = AP+STA dual mode = AP stays visible after sync.
+startWifiPortalServer(false) = STA-only portal. Use false in disconnectWifiAfterSync().
+
+─── Full-cache repair (validateAndRepairFullCacheIfNeeded) must run on fast-path boots ───
+The fast path (latest-current, exact-current) can skip redownload but must still
+call validateAndRepairFullCacheIfNeeded() before marking the boot complete.
+Without it, a poisoned cached JPEG can survive indefinitely because the repair scan
+never gets to run on cache-current boots.
+
+─── Semantic outlier check must be applied at raw-build time, not just download ───
+A cached JPEG can be structurally valid and pass download validation but contain
+wrong weather content (wrong geographic region, yellow wash, color artifact).
+weatherFrameLooksSemanticOutlier() must run in the raw-build path, not just
+validateBufferedWeatherFrameJpeg(). Detection at build time prevents baking the
+outlier into stream.raw.
+
+
+═══════════════════════════════════════════════════════════════════════════════
+KNOWN STRUCTURAL RISKS (not yet fixed as of 2026-03-08)
+═══════════════════════════════════════════════════════════════════════════════
+
+1. commitTempFrames() is non-transactional. Mid-commit power loss leaves cache
+   partially destroyed. No atomic rename or recovery mechanism exists.
+
+2. Partial-keep and partial-trim cache branches allow frame count to drift below
+   target across many boots without forcing recovery or redownload.
+
+3. Semantic outlier validation weakens as the cache degrades — the reference
+   distribution loses signal when many neighbors are already invalid.
+
+4. The "vld: MISS BLOCK-CORR" diag line appears every boot, origin unknown.
+
+
