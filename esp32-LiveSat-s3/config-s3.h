@@ -39,3 +39,6 @@
 #define SLEEP_HOURS          6    // hours to sleep between play sessions
 
 #define ENABLE_SERIAL_DIAG 1
+
+// Uncomment for off-season hurricane watch testing (injects fake Cat 3 storm)
+// #define HURRICANE_TEST_MODE 1

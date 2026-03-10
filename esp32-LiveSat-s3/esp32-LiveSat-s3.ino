@@ -466,9 +466,16 @@ RTC_DATA_ATTR static time_t s_lastRadarUtc = 0;
 RTC_DATA_ATTR static bool   s_lastRadarUtcValid = false;
 static bool s_radarMetaLoaded = false;
 static bool s_radarNoSignatures = false;  // download succeeded but no precipitation echoes ("Clear")
+RTC_DATA_ATTR static time_t s_lastRadarCheckUtc = 0;  // when radar was last polled (for "Clear" age)
 static bool s_radarDownloadFailed = false; // download itself failed — outside coverage or service error ("no sig")
 static bool s_topBarUseRadarScanTime = false; // Terrain stage shows radar scan time/min age in top bar.
 static bool s_zoomSnapshotsRefreshPending = false;
+
+// ── Moon phase complication ──────────────────────────────────────────────
+#define MOON_FRAME_COUNT  30
+#define MOON_DECODED_PX   54   // 216 / 4 = 54 (JPEG_SCALE_QUARTER)
+static uint16_t* s_moonBuf = nullptr;      // PSRAM, MOON_DECODED_PX² pixels
+static bool      s_moonDrawn = false;       // one-shot: AMOLED retains pixels
 // Weather zoom stages only refresh when new weather frames were downloaded
 // in this sync cycle (or when zoom assets are missing/stale).
 static bool s_zoomWeatherRefreshNeeded = false;
@@ -529,6 +536,35 @@ static char     s_syncProgPhaseLabel[24] = "sync";
 
 RTC_DATA_ATTR static bool s_sleepModeEnabled = true;
 RTC_DATA_ATTR static bool s_autoUpdateInSleep = true;
+
+// ── Hurricane Watch ─────────────────────────────────────────────────────────
+struct HurricaneInfo {
+  char     id[12];         // ATCF ID: "AL092025"
+  char     name[20];       // "KATRINA"
+  float    lat;            // Current center latitude
+  float    lon;            // Current center longitude
+  uint8_t  category;       // Saffir-Simpson 0(TD/TS) or 1-5
+  uint16_t windKt;         // Max sustained wind (knots)
+  uint16_t pressureMb;     // MSLP
+  time_t   advisoryUtc;    // Advisory timestamp
+  char     stormType[4];   // "HU", "TS", "TD"
+};
+
+RTC_DATA_ATTR static bool          s_hurricaneMode = false;
+RTC_DATA_ATTR static HurricaneInfo s_activeStorm = {};
+RTC_DATA_ATTR static float         s_savedWeatherCenterLat = 0.0f;
+RTC_DATA_ATTR static float         s_savedWeatherCenterLon = 0.0f;
+RTC_DATA_ATTR static bool          s_savedWeatherGeoValid = false;
+RTC_DATA_ATTR static char          s_lastHurricaneAlertId[12] = {};
+
+static bool    s_hurricaneWatchEnabled = false;
+static bool    s_hurricaneIncludeTS = false;
+static bool    s_hurricaneIncludeTD = false;
+static uint8_t s_hurricaneAlertVolume = 200;
+static char    s_hurricaneAlertSound[32] = "/hurricane_alert.raw";
+static int     s_hurricaneLoopsSinceCheck = 0;
+// ─────────────────────────────────────────────────────────────────────────────
+
 static int s_loopsBeforeSleep = LOOPS_BEFORE_SLEEP;
 static bool s_shakeToWakeEnabled = false;
 static uint16_t s_shakeEntryIgnoreMs = 2000;  // ignore WoM for this long after entering sleep (settle window)
@@ -748,12 +784,37 @@ static void loadWifiPortalConfig() {
         s_shakeConfirmMs = (uint16_t)dbms;
       }
       s_lastSuccessfulSyncUtc = (time_t)prefs.getULong64("lsyn", 0ULL);
+      // Hurricane watch config
+      s_hurricaneWatchEnabled = prefs.getBool("hwen", false);
+#ifdef HURRICANE_TEST_MODE
+      s_hurricaneWatchEnabled = true;  // force-enable for testing
+#endif
+      s_hurricaneIncludeTS = prefs.getBool("hwts", false);
+      s_hurricaneIncludeTD = prefs.getBool("hwtd", false);
+      int hwvol = prefs.getUChar("hwvol", 200);
+      if (hwvol < 0) hwvol = 0;
+      if (hwvol > 255) hwvol = 255;
+      s_hurricaneAlertVolume = (uint8_t)hwvol;
+      prefs.getString("hwsnd", s_hurricaneAlertSound, sizeof(s_hurricaneAlertSound));
+      if (s_hurricaneAlertSound[0] == '\0')
+        strlcpy(s_hurricaneAlertSound, "/hurricane_alert.raw", sizeof(s_hurricaneAlertSound));
     }
     prefs.end();
   }
 
   refreshWifiDisplayNameFromConfig();
   s_wifiConfigLoaded = true;
+}
+
+static void saveHurricaneConfig() {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", false)) return;
+  prefs.putBool("hwen", s_hurricaneWatchEnabled);
+  prefs.putBool("hwts", s_hurricaneIncludeTS);
+  prefs.putBool("hwtd", s_hurricaneIncludeTD);
+  prefs.putUChar("hwvol", s_hurricaneAlertVolume);
+  prefs.putString("hwsnd", s_hurricaneAlertSound);
+  prefs.end();
 }
 
 static void saveSleepModePreference(bool enabled) {
@@ -1170,6 +1231,61 @@ static void sendWifiPortalPage() {
               ".catch(function(){if(b)b.textContent='(fetch failed)';});"
             "}"
             "</script>"
+            "<div class='card' style='margin-top:14px;border:1px solid #f59e0b;'>"
+              "<h2 style='color:#fbbf24;margin-bottom:8px;'>Hurricane Watch</h2>"
+              "<label style='display:flex;align-items:center;gap:6px;margin-bottom:8px;'>"
+                "<input type='checkbox' name='hwen' value='1' style='width:auto;'"
+  );
+  if (s_hurricaneWatchEnabled) html += " checked";
+  html += F(
+                "> Watch for Atlantic hurricanes (Cat 1+)"
+              "</label>"
+              "<label style='display:flex;align-items:center;gap:6px;margin-bottom:8px;'>"
+                "<input type='checkbox' name='hwts' value='1' style='width:auto;'"
+  );
+  if (s_hurricaneIncludeTS) html += " checked";
+  html += F(
+                "> Also notify for tropical storms"
+              "</label>"
+              "<label style='display:flex;align-items:center;gap:6px;margin-bottom:8px;'>"
+                "<input type='checkbox' name='hwtd' value='1' style='width:auto;'"
+  );
+  if (s_hurricaneIncludeTD) html += " checked";
+  html += F(
+                "> Also notify for tropical depressions"
+              "</label>"
+              "<div class='hint' style='margin-top:4px;'>Alert volume (0-255): </div>"
+              "<input type='number' name='hwvol' min='0' max='255' value='"
+  );
+  html += String((int)s_hurricaneAlertVolume);
+  html += F(
+              "' style='width:80px;'>"
+              "<div class='hint' style='margin-top:4px;'>Alert sound SD path: </div>"
+              "<input type='text' name='hwsnd' value='"
+  );
+  html += String(s_hurricaneAlertSound);
+  html += F(
+              "' style='width:100%;'>"
+  );
+  // Show suppression list (read-only)
+  {
+    Preferences prefs;
+    char supList[128] = {};
+    if (prefs.begin("satwatch", true)) {
+      prefs.getString("hwsup", supList, sizeof(supList));
+      prefs.end();
+    }
+    if (supList[0] != '\0') {
+      html += F("<div class='hint' style='margin-top:8px;'>Suppressed storms: ");
+      html += String(supList);
+      html += F("</div>");
+    }
+  }
+  html += F(
+              "<form method='POST' action='/hwclearsup' style='margin-top:8px;'>"
+                "<button type='submit' style='background:#374151;width:auto;padding:4px 14px;font-size:13px;'>Clear suppression list</button>"
+              "</form>"
+            "</div>"
             "<div class='card' style='margin-top:16px;'>"
               "<h2 style='display:flex;align-items:center;gap:10px;margin-bottom:10px;'>Boot Log"
               "<button type='button' onclick='loadDiag()' style='width:auto;padding:4px 14px;font-size:13px;margin:0;background:#374151;'>Refresh</button>"
@@ -1260,6 +1376,24 @@ static void handleWifiPortalSave() {
   int shakeConfirmMs = s_wifiPortalServer.arg("stwkdbms").toInt();
   if (shakeConfirmMs < 0) shakeConfirmMs = 0;
   if (shakeConfirmMs > 2000) shakeConfirmMs = 2000;
+  // Hurricane watch config
+  s_hurricaneWatchEnabled = s_wifiPortalServer.hasArg("hwen");
+  s_hurricaneIncludeTS = s_wifiPortalServer.hasArg("hwts");
+  s_hurricaneIncludeTD = s_wifiPortalServer.hasArg("hwtd");
+  {
+    int hvol = s_wifiPortalServer.arg("hwvol").toInt();
+    if (hvol < 0) hvol = 0;
+    if (hvol > 255) hvol = 255;
+    s_hurricaneAlertVolume = (uint8_t)hvol;
+  }
+  {
+    String hwsnd = s_wifiPortalServer.arg("hwsnd");
+    hwsnd.trim();
+    if (hwsnd.length() > 0)
+      hwsnd.toCharArray(s_hurricaneAlertSound, sizeof(s_hurricaneAlertSound));
+  }
+  saveHurricaneConfig();
+
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
                        (StartCueMode)mode, (uint8_t)chimeVol, autoUpdateInSleep,
                        schedCount, schedMins, loopsBeforeSleep, shakeToWake,
@@ -1281,6 +1415,16 @@ static void sendDiagHandler() {
   }
   s_wifiPortalServer.streamFile(f, "text/plain");
   f.close();
+}
+
+static void handleClearHurricaneSuppression() {
+  Preferences prefs;
+  if (prefs.begin("satwatch", false)) {
+    prefs.putString("hwsup", "");
+    prefs.end();
+  }
+  s_wifiPortalServer.sendHeader("Location", "/", true);
+  s_wifiPortalServer.send(302, "text/plain", "");
 }
 
 static void handleClearFrames() {
@@ -1447,6 +1591,7 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/diag", HTTP_GET, sendDiagHandler);
   s_wifiPortalServer.on("/ls", HTTP_GET, sendLsHandler);
   s_wifiPortalServer.on("/clearframes", HTTP_POST, handleClearFrames);
+  s_wifiPortalServer.on("/hwclearsup", HTTP_POST, handleClearHurricaneSuppression);
   s_wifiPortalServer.on("/frame", HTTP_GET, handleServeFrame);
   s_wifiPortalServer.on("/gravity", HTTP_GET, handleGravity);
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
@@ -2496,7 +2641,8 @@ static void showMessage(const char* line1, const char* line2 = nullptr) {
 #if BOARD_IS_AMOLED_206
   int screenW = s_amoledOut ? s_amoledOut->width() : AMOLED_WIDTH;
   int screenH = s_amoledOut ? s_amoledOut->height() : AMOLED_HEIGHT;
-  if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
+  uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;  // visible dark red or black
+  if (s_amoledOut) s_amoledOut->fillScreen(bg);
   if (s_amoledOut) {
     s_amoledOut->setTextColor(0xFFFF);
     s_amoledOut->setTextSize(2);
@@ -2541,14 +2687,24 @@ static void drawProgressBarUi(uint32_t current, uint32_t total, const char* labe
   int barY = progressTextY + 12;
   int barW = (int)((long)screenW * (long)current / (long)total);
 
+  uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;        // visible dark red or black
+  uint16_t trackBg = s_hurricaneMode ? 0xC000 : 0x2104;   // medium red or dark grey
+
+  // Fill areas above and below bar+text with background color
+  if (s_hurricaneMode) {
+    s_amoledOut->fillRect(0, 0, screenW, progressTextY - 2, bg);
+    int barBottom = barY + barH;
+    s_amoledOut->fillRect(0, barBottom, screenW, screenH - barBottom, bg);
+  }
+
   s_amoledOut->fillRect(0, barY, barW, barH, 0x07E0);
-  s_amoledOut->fillRect(barW, barY, screenW - barW, barH, 0x2104);
+  s_amoledOut->fillRect(barW, barY, screenW - barW, barH, trackBg);
 
   char buf[64];
   snprintf(buf, sizeof(buf), "%s  %lu%%", label ? label : "sync", (unsigned long)percent);
   s_amoledOut->setTextColor(0xFFFF);
   s_amoledOut->setTextSize(1);
-  s_amoledOut->fillRect(0, progressTextY - 2, screenW, 12, 0x0000);
+  s_amoledOut->fillRect(0, progressTextY - 2, screenW, 12, bg);
   s_amoledOut->setCursor(4, progressTextY);
   s_amoledOut->print(buf);
 #else
@@ -2916,6 +3072,26 @@ static void copyBarSpriteToBuffer(uint16_t* dst, size_t npixels) {
   }
 }
 
+// Lazy-create the shared bar sprite used by both normal and hurricane renderers.
+static void ensureBarSpriteReady() {
+  if (s_barSpriteReady) return;
+  s_barSprite.setColorDepth(16);
+  s_barSprite.setSwapBytes(false);
+#if BOARD_HAS_PSRAM_SPRITES
+  s_barSprite.setPsram(psramFound());
+#endif
+  s_barSpriteReady = (bool)s_barSprite.createSprite(SCALED_W, SCALED_BAR_SPRITE_H);
+  if (s_barSpriteReady) {
+    uint16_t* barProbe = (uint16_t*)s_barSprite.getBuffer();
+    if (barProbe) {
+      s_barSprite.fillScreen(0);
+      s_barSprite.drawPixel(0, 0, 0xF800);  // pure red in RGB565
+      s_barSpritePixelsByteSwapped = (barProbe[0] == 0x00F8);
+      s_barSprite.fillScreen(0);
+    }
+  }
+}
+
 // Render timestamp bar text directly at display resolution.
 // Top rows use SCALED_TOP_ROW_H; bottom row uses SCALED_BAR_H.
 // into s_topBarBuf / s_botBarBuf. Avoids the 2× vertical upscale that makes bitmap
@@ -2924,24 +3100,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
   if (!s_topBarBuf || !s_botBarBuf) return;
   if (frameIdx >= frameCount || !s_timesLoaded) return;
 
-  // Lazy-create bar sprite for a single metadata row.
-  if (!s_barSpriteReady) {
-    s_barSprite.setColorDepth(16);
-    s_barSprite.setSwapBytes(false);
-#if BOARD_HAS_PSRAM_SPRITES
-    s_barSprite.setPsram(psramFound());
-#endif
-    s_barSpriteReady = (bool)s_barSprite.createSprite(SCALED_W, SCALED_BAR_SPRITE_H);
-    if (s_barSpriteReady) {
-      uint16_t* barProbe = (uint16_t*)s_barSprite.getBuffer();
-      if (barProbe) {
-        s_barSprite.fillScreen(0);
-        s_barSprite.drawPixel(0, 0, 0xF800);  // pure red in RGB565
-        s_barSpritePixelsByteSwapped = (barProbe[0] == 0x00F8);
-        s_barSprite.fillScreen(0);
-      }
-    }
-  }
+  ensureBarSpriteReady();
   if (!s_barSpriteReady) return;
 
   loadRadarMetaIfNeeded();
@@ -2982,7 +3141,13 @@ static void renderBarsAtScaledRes(int frameIdx) {
     if (radarMins < 0) radarMins = 0;
     snprintf(radarBuf, sizeof(radarBuf), "Radar: %d min", radarMins);
   } else if (s_radarNoSignatures) {
-    snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear");
+    if (s_lastRadarCheckUtc > 0) {
+      int clearMins = (int)(difftime(nowForAge, s_lastRadarCheckUtc) / 60.0 + 0.5);
+      if (clearMins < 0) clearMins = 0;
+      snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear %dm", clearMins);
+    } else {
+      snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear");
+    }
   } else if (s_radarDownloadFailed) {
     snprintf(radarBuf, sizeof(radarBuf), "Radar: no sig");
   } else {
@@ -3145,6 +3310,718 @@ static void renderBarsAtScaledRes(int frameIdx) {
   }
   copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Hurricane Watch — storm bars, NOAA poll, suppression, mode enter/exit
+// ═══════════════════════════════════════════════════════════════════════════
+
+static uint16_t hurricaneCategoryColor(uint8_t cat) {
+  switch (cat) {
+    case 1:  return 0xFE60;  // yellow
+    case 2:  return 0xFCC0;  // orange
+    case 3:  return 0xF800;  // red
+    case 4:
+    case 5:  return 0xF81F;  // magenta
+    default: return 0x07FF;  // cyan (TS/TD)
+  }
+}
+
+static bool s_hurricaneBarsLoggedOnce = false;
+
+static void renderHurricaneStormBars(int frameIdx) {
+  if (!s_topBarBuf || !s_botBarBuf) return;
+  ensureBarSpriteReady();
+  if (!s_barSpriteReady) return;
+  if (!s_hurricaneBarsLoggedOnce) {
+    s_hurricaneBarsLoggedOnce = true;
+  }
+
+  // --- Top bar row 0: battery/wifi (reuse normal) ---
+  s_batPct = readAxp2101BatPct();
+  s_batChargeState = readAxp2101ChargeState();
+  refreshCachedWifiDisplayState();
+  s_barSprite.fillScreen(0x0000);
+  {
+    int iconH = SCALED_TOP_ROW_H - 6;
+    int iconW = iconH * 5 / 2;
+    int iconX = SCALED_W - iconW - 6;
+    int iconY = (SCALED_TOP_ROW_H - iconH) / 2;
+    char pctBuf[6];
+    int batPct = (int)s_batPct;
+    if (batPct >= 0) snprintf(pctBuf, sizeof(pctBuf), "%d%%", (batPct > 100) ? 100 : batPct);
+    else snprintf(pctBuf, sizeof(pctBuf), "--");
+    s_barSprite.setTextWrap(false);
+    s_barSprite.setTextColor(TFT_WHITE, TFT_BLACK);
+    s_barSprite.setTextSize(2);
+    int pctW = s_barSprite.textWidth(pctBuf);
+    if (pctW > 54) { s_barSprite.setTextSize(1); pctW = s_barSprite.textWidth(pctBuf); }
+    int pctH = s_barSprite.fontHeight();
+    int pctX = iconX - pctW - 6; if (pctX < 4) pctX = 4;
+    int pctY = (SCALED_TOP_ROW_H - pctH) / 2; if (pctY < 1) pctY = 1;
+    s_barSprite.setCursor(pctX, pctY);
+    s_barSprite.print(pctBuf);
+    drawBatteryIcon(s_barSprite, iconX, iconY, iconW, iconH, batPct, s_batChargeState);
+  }
+  copyBarSpriteToBuffer(s_topBarBuf, (size_t)SCALED_W * SCALED_TOP_ROW_H);
+
+  // --- Top bar row 1: storm name + category ---
+  s_barSprite.fillScreen(0x0000);
+  {
+    char nameBuf[48];
+    if (strcmp(s_activeStorm.stormType, "HU") == 0)
+      snprintf(nameBuf, sizeof(nameBuf), "HURRICANE %s", s_activeStorm.name);
+    else if (strcmp(s_activeStorm.stormType, "TS") == 0)
+      snprintf(nameBuf, sizeof(nameBuf), "T.S. %s", s_activeStorm.name);
+    else
+      snprintf(nameBuf, sizeof(nameBuf), "T.D. %s", s_activeStorm.name);
+
+    char catBuf[8];
+    if (s_activeStorm.category >= 1)
+      snprintf(catBuf, sizeof(catBuf), "CAT %d", s_activeStorm.category);
+    else if (strcmp(s_activeStorm.stormType, "TS") == 0)
+      strlcpy(catBuf, "TS", sizeof(catBuf));
+    else
+      strlcpy(catBuf, "TD", sizeof(catBuf));
+
+    float ts = 2.0f;
+    s_barSprite.setTextSize(ts);
+    int totalW = s_barSprite.textWidth(nameBuf) + s_barSprite.textWidth(catBuf) + 20;
+    while (totalW > SCALED_W && ts > 1.0f) {
+      ts -= 0.1f;
+      s_barSprite.setTextSize(ts);
+      totalW = s_barSprite.textWidth(nameBuf) + s_barSprite.textWidth(catBuf) + 20;
+    }
+    int fh = s_barSprite.fontHeight();
+    int ty = (SCALED_TOP_ROW_H - fh) / 2; if (ty < 1) ty = 1;
+
+    s_barSprite.setTextColor(TFT_WHITE);
+    s_barSprite.setCursor(4, ty);
+    s_barSprite.print(nameBuf);
+
+    uint16_t catColor = hurricaneCategoryColor(s_activeStorm.category);
+    s_barSprite.setTextColor(catColor);
+    int catW = s_barSprite.textWidth(catBuf);
+    s_barSprite.setCursor(SCALED_W - catW - 4, ty);
+    s_barSprite.print(catBuf);
+  }
+  copyBarSpriteToBuffer(s_topBarBuf + (size_t)SCALED_W * SCALED_TOP_ROW_H,
+                        (size_t)SCALED_W * SCALED_TOP_ROW_H);
+
+  // --- Bottom bar: wind/pressure + advisory age ---
+  s_barSprite.fillScreen(0x0000);
+  {
+    char windBuf[32];
+    snprintf(windBuf, sizeof(windBuf), "%u kt  %u mb",
+             (unsigned)s_activeStorm.windKt, (unsigned)s_activeStorm.pressureMb);
+
+    char ageBuf[32];
+    time_t now = currentUtcForAgeMetrics();
+    int ageMin = (int)(difftime(now, s_activeStorm.advisoryUtc) / 60.0 + 0.5);
+    if (ageMin < 0) ageMin = 0;
+    if (ageMin >= 120)
+      snprintf(ageBuf, sizeof(ageBuf), "%dh ago", ageMin / 60);
+    else
+      snprintf(ageBuf, sizeof(ageBuf), "%dm ago", ageMin);
+
+    float bottomTs = 2.0f;
+    s_barSprite.setTextSize(bottomTs);
+    int totalW = s_barSprite.textWidth(windBuf) + s_barSprite.textWidth(ageBuf) + 20;
+    while (totalW > SCALED_W && bottomTs > 1.0f) {
+      bottomTs -= 0.1f;
+      s_barSprite.setTextSize(bottomTs);
+      totalW = s_barSprite.textWidth(windBuf) + s_barSprite.textWidth(ageBuf) + 20;
+    }
+    int botFh = s_barSprite.fontHeight();
+    int by = (SCALED_BAR_H - botFh) / 2; if (by < 0) by = 0;
+
+    s_barSprite.setTextColor(TFT_WHITE);
+    s_barSprite.setCursor(4, by);
+    s_barSprite.print(windBuf);
+
+    int ageW = s_barSprite.textWidth(ageBuf);
+    s_barSprite.setCursor(SCALED_W - ageW - 4, by);
+    s_barSprite.print(ageBuf);
+  }
+  copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
+}
+
+// Draw "Reboot for local weather" in the black border below the frame.
+// Uses direct AMOLED text draw (same approach as showMessage).
+static bool s_hurricaneHintDrawn = false;
+
+static void drawHurricaneRebootHint(uint16_t* buf) {
+  (void)buf;
+  if (!s_amoledOut || s_hurricaneHintDrawn) return;
+
+  int screenW = s_amoledOut->width();
+  int frameBottom = (AMOLED_HEIGHT - SCALED_H) / 2 + SCALED_H;  // 71 + 360 = 431
+  int borderH = AMOLED_HEIGHT - frameBottom;  // 71px
+
+  // Clear the bottom border
+  s_amoledOut->fillRect(0, frameBottom, screenW, borderH, 0x0000);
+
+  // Draw text directly to AMOLED
+  const char* hint = "Reboot for local weather";
+  s_amoledOut->setTextColor(0xFFFF);
+  s_amoledOut->setTextSize(2);
+  int cx = screenW / 2 - (int)(strlen(hint) * 6 * 2) / 2;  // 6px per char at size 1, *2 for size 2
+  int cy = frameBottom + (borderH - 16) / 2;  // 16px tall at size 2
+  if (cx < 2) cx = 2;
+  s_amoledOut->setCursor(cx, cy);
+  s_amoledOut->print(hint);
+
+  s_hurricaneHintDrawn = true;
+}
+
+// ── Storm Bbox Computation ────────────────────────────────────────────────
+static void computeStormBbox(float lat, float lon, uint8_t category,
+                             float* west, float* south, float* east, float* north) {
+  float radiusKm;
+  switch (category) {
+    case 1:  radiusKm = 800.0f; break;
+    case 2:  radiusKm = 700.0f; break;
+    case 3:  radiusKm = 600.0f; break;
+    case 4:  radiusKm = 500.0f; break;
+    case 5:  radiusKm = 450.0f; break;
+    default: radiusKm = 900.0f; break;  // TD/TS — wider view
+  }
+  float cosLat = cosf(lat * 0.01745329252f);
+  if (cosLat < 0.2f) cosLat = 0.2f;
+  float dLat = radiusKm / 111.32f;
+  float dLon = radiusKm / (111.32f * cosLat);
+  float aspectRatio = 41.0f / 36.0f;
+  if (dLon / dLat < aspectRatio) dLon = dLat * aspectRatio;
+  else dLat = dLon / aspectRatio;
+
+  float w = lon - dLon, e2 = lon + dLon;
+  float s = lat - dLat, n = lat + dLat;
+  if (s < -89.5f) s = -89.5f;
+  if (n >  89.5f) n =  89.5f;
+  if (w < -180.0f) w = -180.0f;
+  if (e2 > 180.0f) e2 = 180.0f;
+  if (west)  *west  = w;
+  if (south) *south = s;
+  if (east)  *east  = e2;
+  if (north) *north = n;
+}
+
+// ── NOAA Poll + JSON Parse ────────────────────────────────────────────────
+static bool parseNoaaStormJson(const String& body, HurricaneInfo* storms,
+                               int maxStorms, int* outCount) {
+  *outCount = 0;
+  const char* s = body.c_str();
+  const char* cursor = s;
+
+  while (*outCount < maxStorms) {
+    const char* propStart = strstr(cursor, "\"properties\"");
+    if (!propStart) break;
+    // Find the closing brace for this properties block
+    const char* braceOpen = strchr(propStart, '{');
+    if (!braceOpen) break;
+    // Find the next "properties" or end to bound the search
+    const char* nextProp = strstr(braceOpen + 1, "\"properties\"");
+    int blockLen = nextProp ? (int)(nextProp - braceOpen) : (int)(strlen(braceOpen));
+    // Create a substring for this feature's properties
+    String block = body.substring((int)(braceOpen - s), (int)(braceOpen - s) + blockLen);
+
+    char stormType[8] = {};
+    char stormName[20] = {};
+    int32_t stormNum = 0, ssNum = 0, intensity = 0, mslp = 0;
+    float lat = 0, lon = 0;
+
+    jsonExtractStringField(block, "\"STORMTYPE\"", stormType, sizeof(stormType));
+    jsonExtractStringField(block, "\"STORMNAME\"", stormName, sizeof(stormName));
+    jsonExtractIntField(block, "\"STORMNUM\"", &stormNum);
+    jsonExtractIntField(block, "\"SSNUM\"", &ssNum);
+    jsonExtractIntField(block, "\"INTENSITY\"", &intensity);
+    jsonExtractIntField(block, "\"MSLP\"", &mslp);
+    jsonExtractFloatField(block, "\"LAT\"", &lat);
+    jsonExtractFloatField(block, "\"LON\"", &lon);
+
+    bool qualifies = false;
+    if (stormName[0] != '\0') {
+      if (strcmp(stormType, "HU") == 0 && ssNum >= 1) qualifies = true;
+      if (s_hurricaneIncludeTS && strcmp(stormType, "TS") == 0) qualifies = true;
+      if (s_hurricaneIncludeTD && strcmp(stormType, "TD") == 0) qualifies = true;
+    }
+
+    if (qualifies) {
+      HurricaneInfo& st = storms[*outCount];
+      memset(&st, 0, sizeof(st));
+      struct tm tmNow; time_t now = time(nullptr); gmtime_r(&now, &tmNow);
+      snprintf(st.id, sizeof(st.id), "AL%02d%04d", (int)stormNum, tmNow.tm_year + 1900);
+      strlcpy(st.name, stormName, sizeof(st.name));
+      strlcpy(st.stormType, stormType, sizeof(st.stormType));
+      st.lat = lat;
+      st.lon = lon;
+      st.category = (uint8_t)ssNum;
+      st.windKt = (uint16_t)intensity;
+      st.pressureMb = (uint16_t)mslp;
+      st.advisoryUtc = time(nullptr);
+      (*outCount)++;
+    }
+    cursor = braceOpen + 1;
+  }
+
+  // Sort by STORMNUM descending (newest first) — bubble sort, max 4 items
+  for (int i = 0; i < *outCount - 1; i++) {
+    for (int j = 0; j < *outCount - 1 - i; j++) {
+      // Extract storm number from ID (characters 2-3)
+      int numA = atoi(storms[j].id + 2);
+      int numB = atoi(storms[j + 1].id + 2);
+      if (numB > numA) {
+        HurricaneInfo tmp = storms[j];
+        storms[j] = storms[j + 1];
+        storms[j + 1] = tmp;
+      }
+    }
+  }
+  return (*outCount > 0);
+}
+
+static bool pollNoaaForHurricane(HurricaneInfo* storms, int maxStorms, int* outCount) {
+  *outCount = 0;
+#ifdef HURRICANE_TEST_MODE
+  // Inject fake Cat 3 storm for off-season testing
+  HurricaneInfo& fake = storms[0];
+  memset(&fake, 0, sizeof(fake));
+  strlcpy(fake.id, "AL052026", sizeof(fake.id));
+  strlcpy(fake.name, "TESTRINA", sizeof(fake.name));
+  strlcpy(fake.stormType, "HU", sizeof(fake.stormType));
+  fake.lat = 25.0f;
+  fake.lon = -75.0f;
+  fake.category = 3;
+  fake.windKt = 120;
+  fake.pressureMb = 955;
+  fake.advisoryUtc = time(nullptr);
+  *outCount = 1;
+  Serial.println("hurricane: TEST MODE — fake Cat 3");
+  return true;
+#endif
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, "https://www.nhc.noaa.gov/CurrentSurfaces/AT.json");
+  http.setTimeout(8000);
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("hurricane: NOAA HTTP %d\n", httpCode);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  if (body.length() < 10) {
+    Serial.println("hurricane: NOAA response too short");
+    return false;
+  }
+  bool ok = parseNoaaStormJson(body, storms, maxStorms, outCount);
+  Serial.printf("hurricane: NOAA %d bytes, %d storms\n", (int)body.length(), *outCount);
+  return ok;
+}
+
+// ── Suppression Logic ─────────────────────────────────────────────────────
+static bool isStormSuppressed(const char* stormId) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", true)) return false;
+  char supList[128] = {};
+  prefs.getString("hwsup", supList, sizeof(supList));
+  prefs.end();
+  if (supList[0] == '\0') return false;
+  // Search for stormId in comma-separated list
+  const char* p = supList;
+  size_t idLen = strlen(stormId);
+  while (p) {
+    if (strncmp(p, stormId, idLen) == 0 && (p[idLen] == ',' || p[idLen] == '\0')) return true;
+    p = strchr(p, ',');
+    if (p) p++;
+  }
+  return false;
+}
+
+static void suppressStorm(const char* stormId) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", false)) return;
+  char supList[128] = {};
+  prefs.getString("hwsup", supList, sizeof(supList));
+  if (supList[0] != '\0') {
+    // Check if already in list
+    const char* p = supList;
+    size_t idLen = strlen(stormId);
+    while (p) {
+      if (strncmp(p, stormId, idLen) == 0 && (p[idLen] == ',' || p[idLen] == '\0')) {
+        prefs.end();
+        return;
+      }
+      p = strchr(p, ',');
+      if (p) p++;
+    }
+    strlcat(supList, ",", sizeof(supList));
+  }
+  strlcat(supList, stormId, sizeof(supList));
+  prefs.putString("hwsup", supList);
+  prefs.end();
+  Serial.printf("hurricane: suppressed %s\n", stormId);
+}
+
+static void cleanupSuppressedStorms(const HurricaneInfo* activeStorms, int activeCount) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", false)) return;
+  char supList[128] = {};
+  prefs.getString("hwsup", supList, sizeof(supList));
+  if (supList[0] == '\0') { prefs.end(); return; }
+
+  // Seasonal expiry: clear if any ID is from a previous year and we're past June 1
+  struct tm tmNow; time_t now = time(nullptr); gmtime_r(&now, &tmNow);
+  int curYear = tmNow.tm_year + 1900;
+
+  char cleaned[128] = {};
+  char* tok = strtok(supList, ",");
+  while (tok) {
+    bool keep = false;
+    // Check if storm is still active
+    for (int i = 0; i < activeCount; i++) {
+      if (strcmp(tok, activeStorms[i].id) == 0) { keep = true; break; }
+    }
+    // Seasonal check: extract year from last 4 chars
+    size_t tokLen = strlen(tok);
+    if (!keep && tokLen >= 4) {
+      int idYear = atoi(tok + tokLen - 4);
+      if (idYear < curYear && tmNow.tm_mon >= 5) keep = false;  // expired
+      else if (idYear == curYear) keep = true;  // same year, storm just not in current list — keep for safety
+    }
+    if (keep) {
+      if (cleaned[0] != '\0') strlcat(cleaned, ",", sizeof(cleaned));
+      strlcat(cleaned, tok, sizeof(cleaned));
+    }
+    tok = strtok(nullptr, ",");
+  }
+  prefs.putString("hwsup", cleaned);
+  prefs.end();
+}
+
+// ── Mode Enter/Exit ───────────────────────────────────────────────────────
+static void triggerHurricaneAlert() {
+#if BOARD_IS_AMOLED_206
+  // Try to load hurricane alert sound directly
+  File cueFile = SD.open(s_hurricaneAlertSound, FILE_READ);
+  if (!cueFile) {
+    Serial.printf("hurricane: alert sound %s not found, using default chime\n", s_hurricaneAlertSound);
+    s_startCuePending = true;
+    return;
+  }
+  size_t cueLen = (size_t)cueFile.size();
+  if (cueLen == 0 || cueLen > 512000) { cueFile.close(); s_startCuePending = true; return; }
+  uint8_t* newBuf = (uint8_t*)heap_caps_malloc(cueLen, MALLOC_CAP_SPIRAM);
+  if (!newBuf) { cueFile.close(); s_startCuePending = true; return; }
+  size_t got = cueFile.read(newBuf, cueLen);
+  cueFile.close();
+  if (got != cueLen) { heap_caps_free(newBuf); s_startCuePending = true; return; }
+  // Replace active cue buffer
+  if (s_audioCueBuf) heap_caps_free(s_audioCueBuf);
+  s_audioCueBuf = newBuf;
+  s_audioCueLen = cueLen;
+  s_audioCueReady = true;
+  strlcpy(s_audioCueLoadedPath, s_hurricaneAlertSound, sizeof(s_audioCueLoadedPath));
+  Serial.printf("hurricane: loaded alert %s (%u bytes)\n", s_hurricaneAlertSound, (unsigned)cueLen);
+  s_startCuePending = true;
+#endif
+}
+
+static void restoreNormalAudioCue() {
+#if BOARD_IS_AMOLED_206
+  preloadSelectedCueToPsram(true);
+#endif
+}
+
+static void enterHurricaneMode(const HurricaneInfo& storm) {
+  // Save current weather center
+  s_savedWeatherCenterLat = s_weatherCenterLat;
+  s_savedWeatherCenterLon = s_weatherCenterLon;
+  s_savedWeatherGeoValid = s_weatherGeoValid;
+
+  // Override center to storm position
+  s_weatherCenterLat = storm.lat;
+  s_weatherCenterLon = storm.lon;
+  s_weatherGeoValid = true;
+  selectSatelliteForLon(storm.lon, true);
+
+  s_hurricaneMode = true;
+  memcpy(&s_activeStorm, &storm, sizeof(HurricaneInfo));
+
+  // Write active storm ID to NVS for reboot suppression
+  {
+    Preferences prefs;
+    if (prefs.begin("satwatch", false)) {
+      prefs.putString("hwact", storm.id);
+      prefs.end();
+    }
+  }
+
+  // Trigger alert if this is a new storm
+  if (strcmp(s_lastHurricaneAlertId, storm.id) != 0) {
+    strlcpy(s_lastHurricaneAlertId, storm.id, sizeof(s_lastHurricaneAlertId));
+    triggerHurricaneAlert();
+  }
+
+  framesReady = false;  // force re-download with storm bbox
+  s_hurricaneLoopsSinceCheck = 0;
+  s_hurricaneBarsLoggedOnce = false;
+  s_hurricaneHintDrawn = false;
+  Serial.printf("hurricane: enter %s %s cat=%d at %.1f,%.1f\n",
+                storm.id, storm.name, storm.category, (double)storm.lat, (double)storm.lon);
+  appendDiagLog("hurricane: enter %s %s cat=%d lat=%.1f lon=%.1f wind=%ukt %umb\n",
+                storm.id, storm.name, storm.category, (double)storm.lat, (double)storm.lon,
+                (unsigned)storm.windKt, (unsigned)storm.pressureMb);
+}
+
+static void exitHurricaneMode() {
+  // Restore saved weather center
+  s_weatherCenterLat = s_savedWeatherCenterLat;
+  s_weatherCenterLon = s_savedWeatherCenterLon;
+  s_weatherGeoValid = s_savedWeatherGeoValid;
+
+  Serial.printf("hurricane: exit %s\n", s_activeStorm.id);
+  appendDiagLog("hurricane: exit %s\n", s_activeStorm.id);
+
+  s_hurricaneMode = false;
+  memset(&s_activeStorm, 0, sizeof(s_activeStorm));
+  restoreNormalAudioCue();
+  framesReady = false;  // force view refresh with restored bbox
+}
+
+// ── Periodic Re-check ─────────────────────────────────────────────────────
+static void hurricaneRecheckAndUpdate() {
+  if (!connectWifiForSync(false, "Checking storms...")) return;
+  HurricaneInfo storms[4];
+  int stormCount = 0;
+  bool polled = pollNoaaForHurricane(storms, 4, &stormCount);
+  disconnectWifiAfterSync();
+
+  if (!polled || stormCount == 0) {
+    // Storm dissipated — exit mode
+    exitHurricaneMode();
+    return;
+  }
+
+  // Check if our active storm is still in the list
+  bool found = false;
+  for (int i = 0; i < stormCount; i++) {
+    if (strcmp(storms[i].id, s_activeStorm.id) == 0) {
+      // Update position/category
+      float dLat = storms[i].lat - s_activeStorm.lat;
+      float dLon = storms[i].lon - s_activeStorm.lon;
+      float distKm = sqrtf(dLat * dLat + dLon * dLon) * 111.32f;
+
+      s_activeStorm.lat = storms[i].lat;
+      s_activeStorm.lon = storms[i].lon;
+      s_activeStorm.category = storms[i].category;
+      s_activeStorm.windKt = storms[i].windKt;
+      s_activeStorm.pressureMb = storms[i].pressureMb;
+      s_activeStorm.advisoryUtc = storms[i].advisoryUtc;
+      strlcpy(s_activeStorm.stormType, storms[i].stormType, sizeof(s_activeStorm.stormType));
+
+      s_weatherCenterLat = storms[i].lat;
+      s_weatherCenterLon = storms[i].lon;
+
+      if (distKm > 100.0f) {
+        Serial.printf("hurricane: %s moved %.0fkm, re-sync\n", storms[i].id, (double)distKm);
+        selectSatelliteForLon(storms[i].lon, true);
+        framesReady = false;
+      } else {
+      }
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    // Active storm not in list anymore — check for new unsuppressed storm
+    cleanupSuppressedStorms(storms, stormCount);
+    bool entered = false;
+    for (int i = 0; i < stormCount; i++) {
+      if (!isStormSuppressed(storms[i].id)) {
+        exitHurricaneMode();
+        enterHurricaneMode(storms[i]);
+        entered = true;
+        break;
+      }
+    }
+    if (!entered) {
+      exitHurricaneMode();
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  End of Hurricane Watch section
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Moon Phase Complication
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Compute moon phase as 0.0 (new) → 0.5 (full) → 1.0 (new).
+// Standard synodic month algorithm referenced to a known new moon epoch.
+static float computeMoonPhase(time_t utc) {
+  // Reference new moon: Jan 6 2000 18:14 UTC (J2000 lunation 0)
+  const double refNewMoon = 947182440.0;  // Unix epoch of that new moon
+  const double synodicMonth = 29.53058770576;  // days
+  double daysSinceRef = difftime((double)utc, refNewMoon) / 86400.0;
+  double phase = fmod(daysSinceRef / synodicMonth, 1.0);
+  if (phase < 0.0) phase += 1.0;
+  return (float)phase;
+}
+
+// JPEGDEC draw callback for moon — renders into s_moonBuf
+static int moonJpegDraw(JPEGDRAW* pDraw) {
+  if (!s_moonBuf) return 0;
+  int drawW = (pDraw->iWidthUsed > 0) ? pDraw->iWidthUsed : pDraw->iWidth;
+  uint16_t* src = (uint16_t*)pDraw->pPixels;
+  for (int row = 0; row < pDraw->iHeight; row++) {
+    int dstY = pDraw->y + row;
+    if (dstY < 0 || dstY >= MOON_DECODED_PX) continue;
+    for (int col = 0; col < drawW; col++) {
+      int dstX = pDraw->x + col;
+      if (dstX < 0 || dstX >= MOON_DECODED_PX) continue;
+      s_moonBuf[dstY * MOON_DECODED_PX + dstX] = src[row * pDraw->iWidth + col];
+    }
+  }
+  return 1;
+}
+
+// Download all 30 moon phase frames from NASA SVS on first boot.
+// Frames are from the 2026 Moon Phase & Libration set, 216×216, evenly
+// spaced across one lunation starting at new moon (Jan 18 2026).
+static void downloadMoonFramesIfMissing() {
+  // Check if already cached
+  if (SD.exists("/moon/moon_00.jpg") && SD.exists("/moon/moon_14.jpg")) return;
+
+  SD.mkdir("/moon");
+  showMessage("Downloading moon...", "One-time setup");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  // Frame numbers in the NASA SVS 8760-frame set (hourly, Jan 1 00:00 UTC).
+  // New moon Jan 18 ~19:00 UTC = frame 427. Step = 709/30 ≈ 24.
+  const int startFrame = 427;
+  const int step = 24;
+  int ok = 0;
+
+  for (int i = 0; i < MOON_FRAME_COUNT; i++) {
+    char sdPath[32];
+    snprintf(sdPath, sizeof(sdPath), "/moon/moon_%02d.jpg", i);
+    if (SD.exists(sdPath)) { ok++; continue; }  // resume partial download
+
+    int nasaFrame = startFrame + i * step;
+    char url[128];
+    snprintf(url, sizeof(url),
+      "https://svs.gsfc.nasa.gov/vis/a000000/a005500/a005587/frames/216x216_1x1_30p/moon.%04d.jpg",
+      nasaFrame);
+
+    HTTPClient http;
+    http.begin(client, url);
+    http.setTimeout(10000);
+    int code = http.GET();
+    if (code == HTTP_CODE_OK) {
+      int len = http.getSize();
+      if (len > 0 && len < 20000) {
+        WiFiClient* stream = http.getStreamPtr();
+        File f = SD.open(sdPath, FILE_WRITE);
+        if (f) {
+          uint8_t buf[512];
+          int total = 0;
+          while (total < len) {
+            int avail = stream->available();
+            if (avail <= 0) { delay(5); continue; }
+            int toRead = (avail < (int)sizeof(buf)) ? avail : (int)sizeof(buf);
+            if (toRead > len - total) toRead = len - total;
+            int got = stream->read(buf, toRead);
+            if (got <= 0) break;
+            f.write(buf, got);
+            total += got;
+          }
+          f.flush();
+          f.close();
+          if (total == len) ok++;
+          else SD.remove(sdPath);  // partial — delete
+        }
+      }
+    }
+    http.end();
+    drawProgressBarUi(i + 1, MOON_FRAME_COUNT, "moon phases");
+  }
+  Serial.printf("moon: downloaded %d/%d frames\n", ok, MOON_FRAME_COUNT);
+}
+
+// Decode the appropriate moon phase JPEG from SD into s_moonBuf.
+static bool decodeMoonPhase() {
+  time_t now = time(nullptr);
+  if (now < 1000000000) {
+    appendDiagLog("moon: skip — NTP not set (now=%ld)\n", (long)now);
+    return false;
+  }
+
+  float phase = computeMoonPhase(now);
+  int frameIdx = (int)(phase * MOON_FRAME_COUNT + 0.5f) % MOON_FRAME_COUNT;
+
+  char path[32];
+  snprintf(path, sizeof(path), "/moon/moon_%02d.jpg", frameIdx);
+
+  File f = SD.open(path, FILE_READ);
+  if (!f) { appendDiagLog("moon: %s not found\n", path); return false; }
+  size_t fSize = (size_t)f.size();
+  if (fSize == 0 || fSize > 20000) { f.close(); return false; }
+
+  uint8_t* jpegBuf = (uint8_t*)heap_caps_malloc(fSize, MALLOC_CAP_SPIRAM);
+  if (!jpegBuf) { f.close(); return false; }
+  size_t got = f.read(jpegBuf, fSize);
+  f.close();
+  if (got != fSize) { heap_caps_free(jpegBuf); return false; }
+
+  if (!s_moonBuf) {
+    s_moonBuf = (uint16_t*)heap_caps_malloc(MOON_DECODED_PX * MOON_DECODED_PX * 2, MALLOC_CAP_SPIRAM);
+    if (!s_moonBuf) { heap_caps_free(jpegBuf); return false; }
+  }
+  memset(s_moonBuf, 0, MOON_DECODED_PX * MOON_DECODED_PX * 2);
+
+  JPEGDEC moonJpeg;
+  bool ok = false;
+  if (moonJpeg.openRAM(jpegBuf, (int)fSize, moonJpegDraw)) {
+    moonJpeg.setPixelType(RGB565_BIG_ENDIAN);
+    ok = moonJpeg.decode(0, 0, JPEG_SCALE_QUARTER);
+    moonJpeg.close();
+  }
+  heap_caps_free(jpegBuf);
+  // Convert from JPEGDEC big-endian to native little-endian RGB565
+  if (ok) {
+    int npx = MOON_DECODED_PX * MOON_DECODED_PX;
+    for (int i = 0; i < npx; i++) s_moonBuf[i] = __builtin_bswap16(s_moonBuf[i]);
+    s_moonDrawn = false;  // force redraw
+  }
+  appendDiagLog("moon: frame=%d phase=%.2f decode=%s buf=%p\n",
+                frameIdx, (double)phase, ok ? "ok" : "FAIL", (void*)s_moonBuf);
+  return ok;
+}
+
+// Draw moon phase icon in the AMOLED bottom border (Y=431-502).
+// s_moonBuf must already be converted to native little-endian RGB565.
+// Uses s_moonDrawn flag: AMOLED retains pixels so we draw once.
+static void drawMoonComplication() {
+  if (!s_amoledOut || !s_moonBuf || s_hurricaneMode || s_moonDrawn) return;
+  const int borderY = (AMOLED_HEIGHT - SCALED_H) / 2 + SCALED_H; // 71 + 360 = 431
+  const int moonX = (SCALED_W - MOON_DECODED_PX) / 2;              // horizontally centered
+  const int moonY = borderY + (AMOLED_HEIGHT - borderY - MOON_DECODED_PX) / 2; // vertically centered in border
+  s_amoledOut->draw16bitRGBBitmap(moonX, moonY, s_moonBuf, MOON_DECODED_PX, MOON_DECODED_PX);
+  s_moonDrawn = true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  End of Moon Phase section
+// ═══════════════════════════════════════════════════════════════════════════
+
 #endif  // BOARD_IS_AMOLED_206
 
 // Render fresh timestamp bars for frameIdx into s_topBarBuf / s_botBarBuf.
@@ -3153,7 +4030,8 @@ static void renderBarsAtScaledRes(int frameIdx) {
 static void updateBarBufs(int frameIdx) {
   if (!s_topBarBuf || !s_botBarBuf) return;
 #if BOARD_IS_AMOLED_206
-  renderBarsAtScaledRes(frameIdx);
+  if (s_hurricaneMode) renderHurricaneStormBars(frameIdx);
+  else renderBarsAtScaledRes(frameIdx);
 #else
   if (!spriteReady) return;
   drawTimestamp(frameIdx, &sprite);
@@ -3185,6 +4063,8 @@ static void presentScaledBuf(uint16_t* src) {
   if (s_amoledClearBeforeNextPresent) {
     s_amoledOut->fillScreen(0x0000);
     s_amoledClearBeforeNextPresent = false;
+    s_hurricaneHintDrawn = false;  // redraw hint after screen clear
+    s_moonDrawn = false;           // redraw moon after screen clear
   }
   static const int CHUNK_ROWS = 8;
   const int outW = SCALED_W;   // 410
@@ -3201,6 +4081,8 @@ static void presentScaledBuf(uint16_t* src) {
     memcpy(s_chunkBuf, src + cy * outW, (size_t)rows * outW * 2U);
     s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, s_chunkBuf, outW, rows);
   }
+  if (s_hurricaneMode) drawHurricaneRebootHint(nullptr);
+  drawMoonComplication();
 #else
   tft.startWrite(); sprite.pushSprite(0, 0); tft.waitDMA(); tft.endWrite();
 #endif
@@ -3591,6 +4473,11 @@ static void computeWeatherBboxFromCenter(float lat, float lon,
 }
 
 static void getActiveWeatherBbox(float* west, float* south, float* east, float* north) {
+  if (s_hurricaneMode) {
+    computeStormBbox(s_activeStorm.lat, s_activeStorm.lon, s_activeStorm.category,
+                     west, south, east, north);
+    return;
+  }
   if (s_weatherGeoValid) {
     computeWeatherBboxFromCenter(s_weatherCenterLat, s_weatherCenterLon, west, south, east, north);
     return;
@@ -6019,6 +6906,7 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
       // Download reached the service and got a valid JPEG, but no precipitation detected.
       s_radarNoSignatures = true;
       s_radarDownloadFailed = false;
+      s_lastRadarCheckUtc = time(nullptr);
       SD.remove(ZOOM_TERRAIN_RADAR_FILE);
       clearRadarMeta();
       Serial.println("radar clear -> base");
@@ -6070,11 +6958,22 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
 
   if (!decodeStage()) {
     if (!isTerrainStage && presentSyntheticZoomStage(path, newestIdx)) {
-      Serial.printf("zoom synth-fallback %s\n", path);
+      Serial.printf("zoom synth-fallback %s (decode fail)\n", path);
       return true;
     }
     Serial.printf("zoom decode-fail %s\n", path);
     appendDiagLog("zoom: decode-fail %s\n", path);
+    return false;
+  }
+  // If decoded zoom has black block artifacts (common on GOES-West limb),
+  // fall through to synthetic zoom instead of showing the corrupt frame.
+  if (!isTerrainStage && spriteLooksHoldFrameBlockCorrupted()) {
+    if (presentSyntheticZoomStage(path, newestIdx)) {
+      Serial.printf("zoom synth-fallback %s (blk-corr)\n", path);
+      return true;
+    }
+    Serial.printf("zoom blk-corr %s\n", path);
+    appendDiagLog("zoom: blk-corr %s\n", path);
     return false;
   }
   bool prevTopBarRadarMode = s_topBarUseRadarScanTime;
@@ -7155,7 +8054,23 @@ static void goToSleep(bool buttonOnly = false) {
   SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
 
   if (!buttonOnly && s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
+    if (s_hurricaneMode && s_hurricaneWatchEnabled) {
+      hurricaneRecheckAndUpdate();
+    }
     if (connectWifiForSync(false)) {
+      // Hurricane check on timer wake (if not already in mode)
+      if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
+        HurricaneInfo hStorms[4]; int hCount = 0;
+        if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
+          cleanupSuppressedStorms(hStorms, hCount);
+          for (int hi = 0; hi < hCount; hi++) {
+            if (!isStormSuppressed(hStorms[hi].id)) {
+              enterHurricaneMode(hStorms[hi]);
+              break;
+            }
+          }
+        }
+      }
       syncWeatherFrames();
       maybeRefreshPendingZoomSnapshots();
     } else {
@@ -7488,6 +8403,34 @@ void setup() {
     strlcpy(s_displayLocationFull,  DISPLAY_TZ_LABEL, sizeof(s_displayLocationFull));
     loadLocationLabelFromNvs(s_displayLocationLabel, sizeof(s_displayLocationLabel),
                              s_displayLocationFull,  sizeof(s_displayLocationFull));
+    // Hurricane: on hard boot, suppress the active storm (user rebooted to dismiss)
+    // and clear hurricane mode.
+    {
+      Preferences hprefs;
+      if (hprefs.begin("satwatch", false)) {
+        char hwact[12] = {};
+        hprefs.getString("hwact", hwact, sizeof(hwact));
+        if (hwact[0] != '\0') {
+          suppressStorm(hwact);
+          hprefs.putString("hwact", "");
+          Serial.printf("hurricane: hard boot — suppressed %s\n", hwact);
+        }
+        hprefs.end();
+      }
+    }
+    s_hurricaneMode = false;
+    memset(&s_activeStorm, 0, sizeof(s_activeStorm));
+#ifdef HURRICANE_TEST_MODE
+    // Clear suppression so test storm always triggers
+    {
+      Preferences tprefs;
+      if (tprefs.begin("satwatch", false)) {
+        tprefs.putString("hwsup", "");
+        tprefs.putString("hwact", "");
+        tprefs.end();
+      }
+    }
+#endif
   } else {
     Serial.printf("wake loops=%d ready=%d n=%d\n",
                   loopsDone, framesReady, frameCount);
@@ -7522,6 +8465,7 @@ void setup() {
       diagF.printf("bat=%d%% chargeState=0x%02X resetReason=%d\n",
                    (int)batPct, (unsigned)(chargeState < 0 ? 0xFF : chargeState),
                    (int)esp_reset_reason());
+      diagF.printf("hurricaneWatch=%d\n", (int)s_hurricaneWatchEnabled);
       diagF.close();
     }
   }
@@ -7569,8 +8513,23 @@ void setup() {
       syncProgressBegin(totalBudget, "Updating cache...", "NASA GIBS");
       syncProgressBeginPhase("sync", 20U);
 
+      // Hurricane watch: check NOAA before sync so bbox is storm-centered if needed
+      if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
+        HurricaneInfo hStorms[4]; int hCount = 0;
+        if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
+          cleanupSuppressedStorms(hStorms, hCount);
+          for (int hi = 0; hi < hCount; hi++) {
+            if (!isStormSuppressed(hStorms[hi].id)) {
+              enterHurricaneMode(hStorms[hi]);
+              break;
+            }
+          }
+        }
+      }
+
       syncWeatherFrames();
       { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("syncWeatherFrames done fc=%d rdy=%d\n", frameCount, (int)framesReady); diagF.close(); } }
+      downloadMoonFramesIfMissing();
       maybeRefreshPendingZoomSnapshots();
       noteSuccessfulScanNow();
       disconnectWifiAfterSync();
@@ -7606,6 +8565,7 @@ void setup() {
       (void)newestUtc;
       s_zoomSnapshotsRefreshPending = true;
       s_zoomWeatherRefreshNeeded = false;
+      downloadMoonFramesIfMissing();
       maybeRefreshPendingZoomSnapshots();
       noteSuccessfulScanNow();
       disconnectWifiAfterSync();
@@ -7635,6 +8595,11 @@ void setup() {
   if ((needSync || hardBoot) && framesReady && frameCount > 0) {
     s_startCuePending = true;
   }
+
+  // ── Decode moon phase for bottom border complication ──────
+#if BOARD_IS_AMOLED_206
+  decodeMoonPhase();
+#endif
 
   // ── Restore brightness after download screen ──────────────
 #if BOARD_IS_AMOLED_206
@@ -7686,7 +8651,13 @@ static void drawTimestamp(int frameIdx, LovyanGFX* target) {
     if (radarMins < 0) radarMins = 0;
     snprintf(radarBuf, sizeof(radarBuf), "Radar: %d min", radarMins);
   } else if (s_radarNoSignatures) {
-    snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear");
+    if (s_lastRadarCheckUtc > 0) {
+      int clearMins = (int)(difftime(nowForAge, s_lastRadarCheckUtc) / 60.0 + 0.5);
+      if (clearMins < 0) clearMins = 0;
+      snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear %dm", clearMins);
+    } else {
+      snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear");
+    }
   } else if (s_radarDownloadFailed) {
     snprintf(radarBuf, sizeof(radarBuf), "Radar: no sig");
   } else {
@@ -8163,8 +9134,10 @@ static void refreshDisplayLocationTimeFromIpInfo() {
     if (gotGeo) Serial.println("geo: fell back to ip-api.com lat/lon");
   }
 
-  // Apply geo position
-  if (gotGeo) {
+  // Apply geo position — skip in hurricane mode to preserve storm-centered bbox
+  if (s_hurricaneMode) {
+    // Still extract timezone offset above, but don't override center/satellite
+  } else if (gotGeo) {
     float stableLat = roundf(lat * 100.0f) * 0.01f;
     float stableLon = roundf(lon * 100.0f) * 0.01f;
     // Suppress cache invalidation for small drifts (BSSID geo is accurate to tens of metres).
@@ -9270,8 +10243,12 @@ void loop() {
           if (zRemain > 0) delay((uint32_t)zRemain);
 
           bool terrainShownForClock = false;
-          if (runTerrainCrossfadeSegment(newestIdx, true)) {
+          if (s_hurricaneMode) {
+            // Skip terrain crossfade in hurricane mode — not relevant
+            baseForClockOverlay = true;
+          } else if (runTerrainCrossfadeSegment(newestIdx, true)) {
             terrainShownForClock = true;
+            baseForClockOverlay = terrainShownForClock;
           } else {
             if (showZoomSnapshotFrame(activeTerrainJpegPath(), newestIdx)) {
               terrainShownForClock = true;
@@ -9280,8 +10257,8 @@ void loop() {
               terrainShownForClock = true;
               delay(terrainTransitionMs);
             }
+            baseForClockOverlay = terrainShownForClock;
           }
-          baseForClockOverlay = terrainShownForClock;
         } else {
           baseForClockOverlay = true;  // keep ZOOM2 as the base if ZOOM3 is unavailable
         }
@@ -9299,6 +10276,19 @@ void loop() {
 
   runCurrentTimeSweepOverlaySegment(newestIdx, baseForClockOverlay);
 
+  // Periodic NOAA re-check during hurricane mode
+  if (s_hurricaneMode && ++s_hurricaneLoopsSinceCheck >= 3) {
+    hurricaneRecheckAndUpdate();
+    s_hurricaneLoopsSinceCheck = 0;
+    // If hurricane mode was exited by recheck, sync new local frames
+    if (!s_hurricaneMode && !framesReady) {
+      if (connectWifiForSync(false)) {
+        syncWeatherFrames();
+        disconnectWifiAfterSync();
+      }
+    }
+  }
+
   loopsDone++;
   uint32_t loopElapsedMs = millis() - loopStartMs;
   uint32_t loopExpectedMs = animationDurationMs + latestFrameHoldMs
@@ -9311,7 +10301,8 @@ void loop() {
                 loopsDone, s_loopsBeforeSleep, validCount, frameCount, newestIdx,
                 loopElapsedMs, loopExpectedMs, loopDriftMs);
 
-  if (s_sleepModeEnabled && loopsDone >= s_loopsBeforeSleep) {
+  // Prevent sleep during hurricane mode
+  if (s_sleepModeEnabled && !s_hurricaneMode && loopsDone >= s_loopsBeforeSleep) {
     loopsDone = 0;
     goToSleep(false);
     return;
