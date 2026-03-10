@@ -1346,6 +1346,49 @@ static void handleServeFrame() {
   f.close();
 }
 
+static void handleGravity() {
+  // Temporarily configure QMI8658 for normal accel reads (WoM mode doesn't allow it)
+  SensorQMI8658 grav;
+  if (!grav.begin(Wire, QMI8658_ADDRESS, SDA, SCL)) {
+    s_wifiPortalServer.send(500, "application/json", "{\"error\":\"qmi init fail\"}");
+    return;
+  }
+  grav.configAccelerometer(SensorQMI8658::ACC_RANGE_2G,
+                           SensorQMI8658::ACC_ODR_1000Hz,
+                           SensorQMI8658::LPF_MODE_3);
+  grav.enableAccelerometer();
+  delay(50);  // let filter settle
+
+  const int N = 4000;
+  double sx = 0, sy = 0, sz = 0;
+  int good = 0;
+  for (int i = 0; i < N; i++) {
+    float x, y, z;
+    if (grav.getAccelerometer(x, y, z)) {
+      sx += x; sy += y; sz += z;
+      good++;
+    }
+    delayMicroseconds(500);  // ~2 kHz polling for 1 kHz ODR
+  }
+  // Restore WoM if it was active
+  if (s_qmiInitialized) initQmiShakeToWake();
+
+  if (good == 0) {
+    s_wifiPortalServer.send(500, "application/json", "{\"error\":\"no readings\"}");
+    return;
+  }
+  double ax = sx / good;
+  double ay = sy / good;
+  double az = sz / good;
+  double mag = sqrt(ax * ax + ay * ay + az * az);
+
+  char json[256];
+  snprintf(json, sizeof(json),
+    "{\"samples\":%d,\"ax\":%.6f,\"ay\":%.6f,\"az\":%.6f,\"magnitude_g\":%.6f,\"magnitude_ms2\":%.6f}",
+    good, ax, ay, az, mag, mag * 9.80665);
+  s_wifiPortalServer.send(200, "application/json", json);
+}
+
 static void sendLsHandler() {
   s_wifiPortalServer.sendHeader("Cache-Control", "no-cache");
   String path = s_wifiPortalServer.hasArg("path") ? s_wifiPortalServer.arg("path") : String("/");
@@ -1405,6 +1448,7 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/ls", HTTP_GET, sendLsHandler);
   s_wifiPortalServer.on("/clearframes", HTTP_POST, handleClearFrames);
   s_wifiPortalServer.on("/frame", HTTP_GET, handleServeFrame);
+  s_wifiPortalServer.on("/gravity", HTTP_GET, handleGravity);
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
   s_wifiPortalHandlersReady = true;
 }
@@ -4247,7 +4291,7 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   if (spriteLooksHoldFrameBlockCorrupted()) return false;
   if (spriteLooksCyanWhiteBlockCorrupted()) return false;
   if (spriteLooksBottomBandJunkCorrupted()) return false;
-  if (spriteLooksBlackSlabCorrupted()) return false;
+  // slab detector disabled — GOES-West disk edge triggers false positives for limb regions
 
   scaleSpriteTo410x360(s_frameDisplayBuf);
   if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) return false;
@@ -4602,11 +4646,12 @@ static bool tryApplyPcf85063Time() {
   return true;
 }
 
-// Persist last-known UTC offset to NVS so it survives power-off
+// Persist last-known UTC offset and location label to NVS so they survive power-off
 static void saveUtcOffsetToNvs(int32_t offsetSec) {
   Preferences prefs;
   if (!prefs.begin("satwatch", false)) return;
   prefs.putInt("utcoff", (int)offsetSec);
+  prefs.putBool("utcvalid", true);
   prefs.end();
 }
 
@@ -4616,6 +4661,36 @@ static int32_t loadUtcOffsetFromNvs() {
   int32_t v = (int32_t)prefs.getInt("utcoff", 0);
   prefs.end();
   return v;
+}
+
+static bool loadUtcOffsetValidFromNvs() {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", true)) return false;
+  bool v = prefs.getBool("utcvalid", false);
+  prefs.end();
+  return v;
+}
+
+static void saveLocationLabelToNvs(const char* label, const char* full) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", false)) return;
+  if (label) prefs.putString("loclabel", label);
+  if (full)  prefs.putString("locfull", full);
+  prefs.end();
+}
+
+static void loadLocationLabelFromNvs(char* label, size_t labelLen, char* full, size_t fullLen) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", true)) return;
+  if (label && labelLen > 0) {
+    String s = prefs.getString("loclabel", "");
+    if (s.length() > 0) strlcpy(label, s.c_str(), labelLen);
+  }
+  if (full && fullLen > 0) {
+    String s = prefs.getString("locfull", "");
+    if (s.length() > 0) strlcpy(full, s.c_str(), fullLen);
+  }
+  prefs.end();
 }
 
 // Poll for a "skip" tap: touch INT pin (TP_INT = GPIO 38, active-low) or AXP2101 PKEY.
@@ -5995,12 +6070,11 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
 
   if (!decodeStage()) {
     if (!isTerrainStage && presentSyntheticZoomStage(path, newestIdx)) {
+      Serial.printf("zoom synth-fallback %s\n", path);
       return true;
     }
-    return false;
-  }
-  if (!isTerrainStage && spriteLooksHoldFrameBlockCorrupted()) {
-    Serial.printf("zoom blk-corr %s\n", path);
+    Serial.printf("zoom decode-fail %s\n", path);
+    appendDiagLog("zoom: decode-fail %s\n", path);
     return false;
   }
   bool prevTopBarRadarMode = s_topBarUseRadarScanTime;
@@ -6299,7 +6373,7 @@ static void refreshZoomSnapshotsForLatestFrame() {
   time_t newestUtc = 0;
   int newestIdx = -1;
   for (int i = frameCount - 1; i >= 0; --i) {
-    if (s_frameTimes[i] > 0) { newestUtc = s_frameTimes[i]; newestIdx = i; break; }
+    if (s_idx.jpegValid[i] && s_frameTimes[i] > 0) { newestUtc = s_frameTimes[i]; newestIdx = i; break; }
   }
   if (newestUtc <= 0) return;
   bool zoomWeatherAssetsUsable = zoomWeatherSnapshotsPresentAndUsable();
@@ -6692,8 +6766,7 @@ static void syncWeatherFrames() {
     // Additional validators
     if (spriteLooksHoldFrameBlockCorrupted() ||
         spriteLooksCyanWhiteBlockCorrupted() ||
-        spriteLooksBottomBandJunkCorrupted() ||
-        spriteLooksBlackSlabCorrupted()) {
+        spriteLooksBottomBandJunkCorrupted()) {
       dlFail++;
       continue;
     }
@@ -7400,7 +7473,7 @@ void setup() {
     frameCount  = 0;
     s_timesLoaded = false;
     s_displayUtcOffsetSec = loadUtcOffsetFromNvs();  // restore from NVS; 0 if never synced
-    s_displayUtcOffsetValid = false;
+    s_displayUtcOffsetValid = loadUtcOffsetValidFromNvs();
     // Keep a deterministic fallback location so pin/zoom/terrain paths still
     // work even if IP geolocation is temporarily unavailable.
     s_weatherCenterLat = (BBOX_SOUTH + BBOX_NORTH) * 0.5f;
@@ -7410,8 +7483,11 @@ void setup() {
     s_lastRadarUtc = 0;
     s_lastRadarUtcValid = false;
     s_radarMetaLoaded = false;
+    // Restore location labels from NVS; fall back to config default if never saved
     strlcpy(s_displayLocationLabel, DISPLAY_TZ_LABEL, sizeof(s_displayLocationLabel));
     strlcpy(s_displayLocationFull,  DISPLAY_TZ_LABEL, sizeof(s_displayLocationFull));
+    loadLocationLabelFromNvs(s_displayLocationLabel, sizeof(s_displayLocationLabel),
+                             s_displayLocationFull,  sizeof(s_displayLocationFull));
   } else {
     Serial.printf("wake loops=%d ready=%d n=%d\n",
                   loopsDone, framesReady, frameCount);
@@ -8033,62 +8109,61 @@ static bool bssidGeoLocate(float* outLat, float* outLon) {
 static void refreshDisplayLocationTimeFromIpInfo() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  // Always call ipapi.co for timezone offset and location label strings.
-  // Use its lat/lon only if both Starlink GPS and BSSID geo fail.
-  WiFiClientSecure secClient;
-  secClient.setInsecure();
-  HTTPClient http;
-  const char* url = "https://ipapi.co/json/";
-  if (!http.begin(secClient, url)) {
-    Serial.println("IP info: begin failed");
-    return;
-  }
-  http.setTimeout(5000);
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("IP info HTTP-%d\n", code);
-    http.end();
-    return;
-  }
-  String body = http.getString();
-  http.end();
-
-  // ipapi.co returns utc_offset as a string e.g. "+0500" or "-0400"
-  char utcOffsetStr[8] = {};
-  int32_t offsetSec = 0;
-  if (jsonExtractStringField(body, "\"utc_offset\"", utcOffsetStr, sizeof(utcOffsetStr))
-      && utcOffsetStr[0]) {
-    const char* p = utcOffsetStr;
-    int sign = 1;
-    if (*p == '+') { p++; }
-    else if (*p == '-') { sign = -1; p++; }
-    int hours = 0, mins = 0;
-    if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9') {
-      hours = (p[0] - '0') * 10 + (p[1] - '0'); p += 2;
-    }
-    if (p[0] >= '0' && p[0] <= '9' && p[1] >= '0' && p[1] <= '9') {
-      mins = (p[0] - '0') * 10 + (p[1] - '0');
-    }
-    offsetSec = sign * (hours * 3600 + mins * 60);
-    s_displayUtcOffsetSec = offsetSec;
-    s_displayUtcOffsetValid = true;
-    saveUtcOffsetToNvs(offsetSec);
-  } else {
-    Serial.println("IP info: missing utc_offset");
-    return;
-  }
-
-  // --- Determine lat/lon: Starlink GPS → BSSID scan → ipapi.co fallback ---
+  // ── Phase 1: Lat/lon via Starlink GPS or Apple BSSID multi-AP scan ──
+  // These run independently of any IP API and are the primary geo source.
   float lat = 0.0f, lon = 0.0f;
   bool gotGeo = starlinkGeoLocate(&lat, &lon);
-  if (!gotGeo) gotGeo = bssidGeoLocate(&lat, &lon);
+  if (gotGeo) Serial.println("geo: starlink GPS");
   if (!gotGeo) {
-    gotGeo = jsonExtractFloatField(body, "\"latitude\"", &lat) &&
-             jsonExtractFloatField(body, "\"longitude\"", &lon) &&
-             lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
-    if (gotGeo) Serial.println("geo: fell back to ipapi.co lat/lon");
+    gotGeo = bssidGeoLocate(&lat, &lon);
+    if (gotGeo) Serial.println("geo: Apple BSSID multi-AP");
   }
 
+  // ── Phase 2: Timezone offset + location labels via ip-api.com (HTTP) ──
+  // Free tier: 45 req/min, no API key, HTTP only. More reliable than ipapi.co.
+  // ip-api.com fields: offset (seconds), regionName, countryCode, timezone, lat, lon
+  bool gotIpApi = false;
+  String body;
+  {
+    WiFiClient plainClient;
+    HTTPClient http;
+    if (http.begin(plainClient, "http://ip-api.com/json/?fields=status,lat,lon,timezone,regionName,countryCode,offset")) {
+      http.setTimeout(5000);
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
+        body = http.getString();
+        // Verify status field
+        char status[16] = {};
+        if (jsonExtractStringField(body, "\"status\"", status, sizeof(status))
+            && strcmp(status, "success") == 0) {
+          gotIpApi = true;
+        }
+      } else {
+        Serial.printf("ip-api HTTP-%d\n", code);
+      }
+      http.end();
+    }
+  }
+
+  // Extract timezone offset from ip-api.com (integer seconds, not a string)
+  if (gotIpApi) {
+    int32_t offsetSec = 0;
+    if (jsonExtractIntField(body, "\"offset\"", &offsetSec)) {
+      s_displayUtcOffsetSec = offsetSec;
+      s_displayUtcOffsetValid = true;
+      saveUtcOffsetToNvs(offsetSec);
+    }
+  }
+
+  // If BSSID/Starlink failed, use ip-api.com lat/lon as fallback
+  if (!gotGeo && gotIpApi) {
+    gotGeo = jsonExtractFloatField(body, "\"lat\"", &lat) &&
+             jsonExtractFloatField(body, "\"lon\"", &lon) &&
+             lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
+    if (gotGeo) Serial.println("geo: fell back to ip-api.com lat/lon");
+  }
+
+  // Apply geo position
   if (gotGeo) {
     float stableLat = roundf(lat * 100.0f) * 0.01f;
     float stableLon = roundf(lon * 100.0f) * 0.01f;
@@ -8110,52 +8185,58 @@ static void refreshDisplayLocationTimeFromIpInfo() {
     selectSatelliteForLon(s_weatherCenterLon, true);
   }
 
-  // Compact "STATE, CC" label for internal use.
-  // ipapi.co: region_code = short region code, country_code = 2-letter country
-  char region[12] = {};
-  char countryCode[8] = {};
-  bool haveRegion = jsonExtractStringField(body, "\"region_code\"", region, sizeof(region)) && region[0];
-  bool haveCountry = jsonExtractStringField(body, "\"country_code\"", countryCode, sizeof(countryCode)) && countryCode[0];
-  if (haveRegion && haveCountry) {
-    snprintf(s_displayLocationLabel, sizeof(s_displayLocationLabel), "%s, %s", region, countryCode);
-  } else if (haveCountry) {
-    strlcpy(s_displayLocationLabel, countryCode, sizeof(s_displayLocationLabel));
-  } else {
-    strlcpy(s_displayLocationLabel, "Local", sizeof(s_displayLocationLabel));
-  }
+  // Extract location labels from ip-api.com
+  // ip-api.com: regionName = full region name, countryCode = 2-letter country
+  if (gotIpApi) {
+    char regionName[40] = {};
+    char countryCode[8] = {};
+    bool haveRegion = jsonExtractStringField(body, "\"regionName\"", regionName, sizeof(regionName)) && regionName[0];
+    bool haveCountry = jsonExtractStringField(body, "\"countryCode\"", countryCode, sizeof(countryCode)) && countryCode[0];
 
-  // Full "Region Name, Country" label for display.
-  // ipapi.co: region = full region name, country_name = full country name
-  char regionName[40] = {};
-  char countryFull[40] = {};
-  bool haveRegionName = jsonExtractStringField(body, "\"region\"", regionName, sizeof(regionName)) && regionName[0];
-  bool haveCountryFull = jsonExtractStringField(body, "\"country_name\"", countryFull, sizeof(countryFull)) && countryFull[0];
-  if (haveRegionName && haveCountryFull) {
-    snprintf(s_displayLocationFull, sizeof(s_displayLocationFull), "%s, %s", regionName, countryFull);
-  } else if (haveCountryFull) {
-    strlcpy(s_displayLocationFull, countryFull, sizeof(s_displayLocationFull));
-  } else if (haveRegionName) {
-    strlcpy(s_displayLocationFull, regionName, sizeof(s_displayLocationFull));
-  } else {
-    strlcpy(s_displayLocationFull, s_displayLocationLabel, sizeof(s_displayLocationFull));
+    // Compact label: "BC, CA" style
+    if (haveRegion && haveCountry) {
+      // Abbreviate regionName to first 2 chars if it's long, else use as-is
+      char regionShort[12] = {};
+      strlcpy(regionShort, regionName, sizeof(regionShort));
+      snprintf(s_displayLocationLabel, sizeof(s_displayLocationLabel), "%s, %s", regionShort, countryCode);
+    } else if (haveCountry) {
+      strlcpy(s_displayLocationLabel, countryCode, sizeof(s_displayLocationLabel));
+    } else {
+      strlcpy(s_displayLocationLabel, "Local", sizeof(s_displayLocationLabel));
+    }
+
+    // Full label: "British Columbia, CA"
+    if (haveRegion && haveCountry) {
+      snprintf(s_displayLocationFull, sizeof(s_displayLocationFull), "%s, %s", regionName, countryCode);
+    } else if (haveRegion) {
+      strlcpy(s_displayLocationFull, regionName, sizeof(s_displayLocationFull));
+    } else if (haveCountry) {
+      strlcpy(s_displayLocationFull, countryCode, sizeof(s_displayLocationFull));
+    } else {
+      strlcpy(s_displayLocationFull, s_displayLocationLabel, sizeof(s_displayLocationFull));
+    }
+
+    saveLocationLabelToNvs(s_displayLocationLabel, s_displayLocationFull);
   }
 
   char tzName[40] = {};
-  jsonExtractStringField(body, "\"timezone\"", tzName, sizeof(tzName));
-  Serial.printf("ip off=%ld loc=%s tz=%s lat=%ld lon=%ld g=%d\n",
+  if (gotIpApi) jsonExtractStringField(body, "\"timezone\"", tzName, sizeof(tzName));
+  Serial.printf("geo: off=%ld loc=%s tz=%s lat=%ld lon=%ld g=%d bssid=%d ipapi=%d\n",
                 (long)s_displayUtcOffsetSec,
                 s_displayLocationLabel,
                 tzName[0] ? tzName : "?",
                 (long)(s_weatherCenterLat * 10000.0f),
                 (long)(s_weatherCenterLon * 10000.0f),
-                (int)s_weatherGeoValid);
+                (int)s_weatherGeoValid,
+                (int)gotGeo, (int)gotIpApi);
   Serial.printf("wx src=%s layer=%s cad=%d lag=%d\n",
                 s_activeWeatherSource, s_activeGibsLayer,
                 activeCadenceMin(), activeLagHours());
-  appendDiagLog("ip-geo: off=%ld loc=%s lat=%.4f lon=%.4f src=%s cad=%d g=%d millis=%lu ms\n",
+  appendDiagLog("geo: off=%ld loc=%s lat=%.4f lon=%.4f src=%s cad=%d g=%d bssid=%d ipapi=%d millis=%lu ms\n",
                 (long)s_displayUtcOffsetSec, s_displayLocationLabel,
                 (double)s_weatherCenterLat, (double)s_weatherCenterLon,
-                s_activeWeatherSource, activeCadenceMin(), (int)s_weatherGeoValid, millis());
+                s_activeWeatherSource, activeCadenceMin(),
+                (int)s_weatherGeoValid, (int)gotGeo, (int)gotIpApi, millis());
 }
 
 static void formatDisplayLocalClockNow(char* out, size_t len) {
