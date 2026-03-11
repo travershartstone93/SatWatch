@@ -45,6 +45,7 @@
 #include <driver/gpio.h>   // gpio_wakeup_enable()
 #include <esp_wifi.h>      // esp_wifi_set_protocol()
 #include "SensorQMI8658.hpp"
+// FT3168 touch IC accessed via direct I2C (addr 0x38)
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
 #include <Arduino_GFX_Library.h>
 #endif
@@ -528,6 +529,13 @@ static bool s_wifiPortalApActive = false;
 static bool s_wifiPortalMdnsRunning = false;
 static bool s_startCuePending = false;
 
+// Display preferences (portal "Display" card)
+static uint8_t  s_clockFontIdx      = 1;        // 0=Small(40), 1=Medium(56), 2=Large(72)
+static uint32_t s_clockColorRGB     = 0xFFFFFF;  // 24-bit RGB for clock text
+static uint8_t  s_displayBrightness = 255;       // AMOLED brightness 0-255
+static uint8_t  s_animSpeedIdx      = 1;         // 0=Fast(7s), 1=Normal(10s), 2=Slow(15s)
+static uint8_t  s_clockDurIdx       = 1;         // 0=Short(4s), 1=Normal(7s), 2=Long(10s)
+
 // Unified sync progress tracker (single progress bar across full sync pipeline).
 static bool     s_syncProgActive = false;
 static uint32_t s_syncProgTotalUnits = 0;
@@ -575,6 +583,10 @@ static uint16_t s_shakeConfirmMs     = 600;   // after settle: require 2nd WoM e
 static SensorQMI8658 s_qmi;
 static bool s_qmiInitialized = false;
 static bool s_qmiInitFailed = false;  // sticky — prevents infinite retry on hardware failure
+// ──── Clean display mode ────
+RTC_DATA_ATTR static bool s_cleanModeActive = false;   // current toggle state (survives sleep)
+static bool s_cleanModeFeatureEnabled = false;          // portal checkbox (loaded from NVS)
+static bool s_fullscreenMode = false;                   // runtime-only, resets on reboot/sleep
 #if BOARD_IS_AMOLED_206
 static I2SClass s_audioI2s;
 static es8311_handle_t s_audioCodec = nullptr;
@@ -647,6 +659,7 @@ static void portalFriendlyDelay(uint32_t ms) {
   while (true) {
     serviceWifiPortalServer();
     serviceUserButtons();
+    pollCleanModeToggle();
     int32_t remaining = (int32_t)(deadline - millis());
     if (remaining <= 0) break;
     uint32_t slice = (remaining > 5) ? 5U : (uint32_t)remaining;
@@ -796,6 +809,18 @@ static void loadWifiPortalConfig() {
       prefs.getString("hwsnd", s_hurricaneAlertSound, sizeof(s_hurricaneAlertSound));
       if (s_hurricaneAlertSound[0] == '\0')
         strlcpy(s_hurricaneAlertSound, "/hurricane_alert.raw", sizeof(s_hurricaneAlertSound));
+      // Clean display mode
+      s_cleanModeFeatureEnabled = prefs.getBool("clnmd", false);
+      s_cleanModeActive = prefs.getBool("clna", false);
+      // Display preferences
+      s_clockFontIdx      = prefs.getUChar("clkfn", 1);
+      if (s_clockFontIdx > 2) s_clockFontIdx = 1;
+      s_clockColorRGB     = prefs.getUInt("clkclr", 0xFFFFFF);
+      s_displayBrightness = prefs.getUChar("dbrght", 255);
+      s_animSpeedIdx      = prefs.getUChar("anispd", 1);
+      if (s_animSpeedIdx > 2) s_animSpeedIdx = 1;
+      s_clockDurIdx       = prefs.getUChar("clkdur", 1);
+      if (s_clockDurIdx > 2) s_clockDurIdx = 1;
     }
     prefs.end();
   }
@@ -812,6 +837,17 @@ static void saveHurricaneConfig() {
   prefs.putBool("hwtd", s_hurricaneIncludeTD);
   prefs.putUChar("hwvol", s_hurricaneAlertVolume);
   prefs.putString("hwsnd", s_hurricaneAlertSound);
+  prefs.end();
+}
+
+static void saveDisplayPrefs() {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", false)) return;
+  prefs.putUChar("clkfn", s_clockFontIdx);
+  prefs.putUInt("clkclr", s_clockColorRGB);
+  prefs.putUChar("dbrght", s_displayBrightness);
+  prefs.putUChar("anispd", s_animSpeedIdx);
+  prefs.putUChar("clkdur", s_clockDurIdx);
   prefs.end();
 }
 
@@ -865,7 +901,8 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
                                  bool autoUpdateInSleep,
                                  uint8_t schedCount, const uint16_t* schedMinutes,
                                  int loopsBeforeSleep, bool shakeToWake,
-                                 int shakeEntryIgnoreMs, int shakeConfirmMs) {
+                                 int shakeEntryIgnoreMs, int shakeConfirmMs,
+                                 bool cleanModeEnabled) {
   if (!entries) return;
   Preferences prefs;
   if (!prefs.begin("satwatch", false)) return;
@@ -893,6 +930,7 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   prefs.putBool("stwk", shakeToWake);
   prefs.putInt("stwksetms", shakeEntryIgnoreMs);
   prefs.putInt("stwkdbms", shakeConfirmMs);
+  prefs.putBool("clnmd", cleanModeEnabled);
   // build and save scheduled times string
   {
     char schedStr[64] = {};
@@ -917,6 +955,7 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   s_shakeToWakeEnabled = shakeToWake;
   s_shakeEntryIgnoreMs = (uint16_t)shakeEntryIgnoreMs;
   s_shakeConfirmMs = (uint16_t)shakeConfirmMs;
+  s_cleanModeFeatureEnabled = cleanModeEnabled;
   if (shakeToWake && !s_qmiInitialized && s_sleepModeEnabled) initQmiShakeToWake();
   s_scheduledUpdateCount = schedCount;
   for (int i = 0; i < schedCount; i++) s_scheduledUpdateMinutes[i] = schedMinutes[i];
@@ -1042,7 +1081,7 @@ static String wifiPortalRootUrl() {
 
 static void sendWifiPortalPage() {
   String html;
-  html.reserve(9000);
+  html.reserve(10000);
   html += F("<!doctype html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Sat Watch Setup</title><style>"
             "body{font-family:Arial,sans-serif;background:#111827;color:#f9fafb;margin:0;padding:16px;}"
@@ -1148,6 +1187,10 @@ static void sendWifiPortalPage() {
   html += F("<div style='margin-top:8px'><label class='text-sm text-gray-200'>Shake confirm window (ms): <input type='number' name='stwkdbms' min='0' max='2000' style='width:5em' value='");
   html += String((unsigned)s_shakeConfirmMs);
   html += F("'></label><div class='hint'>After the settle delay: require a 2nd motion event within this window. Filters single bumps/knocks. Default 600 ms. 0 = any single motion wakes.</div></div>");
+  html += F("<div style='margin-top:8px'><label class='flex items-center gap-2 text-sm text-gray-200'>");
+  html += F("<input type='checkbox' name='clnmd' value='1'");
+  if (s_cleanModeFeatureEnabled) html += F(" checked");
+  html += F(">Clean display (tap moon to hide overlays)</label></div>");
   html += F("</div>");
   html += F("<div class='hint'>Portal AP: Sat Watch / 123456789</div>");
   html += F("<div class='hint'>Portal URL: http://satwatch.local/</div>");
@@ -1223,16 +1266,52 @@ static void sendWifiPortalPage() {
               "bindUpdatePresetHooks();"
               "var preloads=document.querySelectorAll('.sched-preload');"
               "preloads.forEach(function(el){addSchedTime(el.value);});"
-              "loadDiag();"
             "});"
-            "function loadDiag(){"
-              "var b=document.getElementById('diagbox');"
-              "if(b)b.textContent='(loading...)';"
-              "fetch('/diag').then(function(r){return r.text();})"
-              ".then(function(t){if(b)b.textContent=t||'(empty)';b.scrollTop=b.scrollHeight;})"
-              ".catch(function(){if(b)b.textContent='(fetch failed)';});"
-            "}"
             "</script>"
+  );
+  // ── Display preferences card ──
+  html += F("<div class='card' style='margin-top:14px;'><h2>Display</h2>"
+            "<label>Clock Font Size</label><select name='clkfn'>"
+            "<option value='0'");
+  if (s_clockFontIdx == 0) html += F(" selected");
+  html += F(">Small</option><option value='1'");
+  if (s_clockFontIdx == 1) html += F(" selected");
+  html += F(">Medium</option><option value='2'");
+  if (s_clockFontIdx == 2) html += F(" selected");
+  html += F(">Large</option></select>"
+            "<label>Clock Color</label><input type='color' name='clkclr' value='#");
+  {
+    char hexBuf[8];
+    snprintf(hexBuf, sizeof(hexBuf), "%06x", (unsigned)(s_clockColorRGB & 0xFFFFFF));
+    html += hexBuf;
+  }
+  html += F("'>"
+            "<label>Brightness</label>"
+            "<div style='display:flex;align-items:center;gap:10px;'>"
+            "<input type='range' name='dbrght' min='10' max='255' value='");
+  html += String((unsigned)s_displayBrightness);
+  html += F("' style='flex:1;' oninput=\"this.nextElementSibling.textContent=this.value\">"
+            "<span>");
+  html += String((unsigned)s_displayBrightness);
+  html += F("</span></div>"
+            "<label>Animation Speed</label><select name='anispd'>"
+            "<option value='0'");
+  if (s_animSpeedIdx == 0) html += F(" selected");
+  html += F(">Fast (7s)</option><option value='1'");
+  if (s_animSpeedIdx == 1) html += F(" selected");
+  html += F(">Normal (10s)</option><option value='2'");
+  if (s_animSpeedIdx == 2) html += F(" selected");
+  html += F(">Slow (15s)</option></select>"
+            "<label>Clock Display Time</label><select name='clkdur'>"
+            "<option value='0'");
+  if (s_clockDurIdx == 0) html += F(" selected");
+  html += F(">Short (4s)</option><option value='1'");
+  if (s_clockDurIdx == 1) html += F(" selected");
+  html += F(">Normal (7s)</option><option value='2'");
+  if (s_clockDurIdx == 2) html += F(" selected");
+  html += F(">Long (10s)</option></select></div>");
+
+  html += F(
             "<div class='card' style='margin-top:14px;border:1px solid #f59e0b;'>"
               "<h2 style='color:#fbbf24;margin-bottom:8px;'>Hurricane Watch</h2>"
               "<label style='display:flex;align-items:center;gap:6px;margin-bottom:8px;'>"
@@ -1288,11 +1367,8 @@ static void sendWifiPortalPage() {
                 "<button type='submit' style='background:#374151;width:auto;padding:4px 14px;font-size:13px;'>Clear suppression list</button>"
               "</form>"
             "</div>"
-            "<div class='card' style='margin-top:16px;'>"
-              "<h2 style='display:flex;align-items:center;gap:10px;margin-bottom:10px;'>Boot Log"
-              "<button type='button' onclick='loadDiag()' style='width:auto;padding:4px 14px;font-size:13px;margin:0;background:#374151;'>Refresh</button>"
-              "</h2>"
-              "<pre id='diagbox' style='background:#0a0f1a;color:#86efac;font-size:11px;line-height:1.5;padding:10px;border-radius:8px;overflow:auto;max-height:340px;white-space:pre-wrap;word-break:break-all;margin:0;'>(loading...)</pre>"
+            "<div class='hint' style='margin-top:14px;text-align:center;'>"
+              "<a href='/diag' target='_blank' style='color:#60a5fa;'>View Boot Log</a>"
             "</div>"
             "<div class='card' style='margin-top:14px;border:1px solid #dc2626;'>"
               "<h2 style='color:#f87171;margin-bottom:8px;'>Maintenance</h2>"
@@ -1378,6 +1454,7 @@ static void handleWifiPortalSave() {
   int shakeConfirmMs = s_wifiPortalServer.arg("stwkdbms").toInt();
   if (shakeConfirmMs < 0) shakeConfirmMs = 0;
   if (shakeConfirmMs > 2000) shakeConfirmMs = 2000;
+  bool cleanModeEnabled = s_wifiPortalServer.hasArg("clnmd");
   // Hurricane watch config
   s_hurricaneWatchEnabled = s_wifiPortalServer.hasArg("hwen");
   s_hurricaneIncludeTS = s_wifiPortalServer.hasArg("hwts");
@@ -1396,10 +1473,30 @@ static void handleWifiPortalSave() {
   }
   saveHurricaneConfig();
 
+  // Display preferences
+  s_clockFontIdx = (uint8_t)s_wifiPortalServer.arg("clkfn").toInt();
+  if (s_clockFontIdx > 2) s_clockFontIdx = 1;
+  {
+    String c = s_wifiPortalServer.arg("clkclr"); // "#rrggbb"
+    if (c.length() == 7 && c[0] == '#')
+      s_clockColorRGB = (uint32_t)strtoul(c.c_str() + 1, nullptr, 16);
+  }
+  {
+    int brt = s_wifiPortalServer.arg("dbrght").toInt();
+    if (brt < 10) brt = 10;
+    if (brt > 255) brt = 255;
+    s_displayBrightness = (uint8_t)brt;
+  }
+  s_animSpeedIdx = (uint8_t)s_wifiPortalServer.arg("anispd").toInt();
+  if (s_animSpeedIdx > 2) s_animSpeedIdx = 1;
+  s_clockDurIdx = (uint8_t)s_wifiPortalServer.arg("clkdur").toInt();
+  if (s_clockDurIdx > 2) s_clockDurIdx = 1;
+  saveDisplayPrefs();
+
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
                        (StartCueMode)mode, (uint8_t)chimeVol, autoUpdateInSleep,
                        schedCount, schedMins, loopsBeforeSleep, shakeToWake,
-                       shakeEntryIgnoreMs, shakeConfirmMs);
+                       shakeEntryIgnoreMs, shakeConfirmMs, cleanModeEnabled);
   s_wifiPortalServer.send(200, "text/html",
                           "<!doctype html><html><body style='font-family:Arial;background:#111827;color:#f9fafb;padding:24px;'>"
                           "<h2>Saved</h2><p>Settings stored. Rebooting now.</p></body></html>");
@@ -1564,19 +1661,28 @@ static bool initAudioStartCue() {
   pinMode(46, OUTPUT);  // PA_CTRL
   digitalWrite(46, LOW);  // Keep amp path off until codec is stable and muted.
 
-  s_audioI2s.setPins(41, 45, 40, 42, 16);  // bclk, lrck, dout, din, mclk
-  if (!s_audioI2s.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_16BIT,
-                        I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
-    Serial.println("audio: i2s init failed");
-    return false;
+  // Step 1: I2S — guard with flag to prevent double-begin
+  static bool s_i2sStarted = false;
+  if (!s_i2sStarted) {
+    s_audioI2s.setPins(41, 45, 40, 42, 16);  // bclk, lrck, dout, din, mclk
+    if (!s_audioI2s.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_16BIT,
+                          I2S_SLOT_MODE_STEREO, I2S_STD_SLOT_BOTH)) {
+      Serial.println("audio: i2s init failed");
+      return false;
+    }
+    s_i2sStarted = true;
   }
 
-  s_audioCodec = es8311_create(0, ES8311_ADDRRES_0);
+  // Step 2: Codec handle — only create once
   if (!s_audioCodec) {
-    Serial.println("audio: codec create failed");
-    return false;
+    s_audioCodec = es8311_create(0, ES8311_ADDRRES_0);
+    if (!s_audioCodec) {
+      Serial.println("audio: codec create failed");
+      return false;
+    }
   }
 
+  // Step 3: Codec config — idempotent (I2C register writes)
   const es8311_clock_config_t clk = {
     .mclk_inverted = false,
     .sclk_inverted = false,
@@ -3169,6 +3275,15 @@ static void renderBarsAtScaledRes(int frameIdx) {
     s_barSprite.print(pctBuf);
     drawBatteryIcon(s_barSprite, iconX, iconY, iconW, iconH, batPct, s_batChargeState);
 
+    if (s_cleanModeActive) {
+      // Battery-only: copy row 0 with just battery, zero everything else
+      copyBarSpriteToBuffer(s_topBarBuf, (size_t)SCALED_W * SCALED_TOP_ROW_H);
+      memset(s_topBarBuf + (size_t)SCALED_W * SCALED_TOP_ROW_H, 0,
+             (size_t)SCALED_W * SCALED_TOP_ROW_H * 2U);
+      memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2U);
+      return;
+    }
+
     int wifiIconH = iconH - 2;
     if (wifiIconH < 8) wifiIconH = iconH;
     int wifiIconW = max(32, (wifiIconH * 8) / 5);
@@ -3997,6 +4112,205 @@ static bool decodeMoonPhase() {
   return ok;
 }
 
+// ──── Clean Mode touch toggle ────
+
+static constexpr uint8_t FT_ADDR = 0x38;
+static bool s_ftPresent = false;
+static volatile bool s_touchIrqFired = false;
+static bool s_touchHasCoords = false;  // true = FT3168 coord mode, false = any-touch mode
+static bool s_touchInitialized = false;
+
+static void IRAM_ATTR touchIrqHandler() {
+  s_touchIrqFired = true;
+}
+
+static uint8_t readFtTouchPoint(int16_t* x, int16_t* y) {
+  uint8_t buf[5];
+  Wire.beginTransmission(FT_ADDR);
+  Wire.write(0x02);  // start at FingerNum register
+  if (Wire.endTransmission(false) != 0) return 0;
+  if (Wire.requestFrom(FT_ADDR, (uint8_t)5) != 5) return 0;
+  for (int i = 0; i < 5; i++) buf[i] = Wire.read();
+
+  uint8_t n = buf[0] & 0x0F;
+  if (n > 0 && x && y) {
+    *x = (int16_t)(((buf[1] & 0x0F) << 8) | buf[2]);
+    *y = (int16_t)(((buf[3] & 0x0F) << 8) | buf[4]);
+  }
+  return n;
+}
+
+static void initCleanModeTouch() {
+  s_touchInitialized = true;
+
+  // Hardware reset FT3168 via GPIO9 (TP_RESET)
+  pinMode(9, OUTPUT);
+  digitalWrite(9, HIGH);  delay(1);
+  digitalWrite(9, LOW);   delay(20);
+  digitalWrite(9, HIGH);  delay(50);
+
+  // Probe FT3168 at 0x38
+  Wire.beginTransmission(FT_ADDR);
+  if (Wire.endTransmission() == 0) {
+    // Set monitor/interrupt power mode
+    Wire.beginTransmission(FT_ADDR);
+    Wire.write(0xA5);
+    Wire.write(0x01);
+    Wire.endTransmission();
+    delay(20);
+    s_ftPresent = true;
+    s_touchHasCoords = true;
+    appendDiagLog("clean-touch: FT3168 OK coord mode\n");
+  } else {
+    appendDiagLog("clean-touch: FT3168 not found, any-touch mode\n");
+  }
+
+  // Both modes: arm GPIO38 interrupt
+  pinMode(38, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(38), touchIrqHandler, FALLING);
+}
+
+static void enterFullscreen() {
+  s_fullscreenMode = true;
+  if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
+}
+
+static void exitFullscreen() {
+  s_fullscreenMode = false;
+  if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
+  s_moonDrawn = false;
+  s_hurricaneHintDrawn = false;
+  updateBarBufs(s_newestCachedIdx);
+}
+
+static void toggleCleanMode() {
+  s_cleanModeActive = !s_cleanModeActive;
+  Preferences prefs;
+  if (prefs.begin("satwatch", false)) {
+    prefs.putBool("clna", s_cleanModeActive);
+    prefs.end();
+  }
+  updateBarBufs(s_newestCachedIdx);
+  s_moonDrawn = false;
+  s_hurricaneHintDrawn = false;
+}
+
+static void pollCleanModeToggle() {
+  if (!s_cleanModeFeatureEnabled) return;
+  if (!s_touchInitialized) initCleanModeTouch();
+
+  // --- Fullscreen mode: triple-tap anywhere to exit ---
+  if (s_fullscreenMode) {
+    if (!s_touchIrqFired) return;
+    s_touchIrqFired = false;
+
+    static uint32_t fsTapTimes[3] = {};
+    static int fsTapCount = 0;
+    uint32_t now = millis();
+
+    // Debounce: ignore taps within 150ms of previous
+    if (fsTapCount > 0 && (now - fsTapTimes[fsTapCount - 1]) < 150) return;
+
+    // Reset if gap since last tap exceeds 1s
+    if (fsTapCount > 0 && (now - fsTapTimes[fsTapCount - 1]) > 1000) fsTapCount = 0;
+
+    fsTapTimes[fsTapCount++] = now;
+    if (fsTapCount >= 3) {
+      if ((fsTapTimes[2] - fsTapTimes[0]) <= 1000) {
+        exitFullscreen();
+        fsTapCount = 0;
+        return;
+      }
+      // Slide window: drop oldest, keep 2 most recent
+      fsTapTimes[0] = fsTapTimes[1];
+      fsTapTimes[1] = fsTapTimes[2];
+      fsTapCount = 2;
+    }
+    return;
+  }
+
+  // --- Normal mode: long press on moon → fullscreen, short tap on moon → clean mode ---
+  // FT3168 register 0x02 gives active touch count (reliable hold tracking).
+  static uint32_t pressStartMs = 0;
+  static uint32_t lastTouchMs = 0;   // last poll where touching > 0
+  static bool longHandled = false;
+  static const uint32_t RELEASE_DEBOUNCE_MS = 150;
+
+  bool irqFired = s_touchIrqFired;
+  if (irqFired) s_touchIrqFired = false;
+
+  // Only poll I2C when tracking or new IRQ (avoid unnecessary bus traffic)
+  if (pressStartMs == 0 && !irqFired) return;
+
+  // Read current touch state from FT3168
+  int16_t tx = 0, ty = 0;
+  uint8_t touching = s_ftPresent ? readFtTouchPoint(&tx, &ty) : 0;
+
+  bool onMoon = false;
+  if (touching > 0) {
+    lastTouchMs = millis();
+    const int moonX1 = 178, moonY1 = 439;
+    const int moonX2 = moonX1 + 54, moonY2 = moonY1 + 54;
+    onMoon = (tx >= moonX1 && tx <= moonX2 && ty >= moonY1 && ty <= moonY2);
+  }
+
+  // New touch down on moon: start tracking
+  if (irqFired && pressStartMs == 0) {
+    if (touching == 0) {
+      // Fast tap: finger already lifted before poll — accept as moon tap
+      static uint32_t lastToggleMs = 0;
+      uint32_t now = millis();
+      if (now - lastToggleMs >= 500) {
+        toggleCleanMode();
+        lastToggleMs = now;
+      }
+      return;
+    }
+    if (s_ftPresent && !onMoon) return;  // coords available but not on moon
+    pressStartMs = millis();
+    longHandled = false;
+    return;
+  }
+
+  // Tracking a moon press
+  if (pressStartMs > 0) {
+    // Debounce release: momentary touching==0 during hold is an I2C glitch
+    bool held = touching > 0 || (millis() - lastTouchMs) < RELEASE_DEBOUNCE_MS;
+    if (held) {
+      if (!longHandled && (millis() - pressStartMs) >= 3000) {
+        enterFullscreen();
+        longHandled = true;
+      }
+      return;
+    }
+    // Confirmed release (touching==0 for >150ms)
+    if (!longHandled) {
+      static uint32_t lastToggleMs = 0;
+      uint32_t now = millis();
+      if (now - lastToggleMs >= 500) {
+        toggleCleanMode();
+        lastToggleMs = now;
+      }
+    }
+    pressStartMs = 0;
+    longHandled = false;
+  }
+}
+
+// Delay in 50ms chunks while polling button + clean-mode touch inputs,
+// so long-press sleep and clean-mode toggles respond within ~50ms
+// even during long hold/zoom/terrain stages.
+static void delayWithInputPoll(uint32_t ms) {
+  uint32_t start = millis();
+  while (millis() - start < ms) {
+    serviceUserButtons();
+    pollCleanModeToggle();
+    uint32_t elapsed = millis() - start;
+    uint32_t remain = (elapsed < ms) ? (ms - elapsed) : 0;
+    delay(remain > 50 ? 50 : remain);
+  }
+}
+
 // Draw moon phase triptych in the AMOLED bottom border (Y=431-502).
 // Layout: [prev 54×54] —gap— [center 54×54] —gap— [next 54×54]
 // Previous phase on left, current center, next phase on right.
@@ -4059,6 +4373,41 @@ static void applyBarsToBuf(uint16_t* buf) {
 static void presentScaledBuf(uint16_t* src) {
 #if BOARD_IS_AMOLED_206
   if (!s_amoledOut || !src) return;
+
+  // Shared chunk buffer (used by both normal and fullscreen paths)
+  static const int CHUNK_ROWS = 8;
+  static uint16_t* s_chunkBuf = nullptr;
+  if (!s_chunkBuf) s_chunkBuf = (uint16_t*)heap_caps_malloc((size_t)CHUNK_ROWS * SCALED_W * 2U, MALLOC_CAP_SPIRAM);
+  if (!s_chunkBuf) return;
+
+  if (s_fullscreenMode) {
+    // Fullscreen: center-crop 410×360 and scale to fill 410×502, no bars/moon/hints
+    const int dstW = SCALED_W;      // 410
+    const int dstH = AMOLED_HEIGHT; // 502
+    const int srcW = SCALED_W;      // 410
+    const int srcH = SCALED_H;      // 360
+    int cropW = (int)((int64_t)dstW * srcH / dstH);  // 294
+    int cropX = (srcW - cropW) / 2;                   // 58
+
+    for (int cy = 0; cy < dstH; cy += CHUNK_ROWS) {
+      int rows = (cy + CHUNK_ROWS <= dstH) ? CHUNK_ROWS : (dstH - cy);
+      for (int r = 0; r < rows; r++) {
+        int oy = cy + r;
+        int sy = oy * srcH / dstH;
+        if (sy >= srcH) sy = srcH - 1;
+        const uint16_t* srcRow = src + sy * srcW;
+        uint16_t* dstRow = s_chunkBuf + r * dstW;
+        for (int ox = 0; ox < dstW; ox++) {
+          int sx = cropX + ox * cropW / dstW;
+          dstRow[ox] = srcRow[sx];
+        }
+      }
+      s_amoledOut->draw16bitRGBBitmap(0, cy, s_chunkBuf, dstW, rows);
+    }
+    return;
+  }
+
+  // --- Normal path ---
   // Stamp persistent timestamp bars over whatever is in src.
   applyBarsToBuf(src);
   if (s_amoledClearBeforeNextPresent) {
@@ -4067,22 +4416,17 @@ static void presentScaledBuf(uint16_t* src) {
     s_hurricaneHintDrawn = false;  // redraw hint after screen clear
     s_moonDrawn = false;           // redraw moon after screen clear
   }
-  static const int CHUNK_ROWS = 8;
   const int outW = SCALED_W;   // 410
   const int outH = SCALED_H;   // 360
   const int outX = 0;
   const int outY = (AMOLED_HEIGHT - outH) / 2;  // (502-360)/2 = 71
-  // PSRAM-allocated chunk buffer: keeps ~20 KB out of internal DRAM for WiFi/SSL use
-  static uint16_t* s_chunkBuf = nullptr;
-  if (!s_chunkBuf) s_chunkBuf = (uint16_t*)heap_caps_malloc((size_t)CHUNK_ROWS * SCALED_W * 2U, MALLOC_CAP_SPIRAM);
-  if (!s_chunkBuf) return;
   for (int cy = 0; cy < outH; cy += CHUNK_ROWS) {
     int rows = CHUNK_ROWS;
     if (cy + rows > outH) rows = outH - cy;
     memcpy(s_chunkBuf, src + cy * outW, (size_t)rows * outW * 2U);
     s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, s_chunkBuf, outW, rows);
   }
-  if (s_hurricaneMode) drawHurricaneRebootHint(nullptr);
+  if (s_hurricaneMode && !s_cleanModeActive) drawHurricaneRebootHint(nullptr);
   drawMoonComplication();
 #else
   tft.startWrite(); sprite.pushSprite(0, 0); tft.waitDMA(); tft.endWrite();
@@ -7237,12 +7581,12 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
   if (holdMs == 0) return;
 
   const uint32_t initialDelayMs = (holdMs >= 1000U) ? 1000U : holdMs;
-  delay(initialDelayMs);
+  delayWithInputPoll(initialDelayMs);
   if (holdMs <= initialDelayMs) return;
 
   uint32_t remainingMs = holdMs - initialDelayMs;
   if (!s_frameDisplayBuf) {
-    delay(remainingMs);
+    delayWithInputPoll(remainingMs);
     return;
   }
 
@@ -7267,7 +7611,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
   z3.valid = computeZoom3LocatorRectScaled(&z3.x, &z3.y, &z3.w, &z3.h);
 
   if (!z3.valid) {
-    delay(remainingMs);
+    delayWithInputPoll(remainingMs);
     return;
   }
 
@@ -7275,7 +7619,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
   const uint32_t ditMs = 25U;                                                  // zoom1/2 quick flash
   const uint32_t gapMs = 12U;                                                  // inter-element gap
   if (dahMs == 0) {
-    delay(remainingMs);
+    delayWithInputPoll(remainingMs);
     return;
   }
 
@@ -7319,7 +7663,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
   // Final clean frame
   restoreFrame();
   if (remainingMs > consumedMs) {
-    delay(remainingMs - consumedMs);
+    delayWithInputPoll(remainingMs - consumedMs);
   }
 }
 
@@ -8176,7 +8520,7 @@ static void goToSleep(bool buttonOnly = false) {
   digitalWrite(LCD_PWR, HIGH);
 
   if (s_amoledOut) s_amoledOut->displayOn();
-  if (s_amoledOut) s_amoledOut->setBrightness(0xFF);
+  if (s_amoledOut) s_amoledOut->setBrightness(s_displayBrightness);
   s_buttonSleepTransition = false;
   s_moonDrawn = false;          // border was cleared — redraw moon
   return;
@@ -8230,9 +8574,9 @@ static void goToSleep(bool buttonOnly = false) {
 
 #if BOARD_IS_AMOLED_206
   if (s_amoledOut) s_amoledOut->displayOn();
-  if (s_amoledOut) s_amoledOut->setBrightness(0xFF);
+  if (s_amoledOut) s_amoledOut->setBrightness(s_displayBrightness);
 #else
-  tft.setBrightness(255);
+  tft.setBrightness(s_displayBrightness);
 #endif
   s_buttonSleepTransition = false;
 #endif
@@ -8293,6 +8637,7 @@ static void serviceUserButtons() {
     if (s_sleepModeEnabled && s_shakeToWakeEnabled && !s_qmiInitialized) {
       initQmiShakeToWake();
     }
+    updateBarBufs(s_newestCachedIdx);  // refresh cached bar buffers so glyph updates immediately
     longHandled = true;
     suppressUntilMs = now + TOP_BTN_SUPPRESS_MS;
   } else if (releasePending) {
@@ -8390,7 +8735,7 @@ void setup() {
   if (s_amoledOut) {
     s_amoledOut->begin();
     s_amoledOut->setRotation(0);
-    s_amoledOut->setBrightness(0xFF);
+    s_amoledOut->setBrightness(s_displayBrightness);
     s_amoledOut->fillScreen(0x0000);
   }
 #elif defined(ARDUINO_WAVESHARE_ESP32_S3_LCD_147)
@@ -8403,7 +8748,7 @@ void setup() {
   tft.setRotation(3);          // landscape 320×172 (rotated 180°)
 #endif
 #if !BOARD_IS_AMOLED_206
-  tft.setBrightness(255);
+  tft.setBrightness(s_displayBrightness);
   tft.fillScreen(TFT_BLACK);
 #endif
 
@@ -8688,9 +9033,9 @@ void setup() {
 
   // ── Restore brightness after download screen ──────────────
 #if BOARD_IS_AMOLED_206
-  if (s_amoledOut) s_amoledOut->setBrightness(0xFF);
+  if (s_amoledOut) s_amoledOut->setBrightness(s_displayBrightness);
 #else
-  tft.setBrightness(255);
+  tft.setBrightness(s_displayBrightness);
 #endif
 }
 
@@ -9315,10 +9660,23 @@ static void formatDisplayLocalClockNow(char* out, size_t len) {
   }
 }
 
+static const lgfx::GFXfont* clockFontForIdx(uint8_t idx) {
+  switch (idx) {
+    case 0: return &fonts::DejaVu40;
+    case 2: return &fonts::DejaVu72;
+    default: return &fonts::DejaVu56;
+  }
+}
+
+static uint16_t rgb565(uint32_t rgb24) {
+  uint8_t r = (rgb24 >> 16) & 0xFF, g = (rgb24 >> 8) & 0xFF, b = rgb24 & 0xFF;
+  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+}
+
 static ClockOverlayLayout makeClockOverlayLayout() {
   ClockOverlayLayout l = {};
 
-  s_clockFxSprite.setFont(&fonts::DejaVu56);
+  s_clockFxSprite.setFont(clockFontForIdx(s_clockFontIdx));
   s_clockFxSprite.setTextSize(1);
   s_clockFxSprite.setTextDatum(top_left);
 
@@ -9599,7 +9957,7 @@ static bool runTerrainCrossfadeSegment(int newestIdx, bool baseAlreadyShown) {
 
     uint32_t stepDeadline = startMs + (uint32_t)(((uint64_t)step * totalMs) / (uint64_t)steps);
     int32_t waitMs = (int32_t)(stepDeadline - millis());
-    if (waitMs > 0) delay((uint32_t)waitMs);
+    if (waitMs > 0) delayWithInputPoll((uint32_t)waitMs);
   }
 
   // Refresh sprite with terrain (used by fallback clock overlay path)
@@ -9676,9 +10034,15 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
                                              uint32_t segElapsedMs) {
   if (!clockBuf || !loadSavedClockBgIntoFxSprite(l)) return;
 
-  const uint32_t inMs   = 2000U;
-  const uint32_t holdMs = 3000U;
-  const uint32_t outMs  = 2000U;
+  // Scale fade in/hold/out proportionally to clock duration setting.
+  // Short=4s (1+2+1), Normal=7s (2+3+2), Long=10s (2.5+5+2.5)
+  static const uint32_t fadeIn[]   = { 1000U, 2000U, 2500U };
+  static const uint32_t fadeHold[] = { 2000U, 3000U, 5000U };
+  static const uint32_t fadeOut[]  = { 1000U, 2000U, 2500U };
+  uint8_t di = s_clockDurIdx < 3 ? s_clockDurIdx : 1;
+  const uint32_t inMs   = fadeIn[di];
+  const uint32_t holdMs = fadeHold[di];
+  const uint32_t outMs  = fadeOut[di];
   const uint32_t totalMs = inMs + holdMs + outMs;
   if (segElapsedMs > totalMs) segElapsedMs = totalMs;
 
@@ -9702,7 +10066,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
     return;
   }
 
-  s_clockFxSprite.setFont(&fonts::DejaVu56);
+  s_clockFxSprite.setFont(clockFontForIdx(s_clockFontIdx));
   s_clockFxSprite.setTextSize(l.textSize);
   s_clockFxSprite.setTextDatum(top_left);
   int actualTextW = s_clockFxSprite.textWidth(clockBuf);
@@ -9711,12 +10075,17 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
   if (textLocalX < 0) textLocalX = 0;
   const int textLocalY = l.textY - l.bgY;
 
-  // Drop shadow — always present for consistent depth at all opacity levels.
-  s_clockFxSprite.setTextColor(gray565(160));
+  // Drop shadow — dimmed version of clock color for consistent depth.
+  {
+    uint8_t sr = ((s_clockColorRGB >> 16) & 0xFF) * 160 / 255;
+    uint8_t sg = ((s_clockColorRGB >>  8) & 0xFF) * 160 / 255;
+    uint8_t sb = ( s_clockColorRGB        & 0xFF) * 160 / 255;
+    s_clockFxSprite.setTextColor(rgb565((sr << 16) | (sg << 8) | sb));
+  }
   s_clockFxSprite.drawString(clockBuf, textLocalX + 1, textLocalY + 1);
 
-  // Main text (white).
-  s_clockFxSprite.setTextColor(gray565(255));
+  // Main text — user-selected color.
+  s_clockFxSprite.setTextColor(rgb565(s_clockColorRGB));
   s_clockFxSprite.drawString(clockBuf, textLocalX, textLocalY);
 
   // Blend only the text+pin region against the saved background.
@@ -9777,7 +10146,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
 static void drawClockOverlayFallbackFrame(const ClockOverlayLayout& layout, const char* clockBuf) {
   if (!clockBuf || clockBuf[0] == '\0') return;
 
-  sprite.setFont(&fonts::DejaVu56);
+  sprite.setFont(clockFontForIdx(s_clockFontIdx));
   sprite.setTextSize(layout.textSize);
   sprite.setTextDatum(top_left);
   int actualTextW = sprite.textWidth(clockBuf);
@@ -9785,7 +10154,7 @@ static void drawClockOverlayFallbackFrame(const ClockOverlayLayout& layout, cons
   int drawX = layout.bgX + ((layout.bgW - actualTextW) / 2);
   if (drawX < layout.bgX) drawX = layout.bgX;
   sprite.fillRect(layout.bgX, layout.bgY, layout.bgW, layout.bgH, 0x0000);
-  sprite.setTextColor(gray565(255));
+  sprite.setTextColor(rgb565(s_clockColorRGB));
   sprite.drawString(clockBuf, drawX, layout.textY);
   if (s_weatherGeoValid) {
     int tipX = DISP_W / 2;
@@ -9802,7 +10171,8 @@ static void drawClockOverlayFallbackFrame(const ClockOverlayLayout& layout, cons
 }
 
 static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadyShown) {
-  const uint32_t totalMs = 7000U;   // 2s in + 3s hold + 2s out
+  static const uint32_t clkTotals[] = { 4000U, 7000U, 10000U };
+  const uint32_t totalMs = clkTotals[s_clockDurIdx < 3 ? s_clockDurIdx : 1];
   const uint32_t tickMs  = 31U;     // avoid 33ms (~2x60Hz) phase-lock with panel scanout
   // Future UX knob: make the pin lead-in configurable from the UI/settings layer.
   const uint32_t pinLeadMs = 0U;    // show pin before the time animation starts
@@ -9820,7 +10190,7 @@ static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadySho
     char clockBuf[16] = {};
     formatDisplayLocalClockNow(clockBuf, sizeof(clockBuf));
     drawClockOverlayFallbackFrame(layout, clockBuf);
-    delay(totalMs);
+    delayWithInputPoll(totalMs);
     return;
   }
   if (!ensureClockFxSpriteForLayout(layout)) {
@@ -9828,14 +10198,14 @@ static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadySho
     char clockBuf[16] = {};
     formatDisplayLocalClockNow(clockBuf, sizeof(clockBuf));
     drawClockOverlayFallbackFrame(layout, clockBuf);
-    delay(totalMs);
+    delayWithInputPoll(totalMs);
     return;
   }
 
   char clockBuf[16] = {};
   formatDisplayLocalClockNow(clockBuf, sizeof(clockBuf));
   if (clockBuf[0] == '\0') {
-    delay(totalMs);
+    delayWithInputPoll(totalMs);
     return;
   }
 
@@ -9855,6 +10225,7 @@ static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadySho
   uint32_t nextTickMs = startMs;
   while (true) {
     serviceUserButtons();
+    pollCleanModeToggle();
     uint32_t nowMs = millis();
     uint32_t elapsedMs = nowMs - startMs;
     if (elapsedMs > totalMs) elapsedMs = totalMs;
@@ -10187,13 +10558,15 @@ void loop() {
     ESP.restart();
   }
 
-  // Loop timing: 10s animation + 2s hold + 3×1s zoom + ~1s terrain + 7s clock ≈ 24s.
+  // Loop timing: animation + 2s hold + 3×1s zoom + ~1s terrain + clock ≈ 17-28s.
   // animationDurationMs is enforced with a break — frames that run long don't overrun.
-  const uint32_t animationDurationMs = 10000U;
+  static const uint32_t animDurations[] = { 7000U, 10000U, 15000U };
+  static const uint32_t clockDurations[] = { 4000U, 7000U, 10000U };
+  const uint32_t animationDurationMs = animDurations[s_animSpeedIdx < 3 ? s_animSpeedIdx : 1];
   const uint32_t latestFrameHoldMs   = 2000U;
   const uint32_t zoomPreviewStepMs   = 1000U;
   const uint32_t terrainTransitionMs = 1000U;
-  const uint32_t clockOverlayMs      = 7000U;
+  const uint32_t clockOverlayMs      = clockDurations[s_clockDurIdx < 3 ? s_clockDurIdx : 1];
   uint32_t targetFrameDelayMs = (FRAME_DELAY_MS > 0) ? (uint32_t)FRAME_DELAY_MS : 1U;
   // No slots cap — time-based frame selection self-paces with pre-scaled reads (~120ms/frame)
   bool startCueArmed = s_startCuePending;
@@ -10210,6 +10583,7 @@ void loop() {
   // This keeps playback monotonic even when the raw validity map has holes.
   for (;;) {
     serviceUserButtons();
+    pollCleanModeToggle();
     uint32_t elapsed = millis() - loopStartMs;
     if (elapsed >= animationDurationMs) break;
 
@@ -10293,6 +10667,7 @@ void loop() {
 
   // Freeze on the already-displayed final animation frame.
   // Avoid any extra frame push at freeze entry (that's where transfer tear occurs).
+  pollCleanModeToggle();
   int holdFrameIdx = (lastDisplayedFrameIdx >= 0) ? lastDisplayedFrameIdx : newestIdx;
   if (s_frameDisplayBuf) {
     // Re-present the exact current frame buffer once so the start of the freeze
@@ -10309,19 +10684,19 @@ void loop() {
     bool z1Shown = showZoomSnapshotFrame(ZOOM1_FILE, newestIdx);
     if (z1Shown) {
       int32_t zRemain = (int32_t)zoomPreviewStepMs - (int32_t)(millis() - zStepStart);
-      if (zRemain > 0) delay((uint32_t)zRemain);
+      if (zRemain > 0) delayWithInputPoll((uint32_t)zRemain);
 
       zStepStart = millis();
       bool z2Shown = showZoomSnapshotFrame(ZOOM2_FILE, newestIdx);
       if (z2Shown) {
         zRemain = (int32_t)zoomPreviewStepMs - (int32_t)(millis() - zStepStart);
-        if (zRemain > 0) delay((uint32_t)zRemain);
+        if (zRemain > 0) delayWithInputPoll((uint32_t)zRemain);
 
         zStepStart = millis();
         bool z3Shown = showZoomSnapshotFrame(ZOOM3_FILE, newestIdx);
         if (z3Shown) {
           zRemain = (int32_t)zoomPreviewStepMs - (int32_t)(millis() - zStepStart);
-          if (zRemain > 0) delay((uint32_t)zRemain);
+          if (zRemain > 0) delayWithInputPoll((uint32_t)zRemain);
 
           bool terrainShownForClock = false;
           if (s_hurricaneMode) {
@@ -10333,10 +10708,10 @@ void loop() {
           } else {
             if (showZoomSnapshotFrame(activeTerrainJpegPath(), newestIdx)) {
               terrainShownForClock = true;
-              delay(terrainTransitionMs);
+              delayWithInputPoll(terrainTransitionMs);
             } else if (showFrame(holdFrameIdx)) {
               terrainShownForClock = true;
-              delay(terrainTransitionMs);
+              delayWithInputPoll(terrainTransitionMs);
             }
             baseForClockOverlay = terrainShownForClock;
           }
@@ -10355,6 +10730,7 @@ void loop() {
     Serial.println("zoom/terrain/clock stages skipped — holding weather frame");
   }
 
+  pollCleanModeToggle();
   runCurrentTimeSweepOverlaySegment(newestIdx, baseForClockOverlay);
 
   // Periodic NOAA re-check during hurricane mode

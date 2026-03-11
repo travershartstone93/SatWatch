@@ -1725,3 +1725,145 @@ Fix:
   Both top-bar render locations updated.
 
 Location: s_lastRadarCheckUtc global; radar clear path; bar render.
+
+
+## Fix: Clean Mode touch detection — 2026-03-10
+
+Problem:
+  Touch toggle for clean mode didn't work. The CST226SE touch IC at 0x5A
+  never responds on I2C (bus scan finds 0x18, 0x34, 0x38, 0x40, 0x51, 0x6B
+  but no 0x5A). GPIO38 DOES go LOW on touch (~ms pulse), but the main loop
+  polls too slowly to catch it. Manual I2C register reads always failed.
+  Attempting a GPIO9 hardware reset put the IC into an uninitialized state
+  where it stopped generating interrupts entirely.
+
+Root cause:
+  The touch IC runs in auto-sleep mode and only briefly asserts GPIO38.
+  Any GPIO9 reset disrupts this default behavior, and without I2C access
+  the IC can't be re-initialized to resume generating interrupts.
+
+Fix (two parts):
+
+  1. Replaced manual I2C touch code (initTouchIC, cstReadReg, readCst226Touch)
+     with SensorLib TouchDrvCSTXXX auto-detect driver. Two-phase init:
+     - Phase 1: Try SensorLib begin() at 0x5A/0x15/0x1A for coordinate mode.
+       CRITICAL: pass RST=-1 (not GPIO9) to prevent SensorLib from resetting
+       the IC. A reset kills the auto-sleep interrupt behavior permanently.
+     - Phase 2 (fallback): If all begin() attempts fail, use GPIO38 interrupt
+       without coordinates — any touch toggles clean mode (debounced 500ms).
+     Both phases arm: pinMode(38, INPUT_PULLUP) + attachInterrupt(FALLING).
+
+  2. Replaced blocking delay() calls throughout the animation pipeline with
+     delayWithTouchPoll() — delays in 50ms chunks while polling the touch
+     interrupt flag. Without this, touch was captured by the ISR but the
+     toggle response was delayed by seconds (up to 7s in the clock sweep
+     stage). Affected locations:
+     - runFreezeZoom3LocatorCue(): initial hold, fallback delays, final hold
+     - Zoom preview step delays (3x zoomPreviewStepMs)
+     - Terrain transition delays (2x terrainTransitionMs)
+     - runCurrentTimeSweepOverlaySegment(): tick loop + fallback delays
+
+Key insight:
+  NEVER reset GPIO9 on this board's touch IC. The IC works fine in its
+  default auto-sleep state (brief GPIO38 pulses on touch). Any reset
+  requires I2C re-init to restore interrupt behavior, and I2C doesn't work.
+
+Location: initCleanModeTouch(), pollCleanModeToggle(), delayWithTouchPoll();
+  runFreezeZoom3LocatorCue(); runCurrentTimeSweepOverlaySegment(); main loop
+  zoom/terrain delay calls.
+
+────────────────────────────────────────────────────────────────────────
+Fix: Sleep glyph delay + clean mode touch gap + startup chime intermittent
+Date: 2026-03-10
+────────────────────────────────────────────────────────────────────────
+
+Three related issues fixed in one pass:
+
+1. Sleep glyph not updating during animations
+   Symptom: Long-pressing to toggle sleep/always-on mode during clock sweep or
+   animation padding worked (state flipped) but the glyph didn't visually update
+   until the animation ended.
+   Root cause: updateBarBufs() renders bars (including sleep glyph) into cached
+   pixel buffers. During animations, bars are stamped from stale cached buffers
+   because updateBarBufs() is never called — only serviceUserButtons() runs.
+   Fix: In serviceUserButtons(), after toggling s_sleepModeEnabled, call
+   updateBarBufs(s_newestCachedIdx) to refresh cached bar buffers immediately.
+   The next presentScaledBuf() call (within 31ms) shows the updated glyph.
+
+2. Clean mode touch unresponsive during delay() calls
+   Symptom: Tapping the moon to toggle clean mode was unresponsive during bare
+   delay() calls (animation padding, zoom holds, etc.).
+   Root cause: portalFriendlyDelay() (target of #define delay(ms)) called
+   serviceUserButtons() but NOT pollCleanModeToggle(). Touch IRQ fired but was
+   never polled until the delay completed.
+   Fix: Added pollCleanModeToggle() call inside portalFriendlyDelay(), right
+   after serviceUserButtons(). Lightweight — returns immediately if feature is
+   disabled or no touch IRQ pending.
+
+3. Clean mode toggle invisible during clock sweep animation
+   Symptom: Tapping the moon during the text fade in/out animation appeared to
+   do nothing — toggle fired but bars didn't visually update.
+   Root cause: Same stale-bar-buffer issue as #1. pollCleanModeToggle() toggled
+   s_cleanModeActive but never called updateBarBufs(), so the bars stamped by
+   presentScaledBuf() still reflected the old state.
+   Fix: Added updateBarBufs(s_newestCachedIdx) inside pollCleanModeToggle()
+   right after the state toggle, so bars refresh immediately during animations.
+
+4. Startup chime intermittent — never plays on some boots
+   Root cause: initAudioStartCue() does a 3-step lazy init (I2S begin, codec
+   create, codec config). If step 1 succeeds but step 2 or 3 fails (I2C bus
+   contention with touch/IMU on core 1), the function returns false with
+   s_audioReady still false — but I2S is left allocated. Next retry calls
+   s_audioI2s.begin() on an already-initialized driver → fails. All subsequent
+   retries also fail → chime never plays for the rest of the session.
+   Fix: Made initAudioStartCue() idempotent with a static bool s_i2sStarted
+   flag. Each step is guarded: I2S only inits once (no double-begin), codec
+   handle only created once, codec config is idempotent I2C register writes
+   that can safely retry.
+
+Location: serviceUserButtons(), portalFriendlyDelay(), pollCleanModeToggle(),
+  initAudioStartCue()
+
+5. Touch coordinate mode — region-specific touch zones on AMOLED
+   The board's touch IC is an FT3168 (FocalTech) at I2C address 0x38, NOT
+   a CST-series chip. SensorLib's TouchDrvCSTXXX always fails to detect it.
+
+   FT3168 direct I2C protocol (no library needed):
+   - Hardware reset: GPIO9 (TP_RESET) — HIGH 1ms, LOW 20ms, HIGH 50ms
+     Required before first I2C probe or the IC won't ACK.
+   - Power mode: write 0x01 to register 0xA5 (monitor/interrupt mode)
+   - Read touch: bulk read 5 bytes starting at register 0x02:
+       buf[0] & 0x0F = number of active touch points (0 = no touch)
+       buf[1] & 0x0F = X high nibble, buf[2] = X low byte
+       buf[3] & 0x0F = Y high nibble, buf[4] = Y low byte
+   - Touch count stays >0 while finger is held (reliable hold tracking)
+   - IRQ on GPIO38 fires FALLING on touch-down (pulse, not sustained level)
+
+   To make a screen region respond to touch instead of the whole screen:
+   1. On IRQ, call readFtTouchPoint(&x, &y) to get coordinates
+   2. Hit-test against a bounding box: e.g. moonX1=178, moonY1=439,
+      moonX2=232, moonY2=493 (54×54 px area)
+   3. If outside the box, ignore the touch (return early)
+   4. For hold detection: poll readFtTouchPoint() each cycle — touch
+      count >0 means finger still down, 0 means released. No need for
+      IRQ pulse timing or GPIO level reads.
+   5. After triggering an action on long-press, keep tracking until the
+      finger actually lifts (don't zero pressStartMs). The longHandled
+      flag prevents any action on release.
+
+   Two gotchas with FT3168 touch handling:
+
+   a) Fast-tap race condition: during heavy rendering (main animation
+      loop iterations take 33-70ms), a quick tap (~100ms) may lift before
+      the first I2C read. readFtTouchPoint() returns touching=0 so
+      coordinates are unavailable and hit-test fails silently.
+      Fix: when IRQ fired but touching==0, treat as instant tap — the
+      IRQ proves a touch happened, skip coordinate check.
+
+   b) Release debounce: FT3168 occasionally reports touching=0 for a
+      single poll cycle mid-hold (I2C glitch or scan gap). Without
+      debounce this aborts the hold and triggers a short-tap action.
+      Fix: track lastTouchMs (last poll where touching>0). Only confirm
+      release after touching==0 persists for >150ms (RELEASE_DEBOUNCE_MS).
+
+Location: initCleanModeTouch(), readFtTouchPoint(), pollCleanModeToggle()
