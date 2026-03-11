@@ -1,0 +1,332 @@
+LIVESAT — THE SATELLITE WEATHER WATCH
+Real-time weather from space. On your wrist. No phone required.
+
+
+THE SHORT VERSION
+
+LiveSat is a standalone wearable that downloads live satellite imagery
+directly from NASA, plays 24 hours of weather as an animation on a
+2-inch AMOLED screen, tracks hurricanes, displays moon phases, and
+works anywhere in the world — all without a phone, a subscription, or
+a cell connection. Just WiFi and your wrist.
+
+No product like this exists. We built one.
+
+
+WHY THIS EXISTS
+
+I wanted to see the weather from space. Not a forecast — the actual
+satellite view. NASA operates three geostationary satellites 22,000
+miles above Earth that photograph the entire hemisphere every ten
+minutes. That imagery is public. It's free. And nobody had put it on
+a wearable.
+
+I started with a website — a 3D globe showing real-time satellite
+weather from all three NASA satellites, blended seamlessly where their
+coverage overlaps. 15,000 lines of code. 41 test suites. It worked.
+
+Then I thought: what if you didn't need a computer?
+
+I moved it onto a microcontroller the size of a postage stamp with a
+tiny screen. It connected to WiFi, downloaded satellite frames, and
+played them back as a looping animation. Bare circuit board, wires
+everywhere — but it proved the concept could run on real hardware.
+
+Then I built the real thing.
+
+
+WHAT LIVESAT DOES
+
+The device plays a continuous display loop:
+
+  - 24-HOUR SATELLITE ANIMATION — Watch a full day of weather unfold
+    across the hemisphere. See storm systems develop, fronts move,
+    hurricanes form. This isn't a static snapshot — it's the actual
+    motion of the atmosphere over the last 24 hours.
+
+  - CLOCK FACE — Time and date, because it's still a watch.
+
+  - ZOOM SEQUENCE — The view dives from the full hemisphere down to
+    your local area, showing terrain, radar overlay, and moon phase
+    along the way.
+
+  - GLOBAL COVERAGE — The device knows where it is and automatically
+    switches between NASA's three satellites: GOES-East and GOES-West
+    for the Americas, Himawari for Asia and the Pacific. Take it
+    anywhere in the world and it adapts.
+
+  - HURRICANE TRACKING — During storm season, LiveSat monitors active
+    tropical systems and alerts you automatically. No checking an app.
+    No refreshing a page. It just tells you.
+
+  - MOON PHASE — Calculated and displayed on every cycle. For anyone
+    on the water, this matters — tides, visibility, and navigation all
+    depend on the lunar cycle.
+
+  - SHAKE TO WAKE — Flip your wrist like checking a regular watch and
+    it wakes up. Set it down and it sleeps to conserve battery. The
+    motion sensor knows the difference between a deliberate wrist-check
+    and ordinary arm movement.
+
+  - BUILT-IN WEB PORTAL — Pull up a page on your phone's browser to
+    check the device's status, battery level, and stored imagery.
+
+All of this runs on a chip you could cover with a quarter.
+
+
+WHY NOT AN APP?
+
+A reasonable question. Two reasons:
+
+First, Apple's App Store terms restrict apps from pulling data directly
+from government servers like NASA's GIBS imagery service. Android has
+similar limitations. A dedicated device sidesteps platform gatekeepers
+entirely — it connects to the satellites on its own terms.
+
+Second, and more importantly: independence. An Apple Watch weather app
+requires an iPhone, an Apple ID, a cellular plan if you want standalone
+operation, software updates, app management, and a proprietary charger.
+LiveSat has one button and a touchscreen. Charge it, connect it to WiFi
+once, and it handles everything from there. No accounts, no
+subscriptions, no phone in your pocket.
+
+For someone on a boat, on an oil rig, on a remote island — that
+simplicity isn't a feature. It's the point.
+
+
+HOW IT COMPARES
+
+The closest existing product is RainViewer, an Apple Watch app that
+shows weather radar and satellite imagery. It's built by a company of
+11-50 employees, founded in 2017, with nine years of development behind
+it. Here's how LiveSat differs:
+
+  LIVESAT                              RAINVIEWER
+  ──────────────────────────────────   ──────────────────────────────────
+  Full-hemisphere satellite animation  Local radar/satellite tile
+  24-hour weather playback             ~2-hour radar history
+  No phone required                    Requires Apple Watch ($250+)
+  No cell connection needed            Needs WiFi or cellular on watch
+  Automatic hurricane tracking         Severe weather alerts (via Apple)
+  Moon phase display                   No moon phase
+  Global auto-switching (3 sats)       Regional coverage
+  One-time purchase, no subscription   Free app, but $250+ hardware
+  Works at sea with just WiFi          Needs cell/WiFi infrastructure
+
+
+THE DEVICE
+
+  Display:      2.06" AMOLED, 410x502 pixels
+  Processor:    ESP32-S3 dual-core, 8MB PSRAM
+  Storage:      MicroSD (satellite frames cached locally)
+  Sensors:      6-axis IMU (wake-on-motion), real-time clock
+  Power:        LiPo battery with AXP2101 PMIC, USB-C charging
+  Connectivity: WiFi 802.11 b/g/n
+  Software:     10,500 lines of custom C++ firmware
+  Data source:  NASA GIBS (GOES-East, GOES-West, Himawari)
+
+
+WHO THIS IS FOR
+
+  - SAILORS & CRUISERS — See weather systems approaching across
+    hundreds of miles of open ocean. Know what's coming before it
+    arrives. Hurricane alerts without checking your phone.
+
+  - CHARTER CAPTAINS & CREW — Weather awareness for every trip.
+    Moon phase for tide planning. No reliance on cell coverage.
+
+  - FISHERMEN — Offshore weather at a glance. Moon phase for bite
+    timing. Works beyond cell range.
+
+  - OFFSHORE WORKERS — Oil rigs, wind farms, research vessels.
+    Weather monitoring that doesn't depend on shore infrastructure.
+
+  - ISLAND RESIDENTS — Hurricane tracking for communities where
+    reliable weather information can be a safety issue.
+
+  - WEATHER ENTHUSIASTS — For anyone who's ever stared at satellite
+    loops on their computer and wished they could take it with them.
+
+  - PILOTS & PARAGLIDERS — Hemisphere-scale cloud pattern awareness
+    before and during flights.
+
+
+THE STORY
+
+I'm Travers. I'm a software engineer who, until January 2026, had almost
+no experience with hardware programming. I knew Python, JavaScript, web
+development — but not C++, not microcontrollers, not how to talk to
+sensors and manage batteries on a chip.
+
+I built LiveSat anyway. Two months, 10,500 lines of C++, and a lot of
+late nights later, it works. Along the way I solved problems that would
+challenge experienced embedded engineers — a shared pin that controls
+both display power and the motion sensor, an SD card library that
+silently corrupts data if you don't handle flush timing exactly right,
+a motion sensor whose interrupt behavior contradicts its own
+documentation.
+
+I built this with the help of AI tools — Claude and OpenAI's Codex —
+across 63 separate development sessions totaling over 3 gigabytes of
+conversation. But AI doesn't design products or make engineering
+decisions. It answers questions. The architecture, the problem-solving,
+and the product vision are mine.
+
+By March, an independent AI evaluation of my ten major programming
+projects rated me 9/10 overall — "Staff-Level Engineer," comparable to
+professionals with 8-12 years of experience. My C++ skills went from
+6/10 to 8/10 in two months. I say this not to brag, but because you
+deserve to know the engineering behind this device is serious.
+
+I'm now moving to the British Virgin Islands to run fleet maintenance
+for a charter company. I'll be living in the middle of LiveSat's target
+market — on the docks, among the captains and crews and sailors who
+need this most. This isn't a project built in a lab. It's built by
+someone who's about to rely on it every day.
+
+
+WHAT YOUR BACKING FUNDS
+
+This Kickstarter funds the first production run of LiveSat Pro — the
+sealed, waterproof version designed for real-world use on the water.
+
+Here's where the money goes:
+
+  Custom waterproof enclosure tooling:     ~$3,000 - $5,000
+  First production run (500 units):        ~$22,500
+  Shipping & fulfillment:                  ~$2,500 - $5,000
+  ──────────────────────────────────────────────────────────
+  Total:                                   ~$25,000
+
+The entire R&D cost to get from idea to working prototype was about
+$200. The hardware is proven. The software is written and running. Your
+money isn't funding research — it's funding manufacturing.
+
+
+REWARD TIERS
+
+  EXPLORER EDITION — $149
+  The current dev-board version. Fully functional LiveSat with AMOLED
+  touchscreen, shake-to-wake, satellite animation, hurricane tracking,
+  moon phase, and web portal. Open hardware — tinker, modify, hack.
+  Not waterproof. For early adopters and enthusiasts who want it now.
+
+  LIVESAT PRO (EARLY BIRD) — $179
+  The waterproof production version in a sealed custom enclosure.
+  Everything in the Explorer Edition, built to survive the elements.
+  Limited to first 140 backers.
+
+  LIVESAT PRO — $199
+  Same as Early Bird, at retail price. Ships after early-bird units.
+
+  FLEET PACK (5x PRO) — $849
+  Five LiveSat Pro units at a discount. For charter companies, marinas,
+  or dive shops outfitting their crews. ($170/unit)
+
+
+TIMELINE
+
+  Campaign launch:              [TBD]
+  Campaign ends:                [TBD + 30 days]
+  Explorer Edition ships:       ~2 weeks after campaign ends
+  Waterproof prototypes:        ~8 weeks after funding
+  Pro production run:           ~16 weeks after funding
+  Pro units ship to backers:    ~20 weeks after funding
+
+
+RISKS & CHALLENGES
+
+Every hardware project has risks. Here's what could go wrong and how
+we're handling it:
+
+  MANUFACTURING DELAYS — Chinese manufacturers quote 8-16 weeks for
+  custom enclosure tooling and production. We've built buffer into the
+  timeline. The Explorer Edition ships immediately because it uses
+  off-the-shelf components that are already in hand.
+
+  WATERPROOFING — Sealing electronics is hard. We're working with
+  established watch manufacturers in Shenzhen who do this at scale,
+  not trying to reinvent it ourselves. Prototype testing before
+  production commitment.
+
+  FIRMWARE UPDATES — The software is mature (10,500 lines, months of
+  daily use), but bugs happen. LiveSat's web portal supports over-the-
+  air configuration, and the firmware can be updated via USB-C. Backers
+  won't be stuck with launch-day software.
+
+  SCOPE — We are not building a smartwatch. LiveSat does one thing
+  exceptionally well: satellite weather on your wrist. We're not
+  adding fitness tracking, notifications, music, or apps. The
+  simplicity is the product.
+
+
+STRETCH GOALS
+
+  $35,000 — AUDIBLE HURRICANE ALERT
+  Add a piezo buzzer for an audible alarm when a new tropical system
+  is detected within your alert radius. Because you might be asleep.
+
+  $50,000 — ADDITIONAL SATELLITE LAYERS
+  Add Meteosat coverage for Europe and Africa, completing true global
+  coverage across all four major geostationary weather satellites.
+
+  $75,000 — COMPANION WEB DASHBOARD
+  A web app (hosted, free for backers) that mirrors your device's
+  satellite view on a full screen — the original 3D globe experience
+  that started this project, now synced with your LiveSat.
+
+
+FAQ
+
+  Q: Does it need my phone?
+  A: No. LiveSat is fully standalone. It needs WiFi to sync imagery
+     (about once every 6 hours), but between syncs it runs entirely
+     on its own.
+
+  Q: How often does it update?
+  A: Configurable. It can sync every 15 minutes, every hour, or on a
+     custom schedule. Between syncs, it plays back the most recent
+     24 hours of cached satellite frames.
+
+  Q: What about battery life?
+  A: With shake-to-wake enabled (screen off when not in use), the
+     device runs for [TBD — depends on sync frequency and usage].
+     It charges via USB-C.
+
+  Q: Can I use it outside the Americas?
+  A: Yes. LiveSat automatically switches between GOES-East, GOES-West,
+     and Himawari based on your location. Take it anywhere.
+
+  Q: Is the satellite data free?
+  A: Yes. NASA's GIBS imagery service is public and free. There is no
+     subscription, no data fee, no ongoing cost. You buy the device
+     once and it works.
+
+  Q: Is the firmware open source?
+  A: The Explorer Edition ships on open hardware (Waveshare ESP32-S3
+     dev board) and the firmware will be available to Explorer backers
+     for modification. Pro firmware updates will be provided as
+     compiled binaries.
+
+  Q: Why not just use Windy / RainViewer / Weather Channel?
+  A: Those apps show local radar tiles on a phone or smartwatch. They
+     require a phone, a cell connection, and a platform. LiveSat shows
+     full-hemisphere satellite animation on a standalone device with
+     no dependencies. Different product, different use case.
+
+  Q: What if the campaign doesn't fund?
+  A: If we don't hit $25,000, no one is charged. The Explorer Edition
+     will still be available for direct purchase outside Kickstarter,
+     as it uses off-the-shelf components with no tooling required.
+
+
+ABOUT THE CREATOR
+
+Travers Hartstone — software engineer, sailor, and the kind of person
+who builds the thing he wishes existed. Currently relocating to the
+British Virgin Islands to run fleet maintenance for a Caribbean charter
+company. Building LiveSat because he wants it on his wrist, and because
+he thinks you might too.
+
+Contact: [email TBD]
+Website: [TBD]

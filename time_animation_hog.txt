@@ -1,0 +1,71 @@
+Unified Input Polling — Animation Pipeline Gaps
+================================================
+
+ISSUE
+-----
+Button long-press (sleep/wake toggle) and touch (clean mode toggle) are
+unresponsive during several animation stages. The ISR/Core1 task captures
+the raw event instantly, but the action functions — serviceUserButtons()
+and pollCleanModeToggle() — only fire when explicitly called. Several
+animation stages have blocking delay() calls that never call either.
+
+ATTEMPTED FIX (did not work)
+----------------------------
+Renamed delayWithTouchPoll() → delayWithInputPoll() and added
+serviceUserButtons() to the polling loop alongside pollCleanModeToggle().
+Also changed the terrain crossfade bare delay() at ~line 9714 to use
+delayWithInputPoll().
+
+This only fixed call sites that were ALREADY using delayWithTouchPoll().
+Multiple bare delay() calls in the animation pipeline were left untouched.
+
+REMAINING BARE delay() CALLS IN THE ANIMATION PIPELINE
+-------------------------------------------------------
+These are the blocking delays still NOT polling inputs:
+
+1. Locator cue morse flashes (runFreezeZoom3LocatorCue ~lines 7404-7431):
+   - line 7408: delay(ditMs)       — dit flash for zoom1 bbox (~100ms)
+   - line 7410: delay(gapMs)       — gap after zoom1 dit (~100ms)
+   - line 7418: delay(ditMs)       — dit flash for zoom2 bbox (~100ms)
+   - line 7429: delay(dahMs)       — dah flash for zoom3 bbox (~300ms each, x4 loop = ~1.2s total)
+   These total ~1.5-2s of unpolled blocking time.
+
+2. Pin lead-in before clock sweep (~line 9963):
+   - delay(pinLeadMs)              — holds the pin frame before time animation
+   Duration unknown but likely 500ms-1s.
+
+3. Animation frame pacing at end of main loop (~line 10395):
+   - delay(animationDurationMs - el2)  — pads remaining time in 10s animation window
+   THIS IS THE BIGGEST ONE — can block up to 10 SECONDS if frames render fast
+   (e.g., when most frames are already cached and display quickly).
+
+4. Clock sweep tick delay (~line 9985):
+   - delay((uint32_t)waitMs)       — ~31ms per tick
+   HOWEVER: the enclosing while(true) loop already calls serviceUserButtons()
+   and pollCleanModeToggle() at the top of each iteration (lines 9971-9972),
+   so this one is actually fine — it polls every ~31ms tick.
+
+CALLS THAT ARE FINE (not in animation pipeline or already handled):
+- line 8136: delay(fadeDelayMs) — inside goToSleep() fade-out, 10ms steps, user-initiated
+- line 10253: delay(5000)  — "No frames" error screen, not animation
+- line 10269-70: delay(4000) — "NO STREAM" error screens
+- line 10293-94: delay(4000) — "0 frames" error screens
+- line 10300: delay(300)  — auto-update reboot, about to restart anyway
+
+WHAT THE FULL FIX NEEDS
+------------------------
+Convert ALL bare delay() calls in the animation pipeline to
+delayWithInputPoll():
+
+  Line 7408:  delay(ditMs)                    → delayWithInputPoll(ditMs)
+  Line 7410:  delay(gapMs)                    → delayWithInputPoll(gapMs)
+  Line 7418:  delay(ditMs)                    → delayWithInputPoll(ditMs)
+  Line 7429:  delay(dahMs)                    → delayWithInputPoll(dahMs)
+  Line 9963:  delay(pinLeadMs)                → delayWithInputPoll(pinLeadMs)
+  Line 10395: delay(animationDurationMs - el2) → delayWithInputPoll(animationDurationMs - el2)
+
+Line 9985 (clock sweep tick) is OK as-is since the loop already polls.
+
+The rename + serviceUserButtons() addition to delayWithInputPoll() was
+correct — the function itself is fine. The problem is that not all bare
+delay() sites were converted.

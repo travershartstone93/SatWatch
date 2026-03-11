@@ -1,0 +1,420 @@
+What Is Worth Protecting — LiveSat Firmware Security Audit
+===========================================================
+
+This document catalogs everything in the LiveSat ESP32-S3 firmware that
+would be exposed if someone dumped the flash memory via USB/JTAG. It is
+organized by severity to guide encryption and hardening priorities.
+
+The source code on the development PC remains unencrypted. This document
+is about protecting the FLASHED FIRMWARE on shipped/deployed devices.
+
+
+═══════════════════════════════════════════════════════════════════
+ CRITICAL — User Credentials
+═══════════════════════════════════════════════════════════════════
+
+1. WiFi passwords stored in NVS (Non-Volatile Storage)
+   NVS keys: s0-s4 (SSIDs), p0-p4 (passwords) — up to 5 networks
+   Stored as plaintext strings in the "satwatch" NVS namespace.
+   Anyone who dumps flash and reads NVS gets the user's home WiFi
+   password(s). This is the single highest-value target.
+
+2. Hardcoded WiFi credentials in config-s3.h
+   #define WIFI_SSID and WIFI_PASS are compiled into the binary.
+   Currently contains a real home network SSID and password.
+   MUST be removed or replaced with empty defaults before shipping.
+
+3. WiFi Portal AP credentials
+   SSID: "Sat Watch", Password: "123456789"
+   Hardcoded in the firmware. Anyone nearby when the device creates
+   its AP hotspot can connect to the admin portal. Less critical
+   because the AP is only active during initial setup, but the
+   password is trivially weak.
+
+
+═══════════════════════════════════════════════════════════════════
+ HIGH — User Location & Privacy
+═══════════════════════════════════════════════════════════════════
+
+4. Geographic coordinates in RTC memory and NVS
+   - s_weatherCenterLat, s_weatherCenterLon (RTC — survives deep sleep)
+   - NVS keys: loclabel (city name), locfull (full address)
+   - NVS keys: utcoff (UTC offset), utcvalid
+   These persist across power cycles. A flash dump reveals where the
+   user lives (city, region, lat/lon).
+
+5. Geolocation query history
+   The device queries these services to determine location:
+   - Apple BSSID API (sends nearby WiFi MAC addresses to Apple)
+   - ip-api.com (sends public IP, receives lat/lon/timezone)
+   - Starlink router GPS (stubbed, not yet active)
+   Query timing and patterns could reveal movement if logged externally.
+
+6. Hurricane watch suppression list
+   NVS key: hwsup — comma-separated storm IDs the user dismissed.
+   NVS key: hwact — last active storm being tracked.
+   Reveals which storms concerned the user (implies location/interest).
+
+
+═══════════════════════════════════════════════════════════════════
+ HIGH — Proprietary Firmware Logic (Intellectual Property)
+═══════════════════════════════════════════════════════════════════
+
+Honest assessment: no single technique below is a breakthrough
+algorithm. Most are standard embedded/graphics practices. The real
+competitive value is the COMPLETE INTEGRATED SYSTEM — all of these
+pieces working together, debugged and tuned against real hardware
+failures, producing a polished consumer-grade experience on a $15
+microcontroller. A flash dump hands a competitor months of R&D
+for free: not just the algorithms, but every threshold, timing
+constant, and failure-recovery path that only emerged through
+testing on physical devices.
+
+Each item below is rated:
+  ★★★  Genuinely hard-won — required real debugging/discovery
+  ★★   Standard technique, but specific tuning/integration matters
+  ★    Textbook — could be re-derived from public docs in a day
+
+--- Hard-won knowledge (★★★) ---
+
+7. Sleep/wake orchestration with QMI8658 WoM                    ★★★
+   configWakeOnMotion() (not configMotion+enableMotionDetect),
+   100mg threshold for wrist-flick, GPIO21 shared with AMOLED
+   power — requires gpio_reset_pin()+INPUT_PULLUP before arming
+   and OUTPUT+HIGH after wake. Light sleep level-triggered wakeup
+   with defaultPinValue=1.
+
+   WHY IT'S WORTH PROTECTING: This took weeks of debugging (see
+   Shake-Wake-Issue.txt). The QMI8658 WoM interrupt is a toggle
+   pulse, not a latched level — undocumented in the API. GPIO21
+   contention between AMOLED power and IMU interrupt is a hardware
+   gotcha specific to this board that no datasheet warns about.
+   The fix (release GPIO driver → INPUT_PULLUP → read physical
+   state → arm opposite edge → re-drive OUTPUT HIGH after wake) is
+   the kind of knowledge a competitor would have to rediscover
+   from scratch. Off-the-shelf: SensorLib provides WoM examples,
+   but they all use edge-triggered interrupts which don't work
+   with ESP32 light sleep (level-triggered only).
+
+8. Semantic corruption detection suite                          ★★★
+   Multi-layer image validation beyond byte-level checks:
+   - Horizontal band detector: catches SPI bus noise on shared
+     LCD+SD lines (one third of image all-zero, rest normal)
+   - Vertical half-frame detector: catches ST7789 GRAM window
+     stuck in sub-region (left or right half all-zero)
+   - Cyan/white block detector: catches JPEG decode failures
+     that produce 0x00E0 fill in 16×16 MCU blocks
+   - Hold-frame block detector: catches frozen GOES satellite
+     encoder artifacts (repeated scanline patterns)
+   - Bottom-band junk detector: catches partial decode artifacts
+
+   WHY IT'S WORTH PROTECTING: These heuristics were trained on
+   real failure data from months of field testing. Each detector
+   targets a specific failure mode observed on this hardware + data
+   source combination. You cannot write these from first principles
+   — you have to encounter and diagnose each corruption pattern
+   on a physical device. A competitor would need the same months
+   of field testing to develop equivalent robustness. Off-the-shelf:
+   no library exists for "detect weather satellite image corruption
+   on ESP32 with shared SPI bus." This is pure institutional
+   knowledge.
+
+--- Integration value (★★) ---
+
+9. Rolling frame sync protocol                                  ★★
+   Timestamp-based file naming (/frames/EPOCH.jpg), reuse
+   validation via cachedFrameLooksReusable(), stale file deletion,
+   times.bin rewrite — zero-rename rolling update. Handles partial
+   failures, decode failures trigger re-download, meta invalidation
+   removed to prevent boot loops.
+
+   WHY IT MATTERS: The individual pieces (circular buffer, timestamp
+   naming, cache invalidation) are textbook. What's not textbook is
+   how they interact with SD card write unreliability, ESP32 power
+   failures mid-sync, and the specific failure mode where meta
+   invalidation caused boot loops (removed after field testing).
+   The failure-recovery paths are the IP — not the happy path.
+   Open-sourceable? Yes. A competitor still saves weeks of
+   integration testing by copying this.
+
+10. Multi-stage zoom and terrain compositing                    ★★
+    Three zoom levels (2×, 4×, 8× supersampled), location-centered
+    viewport with 250km floor, day/night terrain crossfade using
+    NASA BlueMarble + VIIRS Black Marble, radar reflectivity
+    overlay with freshness tracking, 18-step interpolated wipe.
+    Terrain day/night auto-selection by UTC hour. MCU-aligned source
+    resolution (320×176 = 20×11 MCUs) avoids JPEG padding artifacts.
+
+    WHY IT MATTERS: Multi-resolution tiling and day/night switching
+    are standard GIS concepts. The integration-specific value is in
+    the tuned parameters: the 250km viewport floor, the specific
+    zoom ratios that look good on a 2" AMOLED, the wipe step count
+    that feels smooth at the ESP32's frame rate, and the MCU
+    alignment choice (standard JPEG knowledge, but the specific
+    resolution took trial and error to balance quality vs. SD read
+    speed vs. memory). Could use off-the-shelf: map tile libraries
+    exist for phones/desktops but nothing targets a 410×360 AMOLED
+    on an ESP32 with 8MB PSRAM.
+
+11. Pre-scaled binary frame cache                               ★★
+    144 frames stored as pre-decoded RGB565 in a single stream.raw
+    file (~42.5 MB). Eliminates per-frame JPEG decode on playback.
+    Inline raw build during download (lazy init on first success).
+
+    WHY IT MATTERS: Pre-decoding assets to native format is an
+    ancient game dev trick. The integration value is in the inline
+    build (JPEG decode + raw write happen during download, not as a
+    separate 155-second pass), the lazy init (first successful
+    decode opens the raw file), and the specific frame size tuning
+    (410×360×2 bytes = 295,200 bytes/frame × 144 = ~42.5 MB fits
+    on a 32GB SD card alongside everything else). Could be open-
+    sourced — this is solid engineering, not secret sauce.
+
+12. Bilinear interpolation scaling pipeline                     ★★
+    Custom 320×176 → 410×360 scaler with fixed-point math. 4-point
+    interpolation via lerp565_16() using packed bit-field single-
+    multiply technique for RGB565 channel blending. Pixel byte-swap
+    normalization detects LGFX bus-dependent byte order. Dirty-rect
+    variant for clock overlay partial updates.
+
+    WHY IT MATTERS: The packed-channel RGB565 blend trick is ~30
+    years old (Graphics Gems era). The byte-swap normalization for
+    LGFX is obvious in hindsight but took debugging to discover.
+    The dirty-rect clock overlay is textbook. The integration value
+    is that it all works together at the ESP32's clock speed with
+    acceptable frame rates — the specific fixed-point precision
+    and scaling ratios were tuned by eye. Off-the-shelf: LGFX has
+    a built-in scaler, but it doesn't support dirty-rect partial
+    updates or the specific quality/speed tradeoff needed here.
+
+13. Clock overlay sweep animation                               ★★
+    Column-by-column directional fade with feathered leading edge,
+    smoothstep8 fixed-point easing (integer-only, no FPU),
+    quadratic falloff for edge softness. Configurable font/color/
+    duration, drop shadow, background capture, per-pixel alpha
+    blending, left-to-right text reveal.
+
+    WHY IT MATTERS: Every piece is standard graphics (smoothstep,
+    alpha blending, drop shadows). The value is in the specific
+    easing curve, feather width, and timing that look polished on
+    this display at this frame rate. These parameters took iterative
+    tuning. Could use off-the-shelf: LVGL has animation primitives,
+    but integrating LVGL on this board would add significant
+    complexity and memory overhead for one animation effect.
+
+14. Apple BSSID geolocation with hand-built protobuf            ★★
+    Custom varint encoder/decoder for Apple's location services
+    protocol — no protobuf library dependency. Scans nearby WiFi
+    BSSIDs, encodes into Apple's undocumented wire format, parses
+    lat/lon response. Falls back to ip-api.com on failure.
+
+    WHY IT MATTERS: Hand-rolling protobuf is common in firmware
+    (saves ~100KB vs. nanopb library). The value is in the reverse-
+    engineered wire format for Apple's private API — field numbers,
+    message nesting, response parsing. This protocol isn't publicly
+    documented by Apple. The implementation was adapted from open-
+    source projects that reverse-engineered the format, so it's
+    not truly secret, but it saves a competitor the research time.
+    Off-the-shelf: Google's geolocation API requires an API key
+    and billing. Apple's is free but undocumented.
+
+--- Standard practice (★) ---
+
+15. Frame integrity verification                                ★
+    verifyCommittedFrameIntegrity() does full sequential read +
+    jpegEffectiveLength() (not just SOI+EOI spot-check). SD
+    flush+delay before verify read-back to defeat write cache.
+
+    HONEST ASSESSMENT: This is basic defensive programming. SOI/EOI
+    checking is in every JPEG tutorial. The flush+delay before
+    read-back is the only non-obvious part (SD write cache can
+    return stale data on immediate re-read). Could be open-sourced
+    with zero competitive risk.
+
+16. FT3168 touch zone implementation                            ★
+    Direct I2C protocol (no SensorLib), GPIO9 hardware reset,
+    coordinate-based hit-testing for moon region, 150ms release
+    debounce for I2C glitches, fast-tap detection when finger
+    lifts before first I2C read.
+
+    HONEST ASSESSMENT: Direct I2C register reads are what every
+    touch library does under the hood. The FT3168 register map is
+    in the vendor datasheet. Hit-testing a bounding box is trivial.
+    The only non-obvious bits: GPIO9 hardware reset is required
+    before the IC responds (not in all datasheets), and the
+    fast-tap race condition (IRQ fires but finger lifts before
+    I2C poll during 33-70ms animation loop iterations). These are
+    integration bugs, not novel algorithms. Could be open-sourced.
+
+17. GIBS time-domain scanning                                   ★
+    Parses NASA GIBS DescribeDomains XML to find latest available
+    imagery. Binary search snaps to nearest valid granule. Range
+    expansion handles GOES outage gaps.
+
+    HONEST ASSESSMENT: Binary search + XML parsing. The GIBS API
+    is publicly documented. Any developer reading the GIBS docs
+    would implement this identically. Could be open-sourced — it
+    might even help the GIBS developer community.
+
+18. Satellite auto-selection by longitude                       ★
+    Selects GOES-East vs. GOES-West vs. Himawari based on user
+    longitude with ±2° hysteresis band.
+
+    HONEST ASSESSMENT: Three if-statements with hardcoded
+    geographic boundaries. Hysteresis is control theory 101. The
+    satellite coverage boundaries are published by NOAA. Zero
+    competitive value. Open-source freely.
+
+19. ES8311 audio codec I2S pipeline                             ★
+    I2S→ES8311→speaker with PA sequencing (mute → silence → enable
+    PA → silence → play) to prevent audible pops.
+
+    HONEST ASSESSMENT: Uses Espressif's stock ES8311 driver with
+    standard API calls. Pop elimination via silence settling is
+    1980s analog audio practice. The Waveshare board examples
+    demonstrate the same I2S setup. Zero novel content. Could be
+    open-sourced.
+
+20. MCU-aligned JPEG resolution strategy                        ★
+    Source imagery requested at 320×176 (= 20×11 MCU blocks of
+    16×16). Avoids JPEG partial-block padding artifacts.
+
+    HONEST ASSESSMENT: "Make your JPEG dimensions divisible by 16"
+    is documented in every JPEG encoder manual and the JPEGDEC
+    library README. This is not a discovery — it's following
+    instructions. Zero competitive value.
+
+
+═══════════════════════════════════════════════════════════════════
+ MODERATE — Behavioral Metadata
+═══════════════════════════════════════════════════════════════════
+
+21. Update schedule preferences
+    NVS keys: updm, updi, upth, scht — reveal when the user wants
+    weather updates (e.g., every 15 min vs. once per hour), which
+    implies activity patterns.
+
+22. Satellite imagery fetch patterns
+    GOES-East vs. GOES-West selection, bounding box coordinates,
+    time windows — all logged by NASA GIBS servers. Reveals the
+    geographic area the user is watching.
+
+23. Radar fetch area
+    NOAA radar queries include a lat/lon bounding box centered on
+    the user's location. Server-side logs could correlate device
+    identity with location.
+
+24. Display and UX preferences
+    NVS keys: clkfn, clkclr, dbrght, anispd, clkdur, clnmd, clna,
+    t12, lbsl, stwk — not sensitive individually but collectively
+    fingerprint a specific user's device.
+
+
+═══════════════════════════════════════════════════════════════════
+ LOW — Public or Non-Sensitive
+═══════════════════════════════════════════════════════════════════
+
+25. API endpoint URLs
+    All external services are public and free (no API keys):
+    - NASA GIBS WMS/WMTS (satellite imagery)
+    - NOAA NHC (hurricane data)
+    - NOAA radar reflectivity
+    - NASA SVS (moon phase frames)
+    - ip-api.com (geolocation fallback)
+    - Google connectivity check
+    These URLs are discoverable from any weather app.
+
+26. Moon phase algorithm
+    Standard synodic month calculation:
+    Reference new moon: Jan 6, 2000 18:14 UTC
+    Synodic period: 29.53058770576 days
+    Publicly known astronomy formula.
+
+27. Board pin configurations
+    I2C addresses (QMI8658=0x6B, RTC=0x51, PMIC=0x34, Touch=0x38),
+    GPIO assignments, SPI bus config. All documented in the public
+    Waveshare ESP32-S3-Touch-AMOLED-2.06 datasheet and pin_config.h.
+
+28. Display calibration
+    ST7789/AMOLED offset values, SPI frequencies, rotation settings.
+    Board-specific, publicly documented.
+
+29. Audio codec registers
+    ES8311 I2C register definitions. Standard codec, Apache-2.0
+    licensed driver from Espressif.
+
+
+═══════════════════════════════════════════════════════════════════
+ What Encryption Protects Against
+═══════════════════════════════════════════════════════════════════
+
+ESP32 Flash Encryption (AES-256-XTS):
+  ✓ Prevents reading compiled firmware via USB/JTAG flash dump
+  ✓ Protects proprietary algorithms from decompilation
+  ✓ Prevents firmware cloning to counterfeit devices
+  ✗ Does NOT protect NVS data (needs separate NVS encryption)
+
+ESP32 NVS Encryption:
+  ✓ Protects WiFi passwords stored in NVS
+  ✓ Protects location data (lat/lon, city names)
+  ✓ Protects user preferences and behavioral metadata
+  ✗ Requires a partition-level encryption key
+
+ESP32 Secure Boot (v2):
+  ✓ Prevents loading modified/malicious firmware
+  ✓ Ensures only signed firmware can run
+  ✗ Does not protect data at rest (use with flash encryption)
+
+
+═══════════════════════════════════════════════════════════════════
+ What Encryption Does NOT Protect Against
+═══════════════════════════════════════════════════════════════════
+
+- Network sniffing: Most API calls use HTTPS. Exception: ip-api.com
+  uses HTTP (free tier limitation). WiFi traffic is WPA2-encrypted
+  at the link layer but visible to anyone on the same network.
+
+- Physical SD card access: Frame cache (stream.raw), audio cues,
+  diag.txt are on a removable SD card. Not encrypted. Contains
+  satellite imagery (public data) and diagnostic logs.
+
+- Serial console output: Debug logs via USB serial expose sync
+  timing, WiFi connection status, API responses, frame counts.
+  Disable ENABLE_SERIAL_DIAG before shipping.
+
+- Runtime memory: While the device is running, decrypted firmware
+  and NVS data are in RAM. A JTAG debugger could read them.
+  Secure Boot + flash encryption + eFuse JTAG disable mitigates.
+
+- Side-channel attacks: Power analysis, electromagnetic emanation,
+  timing attacks. Not practical for this threat model.
+
+
+═══════════════════════════════════════════════════════════════════
+ Pre-Shipping Checklist
+═══════════════════════════════════════════════════════════════════
+
+Before flashing a device for distribution:
+
+  □ Remove hardcoded WiFi credentials from config-s3.h
+    (replace WIFI_SSID/WIFI_PASS with empty strings)
+  □ Change portal AP password from "123456789" to something stronger
+    (or generate per-device)
+  □ Set ENABLE_SERIAL_DIAG to 0
+  □ Enable ESP32 flash encryption (one-time eFuse burn)
+  □ Enable NVS encryption with partition-level key
+  □ Enable Secure Boot v2 with signing key
+  □ Disable JTAG via eFuse
+  □ Clear any test NVS data (WiFi networks, location)
+  □ Verify ip-api.com fallback is acceptable (HTTP, not HTTPS)
+
+
+═══════════════════════════════════════════════════════════════════
+ File Locations
+═══════════════════════════════════════════════════════════════════
+
+Main firmware:  esp32-LiveSat-s3/esp32-LiveSat-s3.ino
+Configuration:  esp32-LiveSat-s3/config-s3.h
+Audio codec:    esp32-LiveSat-s3/es8311.h, es8311_reg.h
+NVS namespace:  "satwatch" (all keys listed above)
+SD card root:   /frames/, /diag.txt, /*.raw (audio cues)
