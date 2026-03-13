@@ -1867,3 +1867,115 @@ Location: serviceUserButtons(), portalFriendlyDelay(), pollCleanModeToggle(),
       release after touching==0 persists for >150ms (RELEASE_DEBOUNCE_MS).
 
 Location: initCleanModeTouch(), readFtTouchPoint(), pollCleanModeToggle()
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. Device Security Hardening (Pre-shipping)
+────────────────────────────────────────────────────────────────────────────────
+
+Problem:
+   Firmware was "naked" — anyone with USB access could dump flash and extract
+   proprietary rendering logic, user WiFi passwords (NVS plaintext), location
+   data, and debug logs from the SD card's diag.txt.
+
+Code-level changes (applied, no eFuse burns):
+
+   a) Hardcoded WiFi credentials removed from config-s3.h
+      WIFI_SSID and WIFI_PASS set to empty strings. Previously contained a
+      real home network SSID/password that would compile into every binary.
+
+   b) Serial debug output disabled
+      ENABLE_SERIAL_DIAG set to 0 in config-s3.h. All Serial.print/println/
+      printf calls compile to no-ops via NullSerialSink class (line 87-96).
+      Added operator bool() to NullSerialSink so `while (!Serial)` compiles.
+
+   c) SD card diagnostic logging disabled
+      Added ENABLE_DIAG_LOG flag (config-s3.h, default 0). appendDiagLog()
+      (line 5212) wrapped in #if ENABLE_DIAG_LOG — compiles to empty inline
+      when disabled. diag.txt was the only SD file containing sensitive data
+      (WiFi SSIDs, lat/lon coordinates, connection status).
+
+   d) Per-device WiFi portal AP password
+      Replaced hardcoded "123456789" with s_portalApPass[], generated at boot
+      from ESP.getEfuseMac() (chip-unique). Each device gets a different
+      9-digit AP password. Password is still displayed on the AMOLED screen
+      during setup (user must see it to connect).
+
+   e) NVS survives firmware updates
+      Normal arduino-cli upload only writes the app partition (0x10000+), NOT
+      the NVS partition (0x9000). User WiFi credentials and preferences
+      persist across firmware updates. Only a full erase_flash wipes NVS.
+
+Flash-level hardening (harden-device.sh, run per production device):
+
+   The script handles eFuse burns with confirmations. Each step is irreversible.
+
+   - Flash encryption (AES-256-XTS): burns key to eFuse BLOCK_KEY0, enables
+     SPI_BOOT_CRYPT_CNT. Protects firmware + NVS from flash dump. Development
+     mode allows reflashing with --encrypt flag + key file.
+
+   - Secure Boot v2 (RSA-3072): burns signing key digest to BLOCK_KEY1,
+     enables SECURE_BOOT_EN. Only signed firmware can boot.
+
+   - JTAG disable: burns DIS_USB_JTAG and DIS_PAD_JTAG eFuses. Prevents
+     debugger access to running memory.
+
+   - Release mode (commented out): fully burns SPI_BOOT_CRYPT_CNT, read-
+     protects key. Device can NEVER be reflashed. Current partition table
+     has no OTA partition, so this is truly permanent. Do not use without
+     adding OTA support first.
+
+What remains unprotected:
+   - SD card imagery (public NASA/NOAA satellite data, not worth encrypting)
+   - SD card audio cues (WAV files, not sensitive)
+   - USB serial port is accessible but produces no output
+
+Security audit document: What_is_worth_protecting.txt
+Hardening script: harden-device.sh
+Key storage: .keys/ (gitignored, never committed)
+
+Location: config-s3.h, setup(), appendDiagLog(), harden-device.sh
+
+═══════════════════════════════════════════════════════════════
+FIX: "Time Always On" display mode + clock ghost on zoom snapshots
+═══════════════════════════════════════════════════════════════
+
+Feature: 4-state display mode cycled via moon tap:
+  0 = Normal     — bars visible, clock only during dedicated segment
+  1 = Clean      — bars hidden, no persistent clock
+  2 = Time+Clean — bars hidden, clock always visible
+  3 = Time+Bars  — bars visible, clock always visible
+
+Implementation:
+  - Replaced s_cleanModeActive bool with s_displayMode enum (RTC_DATA_ATTR,
+    survives sleep). Helpers: isCleanMode(), isTimeAlwaysOn().
+  - NVS key changed from "clna" (bool) to "dmod" (uint8).
+  - drawAlwaysOnClockOverlay() stamps clock text (shadow + main) at full
+    opacity into s_frameDisplayBuf using existing clock FX sprite infra.
+    Called from presentScaledBuf() after applyBarsToBuf().
+  - When time-always-on, dedicated clock fade segment is skipped; terrain
+    hold uses delayWithInputPoll(clockOverlayMs) to keep loop duration
+    consistent.
+
+Bug fixed — clock ghost on zoom/terrain transitions:
+  Root cause: drawAlwaysOnClockOverlay() burned clock text into
+  s_frameDisplayBuf in-place. Terrain crossfade reads s_frameDisplayBuf as
+  its ZOOM3 base image, so the burned-in clock bled through the alpha blend,
+  producing a ghost/double image on the first crossfade step.
+  Fix: presentScaledBuf() now saves the clock region via saveSpriteRegionToDlBuf()
+  before stamping, pushes the composited frame to the AMOLED, then restores
+  the clean buffer via restoreSpriteRegionFromDlBuf(). Downstream code
+  (terrain crossfade, zoom transitions) always sees a clock-free buffer.
+
+Touch responsiveness fix:
+  - Fast taps (finger lifted before I2C poll) were silently discarded because
+    touching==0 meant no coords to confirm moon zone. Now accepted as moon
+    taps since moon is the only interactive zone in normal mode.
+  - Debounce reduced from 500ms to 300ms.
+
+Arduino preprocessor fix:
+  - Moved ClockOverlayLayout struct before enum DisplayMode to prevent
+    auto-generated prototypes referencing the struct before its definition.
+
+Location: presentScaledBuf(), drawAlwaysOnClockOverlay(), cycleDisplayMode(),
+          pollCleanModeToggle(), loadWifiPortalConfig(), sendWifiPortalPage()

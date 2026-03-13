@@ -3,8 +3,8 @@
 // =============================================================
 //  WiFi — edit these
 // =============================================================
-#define WIFI_SSID          "TELUS7556"
-#define WIFI_PASS          "PhdRxmb5Cz5G"
+#define WIFI_SSID          ""
+#define WIFI_PASS          ""
 
 // =============================================================
 //  Fetch window
@@ -38,7 +38,23 @@
 // =============================================================
 #define SLEEP_HOURS          6    // hours to sleep between play sessions
 
-#define ENABLE_SERIAL_DIAG 1
+#define ENABLE_SERIAL_DIAG 0
+
+// Set to 0 to disable writing diag.txt to SD card (production builds)
+#define ENABLE_DIAG_LOG    1
 
 // Uncomment for off-season hurricane watch testing (injects fake Cat 3 storm)
 // #define HURRICANE_TEST_MODE 1
+
+// =============================================================
+//  Forecast / Nowcast
+// =============================================================
+#define NOWCAST_BBOX_HALF_DEG   0.8f    // ~90km half-width for radar fetch
+#define NOWCAST_FRAME_COUNT     6       // radar snapshots to analyze (30 min span)
+#define NOWCAST_FRAME_STEP_MS   (5ULL * 60ULL * 1000ULL)  // 5 min between frames
+#define NOWCAST_ANALYSIS_PATCH  10      // 10x10 pixel sample patch
+#define NOWCAST_UPWIND_KM       80.0f   // how far upwind to sample
+#define FORECAST_ICON_PX        27      // weather/bar icon size in pixels (max for ~31px bar)
+#define NOWCAST_PIXEL_SAT_MIN   10      // min saturation to classify as radar signal (was 5)
+#define NOWCAST_PIXEL_LUM_MIN   20      // min luminance to classify as radar signal (was 8)
+#define NOWCAST_RAIN_INTENSITY  30      // min avg intensity to declare rain (was 15)

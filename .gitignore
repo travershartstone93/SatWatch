@@ -10,6 +10,9 @@
 *.bak
 .arduino15/
 
+# Security keys — NEVER commit these
+.keys/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -55,6 +55,7 @@
 #include <JPEGDEC.h>
 
 #include "config-s3.h"
+#include "flags_rgb565.h"
 
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
 #define BOARD_IS_AMOLED_206 1
@@ -90,6 +91,7 @@ public:
   template <typename... Args> inline size_t print(Args...) { return 0; }
   template <typename... Args> inline size_t println(Args...) { return 0; }
   template <typename... Args> inline size_t printf(const char*, Args...) { return 0; }
+  inline operator bool() const { return true; }
 };
 static NullSerialSink s_nullSerial;
 #define Serial s_nullSerial
@@ -164,7 +166,8 @@ static NullSerialSink s_nullSerial;
 #define WEATHER_VIEW_META_FILE SD_ROOT "/frames/view.meta"
 #define CACHE_VALIDATE_META_FILE SD_ROOT "/frames/validate.meta"
 #define WIFI_PORTAL_AP_SSID  "Sat Watch"
-#define WIFI_PORTAL_AP_PASS  "123456789"
+// AP password derived from chip MAC at runtime — see s_portalApPass[]
+#define WIFI_PORTAL_AP_PASS  s_portalApPass
 #define WIFI_PORTAL_HOSTNAME "satwatch"
 #define ZOOM_SNAPSHOT_META_FILE SD_ROOT "/frames/zoom.meta"
 
@@ -529,6 +532,9 @@ static bool s_wifiPortalApActive = false;
 static bool s_wifiPortalMdnsRunning = false;
 static bool s_startCuePending = false;
 
+// Per-device AP password derived from chip MAC (generated once at boot)
+static char s_portalApPass[12] = "000000000";
+
 // Display preferences (portal "Display" card)
 static uint8_t  s_clockFontIdx      = 1;        // 0=Small(40), 1=Medium(56), 2=Large(72)
 static uint32_t s_clockColorRGB     = 0xFFFFFF;  // 24-bit RGB for clock text
@@ -583,10 +589,68 @@ static uint16_t s_shakeConfirmMs     = 600;   // after settle: require 2nd WoM e
 static SensorQMI8658 s_qmi;
 static bool s_qmiInitialized = false;
 static bool s_qmiInitFailed = false;  // sticky — prevents infinite retry on hardware failure
-// ──── Clean display mode ────
-RTC_DATA_ATTR static bool s_cleanModeActive = false;   // current toggle state (survives sleep)
+// ──── Forecast data structures ────────────────────────────────────────────────
+struct NowcastSample {
+  time_t   timestamp;
+  uint16_t avgIntensityAtUser;
+  uint16_t avgIntensityUpwind;
+  uint16_t maxIntensityUpwind;
+};
+struct HourlyForecast {
+  time_t  startTime;
+  int8_t  tempC;
+  uint8_t precipProbability;   // 0-100
+  uint8_t windSpeedKmh;
+  uint8_t windDirDeg16;        // 0-22 (x16 = degrees)
+  char    shortForecast[32];
+};
+struct DailyForecast {
+  time_t  date;
+  int8_t  highC, lowC;
+  uint8_t precipProbability;
+  uint8_t weatherCode;         // WMO 0-99
+  char    shortForecast[32];
+};
+struct ForecastData {
+  NowcastSample  nowcast[NOWCAST_FRAME_COUNT];
+  uint8_t        nowcastCount;
+  int16_t        rainEtaMinutes;      // -1=none, 0=raining, >0=ETA
+  int16_t        rainUncertaintyMin;  // ± minutes
+  HourlyForecast hourly[12];
+  uint8_t        hourlyCount;
+  DailyForecast  daily[5];
+  uint8_t        dailyCount;
+  time_t         lastSyncUtc;
+  bool           nwsAvailable;
+  bool           valid;
+};
+RTC_DATA_ATTR static ForecastData s_forecast = {};
+static bool s_forecastEnabled       = true;
+static bool s_forecastUseFahrenheit = true;
+static char s_nwsGridUrl[128]       = {};
+static bool s_nwsGridUrlValid       = false;
+static char s_geoCountryCode[4]     = {};   // "CA", "US", "GB", "VG"
+static char s_geoRegionCode[4]      = {};   // "BC", "FL", "TX"
+// ──────────────────────────────────────────────────────────────────────────────
+struct ClockOverlayLayout {
+  int textX, textY;
+  int textW, textH;
+  float textSize;
+  int bgX, bgY, bgW, bgH;  // saved/restore region in s_frameDisplayBuf
+};
+// ──── Display mode (normal / clean / time-on-clean / time-on-bars) ────
+enum DisplayMode : uint8_t {
+  DISPLAY_NORMAL       = 0,  // bars visible, clock during segment only
+  DISPLAY_CLEAN        = 1,  // bars hidden, no persistent clock
+  DISPLAY_TIME_CLEAN   = 2,  // bars hidden + clock always on
+  DISPLAY_TIME_BARS    = 3,  // bars visible + clock always on
+};
+RTC_DATA_ATTR static uint8_t s_displayMode = DISPLAY_NORMAL;
+static inline bool isCleanMode()    { return s_displayMode == DISPLAY_CLEAN || s_displayMode == DISPLAY_TIME_CLEAN; }
+static inline bool isTimeAlwaysOn() { return s_displayMode == DISPLAY_TIME_CLEAN || s_displayMode == DISPLAY_TIME_BARS; }
 static bool s_cleanModeFeatureEnabled = false;          // portal checkbox (loaded from NVS)
 static bool s_fullscreenMode = false;                   // runtime-only, resets on reboot/sleep
+static bool s_pinOverlayRequested = false;              // stamp location pin in next presentScaledBuf
 #if BOARD_IS_AMOLED_206
 static I2SClass s_audioI2s;
 static es8311_handle_t s_audioCodec = nullptr;
@@ -622,12 +686,6 @@ static volatile uint32_t s_topBtnPressStartMs = 0;
 static volatile uint32_t s_topBtnReleaseMs = 0;
 static bool s_topBtnIgnoreUntilRelease = false;
 
-struct ClockOverlayLayout {
-  int textX, textY;
-  int textW, textH;
-  float textSize;
-  int bgX, bgY, bgW, bgH;  // saved/restore region in s_frameDisplayBuf
-};
 static void showMessage(const char* line1, const char* line2);
 static void serviceWifiPortalServer();
 static bool connectWifiForSync(bool required, const char* statusLine);
@@ -811,7 +869,8 @@ static void loadWifiPortalConfig() {
         strlcpy(s_hurricaneAlertSound, "/hurricane_alert.raw", sizeof(s_hurricaneAlertSound));
       // Clean display mode
       s_cleanModeFeatureEnabled = prefs.getBool("clnmd", false);
-      s_cleanModeActive = prefs.getBool("clna", false);
+      s_displayMode = prefs.getUChar("dmod", 0);
+      if (s_displayMode > 3) s_displayMode = 0;
       // Display preferences
       s_clockFontIdx      = prefs.getUChar("clkfn", 1);
       if (s_clockFontIdx > 2) s_clockFontIdx = 1;
@@ -821,6 +880,11 @@ static void loadWifiPortalConfig() {
       if (s_animSpeedIdx > 2) s_animSpeedIdx = 1;
       s_clockDurIdx       = prefs.getUChar("clkdur", 1);
       if (s_clockDurIdx > 2) s_clockDurIdx = 1;
+      // Forecast config
+      s_forecastEnabled       = prefs.getBool("fcen", true);
+      s_forecastUseFahrenheit = prefs.getBool("fcuf", true);
+      prefs.getString("nwsgu", s_nwsGridUrl, sizeof(s_nwsGridUrl));
+      s_nwsGridUrlValid = (s_nwsGridUrl[0] != '\0');
     }
     prefs.end();
   }
@@ -1190,7 +1254,7 @@ static void sendWifiPortalPage() {
   html += F("<div style='margin-top:8px'><label class='flex items-center gap-2 text-sm text-gray-200'>");
   html += F("<input type='checkbox' name='clnmd' value='1'");
   if (s_cleanModeFeatureEnabled) html += F(" checked");
-  html += F(">Clean display (tap moon to hide overlays)</label></div>");
+  html += F(">Display modes (tap moon: normal / clean / time+clean / time+bars)</label></div>");
   html += F("</div>");
   html += F("<div class='hint'>Portal AP: Sat Watch / 123456789</div>");
   html += F("<div class='hint'>Portal URL: http://satwatch.local/</div>");
@@ -1199,7 +1263,7 @@ static void sendWifiPortalPage() {
     html += htmlEscape(WiFi.localIP().toString().c_str());
     html += F("</div>");
   }
-  html += F("</div><button type='submit'>Save and Reboot</button></form>");
+  html += F("</div>");
   html += F("<script>"
             "var s_rowCount=0;"
             "function minToHMAmpm(m){"
@@ -1311,6 +1375,23 @@ static void sendWifiPortalPage() {
   if (s_clockDurIdx == 2) html += F(" selected");
   html += F(">Long (10s)</option></select></div>");
 
+  // ── Forecast card ──
+  html += F("<div class='card' style='margin-top:14px;'>"
+            "<h2 style='margin-bottom:8px;'>Forecast</h2>"
+            "<label style='display:flex;align-items:center;gap:6px;margin-bottom:8px;'>"
+            "<input type='checkbox' name='fcen' value='1' style='width:auto;'");
+  if (s_forecastEnabled) html += " checked";
+  html += F("> Enable weather forecast in bottom bar</label>"
+            "<div style='margin-bottom:8px;'><label>Temperature unit: "
+            "<select name='fcunit'><option value='f'");
+  if (s_forecastUseFahrenheit) html += " selected";
+  html += F(">Fahrenheit</option><option value='c'");
+  if (!s_forecastUseFahrenheit) html += " selected";
+  html += F(">Celsius</option></select></label></div>"
+            "<p style='font-size:0.85em;color:#aaa;margin:0;'>"
+            "Rain approach + hourly + 48hr forecast. NOAA radar + NWS (US/territories) or ECMWF (worldwide).</p>"
+            "</div>");
+
   html += F(
             "<div class='card' style='margin-top:14px;border:1px solid #f59e0b;'>"
               "<h2 style='color:#fbbf24;margin-bottom:8px;'>Hurricane Watch</h2>"
@@ -1363,10 +1444,12 @@ static void sendWifiPortalPage() {
     }
   }
   html += F(
-              "<form method='POST' action='/hwclearsup' style='margin-top:8px;'>"
-                "<button type='submit' style='background:#374151;width:auto;padding:4px 14px;font-size:13px;'>Clear suppression list</button>"
-              "</form>"
             "</div>"
+            "<button type='submit' style='margin-top:14px;'>Save and Reboot</button>"
+            "</form>"
+            "<form method='POST' action='/hwclearsup' style='margin-top:8px;text-align:center;'>"
+              "<button type='submit' style='background:#374151;width:auto;padding:4px 14px;font-size:13px;'>Clear suppression list</button>"
+            "</form>"
             "<div class='hint' style='margin-top:14px;text-align:center;'>"
               "<a href='/diag' target='_blank' style='color:#60a5fa;'>View Boot Log</a>"
             "</div>"
@@ -1493,6 +1576,18 @@ static void handleWifiPortalSave() {
   if (s_clockDurIdx > 2) s_clockDurIdx = 1;
   saveDisplayPrefs();
 
+  // Forecast settings
+  s_forecastEnabled = s_wifiPortalServer.hasArg("fcen");
+  s_forecastUseFahrenheit = (s_wifiPortalServer.arg("fcunit") != "c");
+  {
+    Preferences fPrefs;
+    if (fPrefs.begin("satwatch", false)) {
+      fPrefs.putBool("fcen", s_forecastEnabled);
+      fPrefs.putBool("fcuf", s_forecastUseFahrenheit);
+      fPrefs.end();
+    }
+  }
+
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
                        (StartCueMode)mode, (uint8_t)chimeVol, autoUpdateInSleep,
                        schedCount, schedMins, loopsBeforeSleep, shakeToWake,
@@ -1507,13 +1602,57 @@ static void handleWifiPortalSave() {
 
 static void sendDiagHandler() {
   s_wifiPortalServer.sendHeader("Cache-Control", "no-cache");
+  String resp;
+  resp.reserve(2048);
+  // Part 1: existing diag.txt from SD
   File f = SD.open(SD_ROOT "/diag.txt", FILE_READ);
-  if (!f) {
-    s_wifiPortalServer.send(200, "text/plain", "(no diag.txt on SD)");
-    return;
+  if (f) {
+    while (f.available()) {
+      char buf[256];
+      int n = f.readBytes(buf, sizeof(buf) - 1);
+      buf[n] = '\0';
+      resp += buf;
+    }
+    f.close();
+  } else {
+    resp += "(no diag.txt on SD)\n";
   }
-  s_wifiPortalServer.streamFile(f, "text/plain");
-  f.close();
+  // Part 2: live forecast state
+  resp += "\n--- forecast state ---\n";
+  char line[256];
+  snprintf(line, sizeof(line),
+           "forecast: enabled=%d valid=%d eta=%d unc=%d nc=%d hr=%d dy=%d nws=%d\n",
+           (int)s_forecastEnabled, (int)s_forecast.valid,
+           (int)s_forecast.rainEtaMinutes, (int)s_forecast.rainUncertaintyMin,
+           (int)s_forecast.nowcastCount, (int)s_forecast.hourlyCount,
+           (int)s_forecast.dailyCount, (int)s_forecast.nwsAvailable);
+  resp += line;
+  time_t nowUtc = time(nullptr);
+  for (int i = 0; i < (int)s_forecast.hourlyCount; i++) {
+    int hoursOut = (int)((s_forecast.hourly[i].startTime - nowUtc) / 3600);
+    snprintf(line, sizeof(line), "hourly[%d]: +%dh precip=%d%% wind=%dkm/h@%ddeg \"%s\"\n",
+             i, hoursOut, (int)s_forecast.hourly[i].precipProbability,
+             (int)s_forecast.hourly[i].windSpeedKmh,
+             (int)s_forecast.hourly[i].windDirDeg16 * 16,
+             s_forecast.hourly[i].shortForecast);
+    resp += line;
+  }
+  for (int i = 0; i < (int)s_forecast.dailyCount; i++) {
+    int hoursOut = (int)((s_forecast.daily[i].date - nowUtc) / 3600);
+    snprintf(line, sizeof(line), "daily[%d]: +%dh hi=%d lo=%d precip=%d%% \"%s\"\n",
+             i, hoursOut, (int)s_forecast.daily[i].highC, (int)s_forecast.daily[i].lowC,
+             (int)s_forecast.daily[i].precipProbability,
+             s_forecast.daily[i].shortForecast);
+    resp += line;
+  }
+  for (int i = 0; i < (int)s_forecast.nowcastCount; i++) {
+    snprintf(line, sizeof(line), "nowcast[%d]: user=%d upwind=%d maxUp=%d\n",
+             i, (int)s_forecast.nowcast[i].avgIntensityAtUser,
+             (int)s_forecast.nowcast[i].avgIntensityUpwind,
+             (int)s_forecast.nowcast[i].maxIntensityUpwind);
+    resp += line;
+  }
+  s_wifiPortalServer.send(200, "text/plain", resp);
 }
 
 static void handleClearHurricaneSuppression() {
@@ -1527,7 +1666,21 @@ static void handleClearHurricaneSuppression() {
 }
 
 static void handleClearFrames() {
-  // Invalidate the frame cache so the next boot triggers a full re-download.
+  // Delete all files in the frames directory, then remove index/meta files.
+  File dir = SD.open(FRAMES_DIR);
+  if (dir && dir.isDirectory()) {
+    File entry;
+    // Collect names first — deleting while iterating can skip entries.
+    String names[200];
+    int n = 0;
+    while ((entry = dir.openNextFile()) && n < 200) {
+      if (!entry.isDirectory()) names[n++] = String("/frames/") + entry.name();
+      entry.close();
+    }
+    dir.close();
+    for (int i = 0; i < n; i++) SD.remove(names[i].c_str());
+    Serial.printf("portal: purged %d files from /frames\n", n);
+  }
   SD.remove(INDEX_BIN_FILE);
   SD.remove(INDEX_TMP_FILE);
   SD.remove(META_FILE);           // legacy cleanup
@@ -2123,40 +2276,29 @@ static int wifiBarsForRssi(int rssi) {
 }
 
 static void drawWifiIndicator(LGFX_Sprite& spr, int x, int y, int w, int h, int rssi, bool connectedNow) {
-  // Fixed 24×20 monochrome icon asset following a standard mobile Wi‑Fi
-  // silhouette: three arcs plus a separate bottom dot.
+  // 24×14 monochrome Wi-Fi icon — flatter arcs to avoid vertical stretch.
   static const uint32_t outerArc[] = {
-    0b000000000111111000000000,
-    0b000000011111111110000000,
-    0b000000111111111111000000,
-    0b000011111000001111110000,
-    0b000111100000000001111000,
-    0b001111000000000000111100,
+    0b000000011111111100000000,
+    0b000001111000000111100000,
+    0b000111000000000000111000,
+    0b001100000000000000001100,
   };
   static const uint32_t midArc[] = {
-    0b000000000000000000000000,
-    0b000000000111111000000000,
-    0b000000011111111110000000,
-    0b000000111100001111000000,
-    0b000001111000000111100000,
+    0b000000001111110000000000,
+    0b000000110000001100000000,
+    0b000001100000000110000000,
   };
   static const uint32_t innerArc[] = {
-    0b000000000000000000000000,
-    0b000000000000000000000000,
-    0b000000000011110000000000,
-    0b000000001111111100000000,
-    0b000000011000001100000000,
+    0b000000000111100000000000,
+    0b000000001000010000000000,
   };
   static const uint32_t dotMask[] = {
-    0b000000000000000000000000,
-    0b000000000000000000000000,
-    0b000000000000000000000000,
-    0b000000000011110000000000,
-    0b000000000011110000000000,
+    0b000000000011000000000000,
+    0b000000000011000000000000,
   };
 
   constexpr int baseW = 24;
-  constexpr int baseH = 20;
+  constexpr int baseH = 14;
   int strength = wifiBarsForRssi(rssi);
   int activeColor = TFT_GREEN;
   int inactiveColor = gray565(110);
@@ -2167,14 +2309,9 @@ static void drawWifiIndicator(LGFX_Sprite& spr, int x, int y, int w, int h, int 
   if (maxH < baseH) maxH = baseH;
   int scale = min(maxW / baseW, maxH / baseH);
   if (scale < 1) scale = 1;
-  int scaleX = (scale * 5 + 2) / 4;  // ~1.25x wider in X to avoid the squished look
-  if (scaleX < 1) scaleX = 1;
+  int scaleX = scale;
   int drawW = baseW * scaleX;
   int drawH = baseH * scale;
-  if (drawW > w) {
-    scaleX = max(1, w / baseW);
-    drawW = baseW * scaleX;
-  }
   int ox = x + (w - drawW) / 2;
   int oy = y + (h - drawH) / 2;
 
@@ -2197,9 +2334,159 @@ static void drawWifiIndicator(LGFX_Sprite& spr, int x, int y, int w, int h, int 
   uint16_t dotColor   = (connectedNow && strength >= 1) ? activeColor : inactiveColor;
 
   drawMask(outerArc, (int)(sizeof(outerArc) / sizeof(outerArc[0])), 0, outerColor);
-  drawMask(midArc,   (int)(sizeof(midArc)   / sizeof(midArc[0])),   6, midColor);
-  drawMask(innerArc, (int)(sizeof(innerArc) / sizeof(innerArc[0])), 11, innerColor);
-  drawMask(dotMask,  (int)(sizeof(dotMask)  / sizeof(dotMask[0])), 15, dotColor);
+  drawMask(midArc,   (int)(sizeof(midArc)   / sizeof(midArc[0])),   5, midColor);
+  drawMask(innerArc, (int)(sizeof(innerArc) / sizeof(innerArc[0])),  9, innerColor);
+  drawMask(dotMask,  (int)(sizeof(dotMask)  / sizeof(dotMask[0])), 12, dotColor);
+}
+
+// Bitmask helper: draw rows of uint32_t bitmasks at given position and scale.
+static void drawBitmask(LGFX_Sprite& spr, const uint32_t* rows, int rowCount, int baseW,
+                        int ox, int oy, int scale, uint16_t color) {
+  for (int r = 0; r < rowCount; ++r) {
+    uint32_t bits = rows[r];
+    for (int c = 0; c < baseW; ++c) {
+      if ((bits >> (baseW - 1 - c)) & 1U) {
+        if (scale <= 1) spr.drawPixel(ox + c, oy + r, color);
+        else spr.fillRect(ox + c * scale, oy + r * scale, scale, scale, color);
+      }
+    }
+  }
+}
+
+// Draw a country flag from PROGMEM RGB565 data. Returns the drawn width (0 if no flag).
+static int drawCountryFlag(LGFX_Sprite& spr, int x, int y, int h, const char* cc) {
+  if (!cc || !cc[0]) return 0;
+  const uint16_t* flagData;
+  int fw, fh;
+  if (getCountryFlagData(cc, &flagData, &fw, &fh)) {
+    // Center flag vertically in allocated height
+    int fy = y + (h - fh) / 2;
+    if (fy < y) fy = y;
+    for (int row = 0; row < fh && (fy + row) < (y + h); row++) {
+      for (int col = 0; col < fw; col++) {
+        uint16_t px = pgm_read_word(&flagData[row * fw + col]);
+        if (px != 0x0000) spr.drawPixel(x + col, fy + row, px);
+      }
+    }
+    return fw;
+  }
+  // Fallback: white-bordered rectangle with country code text
+  int fallbackW = (h * 3) / 2;
+  if (fallbackW < 6) fallbackW = 6;
+  spr.drawRect(x, y, fallbackW, h, TFT_WHITE);
+  float prevTs = spr.getTextSizeX();
+  spr.setTextSize(0.45f);
+  int tw = spr.textWidth(cc);
+  int tx = x + (fallbackW - tw) / 2;
+  int ty = y + (h - spr.fontHeight()) / 2;
+  spr.setCursor(tx, ty);
+  spr.print(cc);
+  spr.setTextSize(prevTs);
+  return fallbackW;
+}
+
+// Draw satellite icon (9×9 base, multicolor) at given position.
+static void drawSatelliteIcon(LGFX_Sprite& spr, int x, int y, int sz, uint16_t /*color*/) {
+  // Solar panels (blue), body (gold/yellow) — 9×9 base so scale=2 at sz=18
+  static const uint32_t kPanels[] = {
+    0b000000000,
+    0b000000000,
+    0b110000011,  // **     **
+    0b110000011,  // **     **
+    0b110000011,  // **     **
+    0b110000011,  // **     **
+    0b110000011,  // **     **
+    0b000000000,
+    0b000000000,
+  };
+  static const uint32_t kBody[] = {
+    0b000010000,  //    *        dish
+    0b000111000,  //   ***       dish
+    0b000010000,  //    *        mast
+    0b000010000,  //    *        body
+    0b000111000,  //   ***       wider body
+    0b000111000,  //   ***
+    0b000010000,  //    *
+    0b000010000,  //    *        base
+    0b000000000,
+  };
+  constexpr int baseW = 9, baseH = 9;
+  int scale = max(1, sz / baseW);
+  int drawW = baseW * scale, drawH = baseH * scale;
+  int ox = x + (sz - drawW) / 2;
+  int oy = y + (sz - drawH) / 2;
+  uint16_t blue = spr.color565(30, 80, 200);
+  uint16_t gold = spr.color565(220, 180, 40);
+  drawBitmask(spr, kPanels, baseH, baseW, ox, oy, scale, blue);
+  drawBitmask(spr, kBody, baseH, baseW, ox, oy, scale, gold);
+}
+
+// Draw radar/bullseye icon (concentric circles) at given position.
+static void drawRadarIcon(LGFX_Sprite& spr, int x, int y, int sz, uint16_t color) {
+  int cx = x + sz / 2, cy = y + sz / 2, r = sz / 2;
+  spr.fillCircle(cx, cy, r,     color);      // outer ring
+  spr.fillCircle(cx, cy, r - 1, TFT_BLACK);  // gap
+  spr.fillCircle(cx, cy, r - 2, color);      // middle ring
+  spr.fillCircle(cx, cy, r - 3, TFT_BLACK);  // gap
+  spr.fillCircle(cx, cy, r - 4, color);      // inner ring
+  spr.fillCircle(cx, cy, r - 5, TFT_BLACK);  // gap
+  spr.fillCircle(cx, cy, 1,     color);      // center dot
+}
+
+// Weather pixel art icons (10×10 base) for forecast bottom bar.
+static const uint32_t kRainCloud[] = {
+  0b0001110000,  //    ***
+  0b0011111000,  //   *****
+  0b1111111110,  //  ********
+  0b1111111110,  //  ********
+  0b0000000000,
+  0b0100100100,  //  *  *  *     rain streaks
+  0b0010010010,  //   *  *  *
+  0b0001001001,  //    *  *  *
+  0b0100100100,  //  *  *  *
+  0b0010010010,  //   *  *  *
+};
+static const uint32_t kSnowflake[] = {
+  0b0000100000,  //     *
+  0b0010101000,  //   * * *
+  0b0001110000,  //    ***
+  0b0100100100,  //  *  *  *
+  0b1111111110,  //  ********
+  0b0100100100,  //  *  *  *
+  0b0001110000,  //    ***
+  0b0010101000,  //   * * *
+  0b0000100000,  //     *
+  0b0000000000,
+};
+static const uint32_t kStormCloud[] = {
+  0b0001110000,  //    ***
+  0b0011111000,  //   *****
+  0b1111111110,  //  ********
+  0b1111111110,  //  ********
+  0b0000000000,
+  0b0001100000,  //    **       lightning bolt
+  0b0011000000,  //   **
+  0b0001110000,  //    ***
+  0b0000110000,  //     **
+  0b0001100000,  //    **
+};
+// Draw a weather icon for precipitation type. Returns drawn width (0 if type is 0/unknown).
+static int drawWeatherIcon(LGFX_Sprite& spr, int x, int y, int h, char type) {
+  const uint32_t* bm = nullptr;
+  uint16_t color = 0;
+  switch (type) {
+    case 'R': bm = kRainCloud;  color = spr.color565(100, 180, 255); break;
+    case 'S': bm = kSnowflake;  color = 0xFFFF; break;
+    case 'T': bm = kStormCloud; color = spr.color565(255, 220, 50); break;
+    default: return 0;
+  }
+  constexpr int baseW = 10, baseH = 10;
+  int scale = max(1, h / baseH);
+  int drawW = baseW * scale, drawH = baseH * scale;
+  int ox = x;
+  int oy = y + (h - drawH) / 2;
+  drawBitmask(spr, bm, baseH, baseW, ox, oy, scale, color);
+  return drawW;
 }
 
 static void drawSleepModeGlyph(LGFX_Sprite& spr, int x, int y, int w, int h, bool sleepEnabled) {
@@ -2275,9 +2562,9 @@ static void drawSleepModeGlyph(LGFX_Sprite& spr, int x, int y, int w, int h, boo
     0b00011111100111111000,
     0b00000000000000000000,
     0b00000000000000000000,
-    0b00100000000000000100,  // smile corners (cols 2, 17)
-    0b00011000000000011000,  // smile sides (cols 3-4, 15-16)
-    0b00000111111111100000,  // smile center (cols 5-14)
+    0b00000100000000100000,  // smile corners (cols 5, 14)
+    0b00000011000001100000,  // smile sides (cols 6-7, 12-13)
+    0b00000000111110000000,  // smile center (cols 8-12)
     0b00000000000000000000,
     0b00000000000000000000,
     0b00000000000000000000,
@@ -2704,19 +2991,29 @@ static bool jpegDrawLooksFullFrame() {
 // ─────────────────────────────────────────────────────────────
 static void showMessage(const char* line1, const char* line2 = nullptr) {
 #if BOARD_IS_AMOLED_206
+  int screenW = s_amoledOut ? s_amoledOut->width()  : AMOLED_WIDTH;
   int screenH = s_amoledOut ? s_amoledOut->height() : AMOLED_HEIGHT;
   uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;  // visible dark red or black
   if (s_amoledOut) s_amoledOut->fillScreen(bg);
   if (s_amoledOut) {
-    s_amoledOut->setTextColor(0xFFFF);
-    s_amoledOut->setTextSize(2);
-    s_amoledOut->setCursor(4, screenH / 2 - (line2 ? 22 : 10));
-    s_amoledOut->print(line1);
+    LGFX_Sprite ts;
+    ts.setColorDepth(16);
+    int msgH = line2 ? 48 : 24;
+    ts.createSprite(screenW, msgH);
+    ts.fillSprite(bg);
+    ts.setFont(&fonts::FreeSans12pt7b);
+    ts.setTextColor(0xFFFF);
+    ts.setTextSize(1);
+    ts.setCursor(4, 2);
+    ts.print(line1);
     if (line2) {
-      s_amoledOut->setCursor(4, screenH / 2 + 8);
-      s_amoledOut->setTextSize(1);
-      s_amoledOut->print(line2);
+      ts.setTextSize(0.7);
+      ts.setCursor(4, 28);
+      ts.print(line2);
     }
+    int msgY = screenH / 2 - msgH / 2;
+    s_amoledOut->draw16bitRGBBitmap(0, msgY, (uint16_t*)ts.getBuffer(), screenW, msgH);
+    ts.deleteSprite();
   }
   s_amoledClearBeforeNextPresent = true;
 #else
@@ -2735,10 +3032,10 @@ static void showMessage(const char* line1, const char* line2 = nullptr) {
   serviceWifiPortalServer();
 }
 
-static void drawProgressBarUi(uint32_t current, uint32_t total, const char* label) {
-  if (total == 0) total = 1;
-  if (current > total) current = total;
-  uint32_t percent = (uint32_t)(((uint64_t)current * 100ULL) / (uint64_t)total);
+static uint32_t s_progBarLastPct = 0;   // last drawn bar percentage (0-100)
+
+// Raw draw — no animation, just paint the bar at the given percentage
+static void drawProgressBarRaw(uint32_t percent, const char* label) {
   if (percent > 100U) percent = 100U;
 
 #if BOARD_IS_AMOLED_206
@@ -2747,13 +3044,12 @@ static void drawProgressBarUi(uint32_t current, uint32_t total, const char* labe
   int screenH = s_amoledOut->height();
   int barH = 14;
   int progressTextY = screenH / 2 + 24;
-  int barY = progressTextY + 12;
-  int barW = (int)((long)screenW * (long)current / (long)total);
+  int barY = progressTextY + 22;
+  int barW = (int)((long)screenW * (long)percent / 100L);
 
-  uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;        // visible dark red or black
-  uint16_t trackBg = s_hurricaneMode ? 0xC000 : 0x2104;   // medium red or dark grey
+  uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;
+  uint16_t trackBg = s_hurricaneMode ? 0xC000 : 0x2104;
 
-  // Fill areas above and below bar+text with background color
   if (s_hurricaneMode) {
     s_amoledOut->fillRect(0, 0, screenW, progressTextY - 2, bg);
     int barBottom = barY + barH;
@@ -2765,21 +3061,30 @@ static void drawProgressBarUi(uint32_t current, uint32_t total, const char* labe
 
   char buf[64];
   snprintf(buf, sizeof(buf), "%s  %lu%%", label ? label : "sync", (unsigned long)percent);
-  s_amoledOut->setTextColor(0xFFFF);
-  s_amoledOut->setTextSize(1);
-  s_amoledOut->fillRect(0, progressTextY - 2, screenW, 12, bg);
-  s_amoledOut->setCursor(4, progressTextY);
-  s_amoledOut->print(buf);
+  {
+    const int txtH = 20;
+    LGFX_Sprite ts;
+    ts.setColorDepth(16);
+    ts.createSprite(screenW, txtH);
+    ts.fillSprite(bg);
+    ts.setFont(&fonts::FreeSans12pt7b);
+    ts.setTextColor(0xFFFF);
+    ts.setTextSize(0.7);
+    ts.setCursor(4, 2);
+    ts.print(buf);
+    s_amoledOut->draw16bitRGBBitmap(0, progressTextY - 2, (uint16_t*)ts.getBuffer(), screenW, txtH);
+    ts.deleteSprite();
+  }
 #else
   int screenW = tft.width();
   int screenH = tft.height();
   int barH = 14;
   int progressTextY = screenH / 2 + 24;
   int barY = progressTextY + 12;
-  int barW = (int)((long)screenW * (long)current / (long)total);
+  int barW = (int)((long)screenW * (long)percent / 100L);
 
   tft.fillRect(0, barY, barW, barH, TFT_GREEN);
-  tft.fillRect(barW, barY, screenW - barW, barH, 0x2104 /*dark grey*/);
+  tft.fillRect(barW, barY, screenW - barW, barH, 0x2104);
 
   char buf[64];
   snprintf(buf, sizeof(buf), "%s  %lu%%", label ? label : "sync", (unsigned long)percent);
@@ -2792,11 +3097,36 @@ static void drawProgressBarUi(uint32_t current, uint32_t total, const char* labe
   serviceWifiPortalServer();
 }
 
+// Smooth progress bar — animates jumps so the bar never teleports
+static void drawProgressBarUi(uint32_t current, uint32_t total, const char* label) {
+  if (total == 0) total = 1;
+  if (current > total) current = total;
+  uint32_t targetPct = (uint32_t)(((uint64_t)current * 100ULL) / (uint64_t)total);
+  if (targetPct > 100U) targetPct = 100U;
+
+  appendDiagLog("[PROG] %s %lu/%lu (%lu%%) last=%lu ms=%lu\n",
+               label ? label : "?", (unsigned long)current, (unsigned long)total,
+               (unsigned long)targetPct, (unsigned long)s_progBarLastPct, millis());
+
+  // Animate in 1% steps if jumping more than 2%
+  if (targetPct > s_progBarLastPct + 2) {
+    while (s_progBarLastPct < targetPct) {
+      s_progBarLastPct++;
+      drawProgressBarRaw(s_progBarLastPct, label);
+      delay(15);
+    }
+  } else {
+    s_progBarLastPct = targetPct;
+    drawProgressBarRaw(targetPct, label);
+  }
+}
+
 static bool syncProgressIsActive() {
   return s_syncProgActive && s_syncProgTotalUnits > 0;
 }
 
 static void syncProgressBegin(uint32_t totalUnits, const char* line1, const char* line2) {
+  appendDiagLog("[PROG] BEGIN total=%lu ms=%lu\n", (unsigned long)totalUnits, millis());
   if (totalUnits == 0) totalUnits = 1;
   s_syncProgActive = true;
   s_syncProgTotalUnits = totalUnits;
@@ -2804,6 +3134,7 @@ static void syncProgressBegin(uint32_t totalUnits, const char* line1, const char
   s_syncProgPhaseBase = 0;
   s_syncProgPhaseUnits = 0;
   s_syncProgCursorUnits = 0;
+  s_progBarLastPct = 0;
   strlcpy(s_syncProgPhaseLabel, "sync", sizeof(s_syncProgPhaseLabel));
   showMessage(line1 ? line1 : "Updating cache...", line2 ? line2 : "Validating data");
   drawProgressBarUi(0, s_syncProgTotalUnits, s_syncProgPhaseLabel);
@@ -2811,6 +3142,9 @@ static void syncProgressBegin(uint32_t totalUnits, const char* line1, const char
 
 static void syncProgressBeginPhase(const char* label, uint32_t phaseUnits) {
   if (!syncProgressIsActive()) return;
+  appendDiagLog("[PROG] PHASE \"%s\" units=%lu base=%lu done=%lu ms=%lu\n",
+               label ? label : "?", (unsigned long)phaseUnits,
+               (unsigned long)s_syncProgPhaseBase, (unsigned long)s_syncProgDoneUnits, millis());
   uint32_t prevEnd = s_syncProgPhaseBase + s_syncProgPhaseUnits;
   if (s_syncProgCursorUnits < prevEnd) s_syncProgCursorUnits = prevEnd;
   if (s_syncProgCursorUnits > s_syncProgTotalUnits) s_syncProgCursorUnits = s_syncProgTotalUnits;
@@ -2847,6 +3181,9 @@ static void syncProgressTick(uint32_t units) {
 
 static void syncProgressCompletePhase() {
   if (!syncProgressIsActive()) return;
+  appendDiagLog("[PROG] COMPLETE phase base=%lu units=%lu done=%lu ms=%lu\n",
+               (unsigned long)s_syncProgPhaseBase, (unsigned long)s_syncProgPhaseUnits,
+               (unsigned long)s_syncProgDoneUnits, millis());
   uint32_t endUnits = s_syncProgPhaseBase + s_syncProgPhaseUnits;
   if (endUnits > s_syncProgTotalUnits) endUnits = s_syncProgTotalUnits;
   s_syncProgCursorUnits = endUnits;
@@ -2858,6 +3195,8 @@ static void syncProgressCompletePhase() {
 
 static void syncProgressEnd() {
   if (!syncProgressIsActive()) return;
+  appendDiagLog("[PROG] END done=%lu total=%lu ms=%lu\n",
+               (unsigned long)s_syncProgDoneUnits, (unsigned long)s_syncProgTotalUnits, millis());
   s_syncProgDoneUnits = s_syncProgTotalUnits;
   drawProgressBarUi(s_syncProgDoneUnits, s_syncProgTotalUnits, "done");
   s_syncProgActive = false;
@@ -2866,6 +3205,7 @@ static void syncProgressEnd() {
   s_syncProgPhaseBase = 0;
   s_syncProgPhaseUnits = 0;
   s_syncProgCursorUnits = 0;
+  s_progBarLastPct = 0;
 }
 
 static void showProgress(int current, int total, const char* label) {
@@ -3081,36 +3421,42 @@ static void drawBatteryIcon(LGFX_Sprite& spr, int x, int y, int w, int h, int pc
     };
 
     if (showChargeGlyph) {
-      // 8×8 Z-bolt: top arm tilts right, crossbar full-width, bottom arm tilts left.
+      // 7×11 lightning bolt with pointed tip
       static const uint32_t kBoltGlyph[] = {
-        0b00001111,  // ....####
-        0b00011110,  // ...####.
-        0b00111100,  // ..####..
-        0b11111110,  // #######.
-        0b00111100,  // ..####..
-        0b01111000,  // .####...
-        0b11110000,  // ####....
-        0b00000000,
+        0b0000110,  // ....##.
+        0b0001100,  // ...##..
+        0b0011000,  // ..##...
+        0b0110000,  // .##....
+        0b1111110,  // ######.
+        0b0011100,  // ..###..
+        0b0011000,  // ..##...
+        0b0110000,  // .##....
+        0b1100000,  // ##.....
+        0b1000000,  // #......
+        0b0000000,
       };
-      constexpr int bW = 8, bH = 8;
+      constexpr int bW = 7, bH = 11;
       int sc = min(max(1, innerW / bW), max(1, innerH / bH));
       int ox = innerX + (innerW - bW * sc) / 2;
       int oy = innerY + (innerH - bH * sc) / 2;
       spr.fillRect(ox, oy, bW * sc, bH * sc, TFT_BLACK);
       drawBatMask(kBoltGlyph, bH, bW, ox, oy, sc, TFT_YELLOW);
     } else if (showPlugGlyph) {
-      // 8×8 plug: two 1px prongs (cols 2, 5), wide body (cols 1-6), cord (cols 3-4)
+      // 8×11 plug: prongs, body, cord
       static const uint32_t kPlugGlyph[] = {
         0b00100100,  // ..#..#..  prongs
-        0b00100100,  // ..#..#..  prongs
-        0b01111110,  // .######.  body
-        0b01111110,  // .######.  body
-        0b01111110,  // .######.  body
+        0b00100100,  // ..#..#..
+        0b00100100,  // ..#..#..
+        0b01111110,  // .######.  body top
+        0b01111110,  // .######.
+        0b01111110,  // .######.
+        0b00111100,  // ..####..  body taper
         0b00011000,  // ...##...  cord
-        0b00011000,  // ...##...  cord
+        0b00011000,  // ...##...
+        0b00011000,  // ...##...
         0b00000000,
       };
-      constexpr int bW = 8, bH = 8;
+      constexpr int bW = 8, bH = 11;
       int sc = min(max(1, innerW / bW), max(1, innerH / bH));
       int ox = innerX + (innerW - bW * sc) / 2;
       int oy = innerY + (innerH - bH * sc) / 2;
@@ -3196,27 +3542,6 @@ static void renderBarsAtScaledRes(int frameIdx) {
     }
   }
 
-  const char* loc = (s_displayLocationFull[0] != '\0') ? s_displayLocationFull : DISPLAY_TZ_LABEL;
-
-  char radarBuf[32];
-  if (s_lastRadarUtcValid && s_lastRadarUtc > 0) {
-    int radarMins = (int)(difftime(nowForAge, s_lastRadarUtc) / 60.0 + 0.5);
-    if (radarMins < 0) radarMins = 0;
-    snprintf(radarBuf, sizeof(radarBuf), "Radar: %d min", radarMins);
-  } else if (s_radarNoSignatures) {
-    if (s_lastRadarCheckUtc > 0) {
-      int clearMins = (int)(difftime(nowForAge, s_lastRadarCheckUtc) / 60.0 + 0.5);
-      if (clearMins < 0) clearMins = 0;
-      snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear %dm", clearMins);
-    } else {
-      snprintf(radarBuf, sizeof(radarBuf), "Radar: Clear");
-    }
-  } else if (s_radarDownloadFailed) {
-    snprintf(radarBuf, sizeof(radarBuf), "Radar: no sig");
-  } else {
-    snprintf(radarBuf, sizeof(radarBuf), "Radar: n/a");
-  }
-
   // Read battery once per bar render so the indicator stays fresh
   s_batPct = readAxp2101BatPct();
   s_batChargeState = readAxp2101ChargeState();
@@ -3225,21 +3550,25 @@ static void renderBarsAtScaledRes(int frameIdx) {
   refreshCachedWifiDisplayState();
 
   // Build strings for top (date/time) and bottom (location + radar split)
-  char topBuf[64];
+  // Icon prefix indicates which age: satellite or radar
+  char topBuf[80];
   if (useRadarTopTime) {
     snprintf(topBuf, sizeof(topBuf), "%s %s  %s  %d min ago", wdayBuf, dateBuf, timeBuf, minsAgo);
   } else {
     snprintf(topBuf, sizeof(topBuf), "%s %s  %s  %.1f h ago", wdayBuf, dateBuf, timeBuf, hoursAgo);
   }
+  // s_topBarAgeIsRadar is used below to draw the appropriate icon before the age text
+  bool topBarAgeIsRadar = useRadarTopTime;
 
-  // Find the largest textSize (starting at 2.0) where the top string fits in one line.
+  // Use smooth anti-aliased font for all bar text.
+  s_barSprite.setFont(&fonts::FreeSans12pt7b);
   s_barSprite.setTextColor(TFT_WHITE);
   s_barSprite.setTextWrap(false);  // safety: clip at right edge, never wrap to row 2
-  float ts = 2.0f;
-  while (ts > 1.0f) {
+  float ts = 1.0f;
+  s_barSprite.setTextSize(ts);
+  while (ts > 0.5f && s_barSprite.textWidth(topBuf) > SCALED_W) {
+    ts -= 0.05f;
     s_barSprite.setTextSize(ts);
-    if (s_barSprite.textWidth(topBuf) <= SCALED_W) break;
-    ts -= 0.1f;
   }
 
   // Vertically center top-row text within the larger top-row height.
@@ -3258,14 +3587,11 @@ static void renderBarsAtScaledRes(int frameIdx) {
     char pctBuf[6];
     if (batPct >= 0) snprintf(pctBuf, sizeof(pctBuf), "%d%%", (batPct > 100) ? 100 : batPct);
     else snprintf(pctBuf, sizeof(pctBuf), "--");
+    s_barSprite.setFont(&fonts::FreeSans12pt7b);
     s_barSprite.setTextWrap(false);
     s_barSprite.setTextColor(TFT_WHITE, TFT_BLACK);
-    s_barSprite.setTextSize(2);
+    s_barSprite.setTextSize(1);
     int pctW = s_barSprite.textWidth(pctBuf);
-    if (pctW > 54) {
-      s_barSprite.setTextSize(1);
-      pctW = s_barSprite.textWidth(pctBuf);
-    }
     int pctH = s_barSprite.fontHeight();
     int pctX = iconX - pctW - 6;
     if (pctX < 4) pctX = 4;
@@ -3275,7 +3601,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
     s_barSprite.print(pctBuf);
     drawBatteryIcon(s_barSprite, iconX, iconY, iconW, iconH, batPct, s_batChargeState);
 
-    if (s_cleanModeActive) {
+    if (isCleanMode()) {
       // Battery-only: copy row 0 with just battery, zero everything else
       copyBarSpriteToBuffer(s_topBarBuf, (size_t)SCALED_W * SCALED_TOP_ROW_H);
       memset(s_topBarBuf + (size_t)SCALED_W * SCALED_TOP_ROW_H, 0,
@@ -3300,15 +3626,26 @@ static void renderBarsAtScaledRes(int frameIdx) {
     int modeGlyphY = (SCALED_TOP_ROW_H - modeGlyphH) / 2;
     drawSleepModeGlyph(s_barSprite, modeGlyphX, modeGlyphY, modeGlyphW, modeGlyphH, s_sleepModeEnabled);
 
-    int wifiAvailW = modeGlyphX - wifiTextX - 8;
+    // Measure flag + region code width to reserve space right-aligned before sleep glyph
+    const int geoGap = 6;
+    int flagH = max(8, SCALED_TOP_ROW_H - 6);
+    int flagW = (s_geoCountryCode[0]) ? (flagH * 3 / 2) : 0;
+    int regionTextW = 0;
+    if (s_geoRegionCode[0]) {
+      s_barSprite.setTextSize(0.65f);
+      regionTextW = s_barSprite.textWidth(s_geoRegionCode) + 3;  // 3px gap after flag
+    }
+    int geoTotalW = (flagW || regionTextW) ? (flagW + regionTextW + geoGap * 2) : 0;
+
+    int wifiAvailW = modeGlyphX - wifiTextX - 8 - geoTotalW;
     if (wifiAvailW > 12) {
       char wifiBuf[33];
       snprintf(wifiBuf, sizeof(wifiBuf), "%s", s_wifiDisplayName[0] ? s_wifiDisplayName : WIFI_SSID);
-      float wifiTs = 2.0f;
+      float wifiTs = 1.0f;
       s_barSprite.setTextSize(wifiTs);
       int wifiTextW = s_barSprite.textWidth(wifiBuf);
-      while (wifiTextW > wifiAvailW && wifiTs > 0.8f) {
-        wifiTs -= 0.1f;
+      while (wifiTextW > wifiAvailW && wifiTs > 0.5f) {
+        wifiTs -= 0.05f;
         s_barSprite.setTextSize(wifiTs);
         wifiTextW = s_barSprite.textWidth(wifiBuf);
       }
@@ -3322,6 +3659,22 @@ static void renderBarsAtScaledRes(int frameIdx) {
       s_barSprite.setCursor(wifiTextX, wifiTextY);
       s_barSprite.print(wifiBuf);
     }
+    // Draw country flag + region code right-aligned before sleep glyph
+    if (flagW > 0 || regionTextW > 0) {
+      int geoBlockW = flagW + regionTextW;
+      int geoX = modeGlyphX - geoGap - geoBlockW;
+      if (geoX < wifiTextX) geoX = wifiTextX;
+      int flagY = (SCALED_TOP_ROW_H - flagH) / 2;
+      if (flagW > 0) drawCountryFlag(s_barSprite, geoX, flagY, flagH, s_geoCountryCode);
+      if (s_geoRegionCode[0]) {
+        s_barSprite.setTextSize(0.65f);
+        int regX = geoX + flagW + 3;
+        int regY = (SCALED_TOP_ROW_H - s_barSprite.fontHeight()) / 2;
+        if (regY < 1) regY = 1;
+        s_barSprite.setCursor(regX, regY);
+        s_barSprite.print(s_geoRegionCode);
+      }
+    }
   }
   // Copy battery row to s_topBarBuf[0 .. SCALED_TOP_ROW_H-1]
   copyBarSpriteToBuffer(s_topBarBuf, (size_t)SCALED_W * SCALED_TOP_ROW_H);
@@ -3332,54 +3685,293 @@ static void renderBarsAtScaledRes(int frameIdx) {
   // --- Date/time row (row 1 of top bar) ---
   s_barSprite.fillScreen(0x0000);
   {
-    int tw = s_barSprite.textWidth(topBuf);
-    int tx = (SCALED_W - tw) / 2;
+    // Split topBuf into date/time part and age part, insert icon between them
+    const int iconSz = FORECAST_ICON_PX;
+    const int iconGap = 3;  // gap on each side of icon
+    int iconSpace = iconSz + iconGap * 2;
+
+    // Find the last "  " separator — everything after it is the age portion
+    char dtPart[64] = {};
+    char agePart[48] = {};
+    const char* lastSep = nullptr;
+    {
+      const char* p = strstr(topBuf, "  ");
+      while (p) {
+        lastSep = p;
+        p = strstr(p + 1, "  ");
+      }
+    }
+    if (lastSep) {
+      size_t dtLen = (size_t)(lastSep - topBuf);
+      if (dtLen >= sizeof(dtPart)) dtLen = sizeof(dtPart) - 1;
+      memcpy(dtPart, topBuf, dtLen);
+      dtPart[dtLen] = '\0';
+      // Skip the double-space separator
+      const char* ageStart = lastSep + 2;
+      strlcpy(agePart, ageStart, sizeof(agePart));
+    } else {
+      strlcpy(dtPart, topBuf, sizeof(dtPart));
+    }
+
+    int dtW = s_barSprite.textWidth(dtPart);
+    int sepW = s_barSprite.textWidth("  ");
+    int ageW = s_barSprite.textWidth(agePart);
+    int totalW = dtW + sepW + iconSpace + ageW;
+    int tx = (SCALED_W - totalW) / 2;
     if (tx < 0) tx = 0;
+
+    // Print date/time part
     s_barSprite.setCursor(tx, topTy);
-    s_barSprite.print(topBuf);
+    s_barSprite.print(dtPart);
+    s_barSprite.print("  ");  // separator
+    int afterSep = tx + dtW + sepW;
+
+    // Draw satellite or radar bitmap icon
+    int iconX = afterSep + iconGap;
+    int iconY = (SCALED_BAR_H - iconSz) / 2;
+    if (iconY < 0) iconY = 0;
+    if (topBarAgeIsRadar)
+      drawRadarIcon(s_barSprite, iconX, iconY, iconSz, s_barSprite.color565(0, 200, 0));
+    else
+      drawSatelliteIcon(s_barSprite, iconX, iconY, iconSz, TFT_WHITE);
+
+    // Print age part after icon
+    int ageX = afterSep + iconSpace;
+    s_barSprite.setCursor(ageX, topTy);
+    s_barSprite.print(agePart);
   }
   // Copy date/time row to s_topBarBuf[SCALED_TOP_ROW_H .. 2*SCALED_TOP_ROW_H-1]
   copyBarSpriteToBuffer(s_topBarBuf + (size_t)SCALED_W * SCALED_TOP_ROW_H,
                         (size_t)SCALED_W * SCALED_TOP_ROW_H);
 
-  // Bottom bar: location upper line, radar lower line.
+  // Bottom bar: forecast lines OR location + radar (fallback).
   s_barSprite.fillScreen(0x0000);
-  {
-    // Keep the two bottom lines at one stable size; do not inherit the top
-    // row's dynamic fit size, or the bottom text will visibly change when the
-    // top date/time string width changes.
-    const char* radarMeasure = "Radar: 999 min";
-    const int minBottomGapPx = 3;
-    float bottomTs = 2.0f;
-    while (bottomTs > 1.0f) {
-      s_barSprite.setTextSize(bottomTs);
-      int botFhProbe = s_barSprite.fontHeight();
-      int widestBottom = max(s_barSprite.textWidth(loc), s_barSprite.textWidth(radarMeasure));
-      if (widestBottom <= SCALED_W && ((2 * botFhProbe) + minBottomGapPx) <= SCALED_BAR_H) break;
-      bottomTs -= 0.1f;
+  if (s_forecastEnabled && s_forecast.valid) {
+    // ── Forecast bottom bar: single-line with pixel art weather icons ──
+    auto isPrecipKeyword = [](const char* s) -> char {
+      // Returns: 'R'=rain, 'T'=thunder, 'S'=snow, 0=none
+      if (!s) return 0;
+      for (const char* p = s; *p; p++) {
+        char buf[32];
+        int n = 0;
+        for (const char* q = p; *q && n < 30; q++) buf[n++] = tolower(*q);
+        buf[n] = '\0';
+        if (strstr(buf, "thunder") || strstr(buf, "tstorm") || strstr(buf, "storm")) return 'T';
+        if (strstr(buf, "snow") || strstr(buf, "flurr") || strstr(buf, "sleet") || strstr(buf, "ice")) return 'S';
+        if (strstr(buf, "rain") || strstr(buf, "shower") || strstr(buf, "drizzle")) return 'R';
+        break;
+      }
+      return 0;
+    };
+    auto fmtLocalTime = [](time_t t, char* out, int outSz) {
+      time_t local = t + (time_t)(s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0);
+      struct tm lt;
+      gmtime_r(&local, &lt);
+      int h = lt.tm_hour;
+      const char* ap = (h < 12) ? "am" : "pm";
+      if (h == 0) h = 12; else if (h > 12) h -= 12;
+      if (lt.tm_min > 0) snprintf(out, outSz, "%d:%02d%s", h, lt.tm_min, ap);
+      else               snprintf(out, outSz, "%d%s", h, ap);
+    };
+    auto fmtDayName = [](time_t t, char* out, int outSz) {
+      time_t local = t + (time_t)(s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0);
+      struct tm lt;
+      gmtime_r(&local, &lt);
+      static const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+      strlcpy(out, days[lt.tm_wday], outSz);
+    };
+
+    // Structured forecast entries — flat array, single line
+    struct ForecastEntry { char type; char text[24]; bool drawDeg; };
+    ForecastEntry entries[6] = {};
+    int entryCount = 0;
+    time_t nowUtcFc = time(nullptr);
+
+    // 1. Nowcast: raining now or rain approaching
+    if (s_forecast.rainEtaMinutes == 0) {
+      entries[entryCount++] = {'R', "now"};
+    } else if (s_forecast.rainEtaMinutes > 0) {
+      char tb[12];
+      time_t arrival = nowUtcFc + (time_t)s_forecast.rainEtaMinutes * 60;
+      fmtLocalTime(arrival, tb, sizeof(tb));
+      ForecastEntry e; e.type = 'R';
+      int um = s_forecast.rainUncertaintyMin;
+      if (um >= 60)
+        snprintf(e.text, sizeof(e.text), "~%s +/-%dh", tb, um / 60);
+      else
+        snprintf(e.text, sizeof(e.text), "~%s +/-%dm", tb, um);
+      entries[entryCount++] = e;
     }
+
+    // 2. Hourly 0-24h: first precip block start as clock time
+    {
+      char lastType = 0;
+      for (int i = 0; i < (int)s_forecast.hourlyCount && entryCount < 4; i++) {
+        int hoursOut = (int)((s_forecast.hourly[i].startTime - nowUtcFc) / 3600);
+        if (hoursOut < 0) continue;
+        if (hoursOut > 24) break;
+        if (s_forecast.hourly[i].precipProbability < 30) { lastType = 0; continue; }
+        char pType = isPrecipKeyword(s_forecast.hourly[i].shortForecast);
+        if (!pType) { lastType = 0; continue; }
+        if (pType == lastType) continue;
+        lastType = pType;
+        ForecastEntry e; e.type = pType;
+        if (hoursOut == 0) {
+          strlcpy(e.text, "now", sizeof(e.text));
+        } else {
+          char tb[12], db[8] = {};
+          fmtLocalTime(s_forecast.hourly[i].startTime, tb, sizeof(tb));
+          // Add day name if entry falls on a different calendar day
+          int32_t off = s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0;
+          struct tm entryLt, nowLt;
+          time_t entryLocal = s_forecast.hourly[i].startTime + (time_t)off;
+          time_t nowLocal = nowUtcFc + (time_t)off;
+          gmtime_r(&entryLocal, &entryLt);
+          gmtime_r(&nowLocal, &nowLt);
+          if (entryLt.tm_mday != nowLt.tm_mday)
+            fmtDayName(s_forecast.hourly[i].startTime, db, sizeof(db));
+          if (db[0])
+            snprintf(e.text, sizeof(e.text), "%s %s +/-1h", db, tb);
+          else
+            snprintf(e.text, sizeof(e.text), "%s +/-1h", tb);
+        }
+        entries[entryCount++] = e;
+      }
+    }
+
+    // 3. Daily fallback: today/tonight/tomorrow (no percentage)
+    if (entryCount == 0) {
+      for (int i = 0; i < (int)s_forecast.dailyCount && entryCount < 4; i++) {
+        int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
+        if (hoursOut < -12) continue;  // period that started >12h ago is over
+        if (hoursOut > 24) break;
+        if (s_forecast.daily[i].precipProbability < 50) continue;
+        char pType = isPrecipKeyword(s_forecast.daily[i].shortForecast);
+        if (!pType) continue;
+        const char* when = "today";
+        if (hoursOut >= 12) when = "tomorrow";
+        else if (hoursOut >= 0) {
+          int32_t off = s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0;
+          struct tm lt; time_t nd = s_forecast.daily[i].date + (time_t)off;
+          gmtime_r(&nd, &lt);
+          struct tm nowLt; time_t nowT = nowUtcFc + (time_t)off;
+          gmtime_r(&nowT, &nowLt);
+          if (lt.tm_mday != nowLt.tm_mday) when = "tonight";
+        }
+        // hoursOut < 0: current active period → "today"
+        ForecastEntry e; e.type = pType;
+        strlcpy(e.text, when, sizeof(e.text));
+        entries[entryCount++] = e;
+        break;
+      }
+    }
+
+    // 4. Daily outlook: merged day ranges (beyond 24h)
+    if (entryCount < 4) {
+      char curType = 0;
+      char startDay[8] = {}, endDay[8] = {};
+      auto flushOutlook = [&]() {
+        if (!curType || entryCount >= 4) return;
+        ForecastEntry e; e.type = curType;
+        if (startDay[0] && endDay[0] && strcmp(startDay, endDay) != 0)
+          snprintf(e.text, sizeof(e.text), "%s-%s", startDay, endDay);
+        else
+          strlcpy(e.text, startDay, sizeof(e.text));
+        entries[entryCount++] = e;
+        curType = 0;
+      };
+      for (int i = 0; i < (int)s_forecast.dailyCount; i++) {
+        int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
+        if (hoursOut <= 24) continue;
+        if (hoursOut > 120) break;
+        if (s_forecast.daily[i].precipProbability < 30) { flushOutlook(); continue; }
+        char pType = isPrecipKeyword(s_forecast.daily[i].shortForecast);
+        if (!pType) { flushOutlook(); continue; }
+        if (pType == curType) {
+          fmtDayName(s_forecast.daily[i].date, endDay, sizeof(endDay));
+        } else {
+          flushOutlook();
+          curType = pType;
+          fmtDayName(s_forecast.daily[i].date, startDay, sizeof(startDay));
+          strlcpy(endDay, startDay, sizeof(endDay));
+        }
+      }
+      flushOutlook();
+    }
+
+    // 5. Clear: no precip entries at all
+    if (entryCount == 0) {
+      entries[entryCount].type = 0;
+      strlcpy(entries[entryCount].text, "No rain 48h", sizeof(entries[0].text));
+      entryCount = 1;
+    }
+
+    // 6. Append current wind from hourly[0]
+    if (s_forecast.hourlyCount > 0 && entryCount < 6) {
+      int kmh = s_forecast.hourly[0].windSpeedKmh;
+      int deg = s_forecast.hourly[0].windDirDeg16 * 16;
+      int kts = (kmh * 10) / 19;  // km/h to knots (1 kt = 1.852 km/h)
+      ForecastEntry e; e.type = 0; e.drawDeg = true;
+      snprintf(e.text, sizeof(e.text), "~%dkts %d", kts, deg);
+      entries[entryCount++] = e;
+    }
+
+    // ── Render: single centered line with icons + text ──
+    const int iconGap = 3;      // gap between icon and text
+    const int sepGap  = 8;      // gap between entries
+    const int iconH = SCALED_BAR_H - 2;  // icons fill bar height (scale=2 at 10×10 base)
+    const int iconDrawW = max(1, iconH / 10) * 10;  // actual icon pixel width
+
+    // Start at max text size that fits bar height, shrink if width overflows
+    float bottomTs = 1.0f;
     s_barSprite.setTextSize(bottomTs);
+    while (bottomTs > 0.4f && s_barSprite.fontHeight() > SCALED_BAR_H) {
+      bottomTs -= 0.05f;
+      s_barSprite.setTextSize(bottomTs);
+    }
+    auto measureTotal = [&]() -> int {
+      int total = 0;
+      for (int i = 0; i < entryCount; i++) {
+        if (i > 0) total += sepGap;
+        int iw = (entries[i].type != 0) ? (iconDrawW + iconGap) : 0;
+        total += iw + s_barSprite.textWidth(entries[i].text);
+        if (entries[i].drawDeg) total += max(1, (int)s_barSprite.fontHeight() / 8) * 2 + 2;
+      }
+      return total;
+    };
+    while (bottomTs > 0.4f && measureTotal() > SCALED_W) {
+      bottomTs -= 0.05f;
+      s_barSprite.setTextSize(bottomTs);
+    }
     int botFh = s_barSprite.fontHeight();
-    int usedH = (2 * botFh) + minBottomGapPx;
-    int topPad = (SCALED_BAR_H - usedH) / 2;
-    if (topPad < 0) topPad = 0;
-    int locY = topPad;
-    int radarY = locY + botFh + minBottomGapPx;
-    if (radarY > SCALED_BAR_H - botFh) radarY = SCALED_BAR_H - botFh;
-    if (radarY <= locY) radarY = min(SCALED_BAR_H - botFh, locY + botFh + 1);
 
-    int locW = s_barSprite.textWidth(loc);
-    int locX = (SCALED_W - locW) / 2;
-    if (locX < 0) locX = 0;
-    s_barSprite.setCursor(locX, locY);
-    s_barSprite.print(loc);
+    int totalW = measureTotal();
+    int cx = (SCALED_W - totalW) / 2;
+    if (cx < 0) cx = 0;
+    int textY = (SCALED_BAR_H - botFh) / 2;
+    if (textY < 0) textY = 0;
 
-    int radarW = s_barSprite.textWidth(radarBuf);
-    int radarX = (SCALED_W - radarW) / 2;
-    if (radarX < 0) radarX = 0;
-    s_barSprite.setCursor(radarX, radarY);
-    s_barSprite.print(radarBuf);
+    for (int i = 0; i < entryCount; i++) {
+      if (i > 0) cx += sepGap;
+      // Draw weather icon — fills bar height
+      if (entries[i].type != 0) {
+        int iw = drawWeatherIcon(s_barSprite, cx, 1, iconH, entries[i].type);
+        cx += iw + iconGap;
+      }
+      // Draw text — centered vertically by font height
+      s_barSprite.setCursor(cx, textY);
+      s_barSprite.print(entries[i].text);
+      cx += s_barSprite.textWidth(entries[i].text);
+      // Draw ° as a small circle (font lacks the glyph)
+      if (entries[i].drawDeg) {
+        int dr = max(1, botFh / 8);  // radius scales with text size
+        int dy = textY + 1 + dr;     // near top of text
+        s_barSprite.drawCircle(cx + dr + 1, dy, dr, TFT_WHITE);
+        cx += dr * 2 + 2;
+      }
+    }
   }
+  // No fallback — bottom bar is blank when forecast is off or has no data
   copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
 }
 
@@ -3422,11 +4014,11 @@ static void renderHurricaneStormBars(int frameIdx) {
     int batPct = (int)s_batPct;
     if (batPct >= 0) snprintf(pctBuf, sizeof(pctBuf), "%d%%", (batPct > 100) ? 100 : batPct);
     else snprintf(pctBuf, sizeof(pctBuf), "--");
+    s_barSprite.setFont(&fonts::FreeSans12pt7b);
     s_barSprite.setTextWrap(false);
     s_barSprite.setTextColor(TFT_WHITE, TFT_BLACK);
-    s_barSprite.setTextSize(2);
+    s_barSprite.setTextSize(1);
     int pctW = s_barSprite.textWidth(pctBuf);
-    if (pctW > 54) { s_barSprite.setTextSize(1); pctW = s_barSprite.textWidth(pctBuf); }
     int pctH = s_barSprite.fontHeight();
     int pctX = iconX - pctW - 6; if (pctX < 4) pctX = 4;
     int pctY = (SCALED_TOP_ROW_H - pctH) / 2; if (pctY < 1) pctY = 1;
@@ -3455,11 +4047,11 @@ static void renderHurricaneStormBars(int frameIdx) {
     else
       strlcpy(catBuf, "TD", sizeof(catBuf));
 
-    float ts = 2.0f;
+    float ts = 1.0f;
     s_barSprite.setTextSize(ts);
     int totalW = s_barSprite.textWidth(nameBuf) + s_barSprite.textWidth(catBuf) + 20;
-    while (totalW > SCALED_W && ts > 1.0f) {
-      ts -= 0.1f;
+    while (totalW > SCALED_W && ts > 0.5f) {
+      ts -= 0.05f;
       s_barSprite.setTextSize(ts);
       totalW = s_barSprite.textWidth(nameBuf) + s_barSprite.textWidth(catBuf) + 20;
     }
@@ -3495,11 +4087,11 @@ static void renderHurricaneStormBars(int frameIdx) {
     else
       snprintf(ageBuf, sizeof(ageBuf), "%dm ago", ageMin);
 
-    float bottomTs = 2.0f;
+    float bottomTs = 1.0f;
     s_barSprite.setTextSize(bottomTs);
     int totalW = s_barSprite.textWidth(windBuf) + s_barSprite.textWidth(ageBuf) + 20;
-    while (totalW > SCALED_W && bottomTs > 1.0f) {
-      bottomTs -= 0.1f;
+    while (totalW > SCALED_W && bottomTs > 0.5f) {
+      bottomTs -= 0.05f;
       s_barSprite.setTextSize(bottomTs);
       totalW = s_barSprite.textWidth(windBuf) + s_barSprite.textWidth(ageBuf) + 20;
     }
@@ -3674,22 +4266,201 @@ static bool pollNoaaForHurricane(HurricaneInfo* storms, int maxStorms, int* outC
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
+  if (syncProgressIsActive()) syncProgressTick(1);
   http.begin(client, "https://www.nhc.noaa.gov/CurrentSurfaces/AT.json");
   http.setTimeout(8000);
   int httpCode = http.GET();
+  if (syncProgressIsActive()) syncProgressTick(3);
+  if (httpCode == HTTP_CODE_OK) {
+    String body = http.getString();
+    http.end();
+    if (body.length() >= 10) {
+      bool ok = parseNoaaStormJson(body, storms, maxStorms, outCount);
+      Serial.printf("hurricane: NOAA %d bytes, %d storms\n", (int)body.length(), *outCount);
+      return ok;
+    }
+    Serial.println("hurricane: NOAA response too short");
+  } else {
+    Serial.printf("hurricane: NOAA HTTP %d — trying GDACS fallback\n", httpCode);
+    http.end();
+  }
+
+  // NOAA unreachable or invalid — fall back to GDACS (EU/UN infrastructure)
+  if (syncProgressIsActive()) syncProgressTick(1);
+  return pollGdacsForHurricane(storms, maxStorms, outCount);
+}
+
+// Bounded strstr — returns nullptr if match is beyond haystack+haystackLen.
+static const char* boundedStrstr(const char* haystack, const char* needle, int haystackLen) {
+  if (!haystack || !needle || haystackLen <= 0) return nullptr;
+  int needleLen = (int)strlen(needle);
+  if (needleLen == 0 || needleLen > haystackLen) return nullptr;
+  for (int i = 0; i <= haystackLen - needleLen; i++) {
+    if (memcmp(haystack + i, needle, needleLen) == 0) return haystack + i;
+  }
+  return nullptr;
+}
+
+// ── GDACS Fallback (EU/UN, independent of US infrastructure) ──────────────
+// Parses https://www.gdacs.org/xml/rss.xml RSS feed for TC (tropical cyclone)
+// items. Only used when NOAA endpoint is unreachable.
+
+// Extract text content between <tag>...</tag> within a block.
+// tag must include angle brackets, e.g. "<gdacs:eventname>".
+static bool xmlExtractTagText(const char* block, int blockLen,
+                              const char* openTag, char* out, size_t outLen) {
+  if (!block || !openTag || !out || outLen == 0) return false;
+  out[0] = '\0';
+  const char* p = boundedStrstr(block, openTag, blockLen);
+  if (!p) return false;
+  p += strlen(openTag);
+  const char* end = strchr(p, '<');
+  if (!end || end > block + blockLen) return false;
+  size_t n = 0;
+  while (p < end && n + 1 < outLen) {
+    if ((uint8_t)*p >= 32) out[n++] = *p;
+    p++;
+  }
+  out[n] = '\0';
+  return (n > 0);
+}
+
+// Extract the "value" attribute from a tag like <gdacs:severity ... value="55.5">
+static bool xmlExtractAttrValue(const char* block, int blockLen,
+                                const char* tagPrefix, float* out) {
+  if (!block || !tagPrefix || !out) return false;
+  const char* p = boundedStrstr(block, tagPrefix, blockLen);
+  if (!p) return false;
+  const char* tagEnd = strchr(p, '>');
+  if (!tagEnd || tagEnd > block + blockLen) return false;
+  const char* val = boundedStrstr(p, "value=\"", (int)(tagEnd - p));
+  if (!val) return false;
+  val += 7; // skip value="
+  char buf[24] = {};
+  int i = 0;
+  while (val < tagEnd && *val != '"' && i < 23) buf[i++] = *val++;
+  buf[i] = '\0';
+  *out = strtof(buf, nullptr);
+  return true;
+}
+
+// Derive Saffir-Simpson category from wind speed in km/h.
+static uint8_t categoryFromWindKmh(float kmh) {
+  if (kmh >= 252) return 5;
+  if (kmh >= 209) return 4;
+  if (kmh >= 178) return 3;
+  if (kmh >= 154) return 2;
+  if (kmh >= 119) return 1;
+  return 0; // TD or TS
+}
+
+// Derive storm type string from wind speed in km/h.
+static void stormTypeFromWindKmh(float kmh, char* out, size_t len) {
+  if (kmh >= 119)     strlcpy(out, "HU", len);
+  else if (kmh >= 63) strlcpy(out, "TS", len);
+  else                strlcpy(out, "TD", len);
+}
+
+static bool parseGdacsStormXml(const String& body, HurricaneInfo* storms,
+                                int maxStorms, int* outCount) {
+  *outCount = 0;
+  const char* s = body.c_str();
+  int bodyLen = (int)body.length();
+  const char* cursor = s;
+
+  while (*outCount < maxStorms) {
+    const char* itemStart = boundedStrstr(cursor, "<item>", (int)((s + bodyLen) - cursor));
+    if (!itemStart) break;
+    const char* itemEnd = boundedStrstr(itemStart, "</item>", (int)((s + bodyLen) - itemStart));
+    if (!itemEnd) break;
+    int blockLen = (int)(itemEnd - itemStart);
+
+    // Only process tropical cyclones
+    char eventType[8] = {};
+    xmlExtractTagText(itemStart, blockLen, "<gdacs:eventtype>", eventType, sizeof(eventType));
+    if (strcmp(eventType, "TC") != 0) {
+      cursor = itemEnd + 7;
+      continue;
+    }
+
+    // Extract fields
+    char stormName[20] = {};
+    char eventId[16] = {};
+    char latStr[16] = {}, lonStr[16] = {};
+    float windKmh = 0;
+
+    xmlExtractTagText(itemStart, blockLen, "<gdacs:eventname>", stormName, sizeof(stormName));
+    xmlExtractTagText(itemStart, blockLen, "<gdacs:eventid>", eventId, sizeof(eventId));
+    xmlExtractTagText(itemStart, blockLen, "<geo:lat>", latStr, sizeof(latStr));
+    xmlExtractTagText(itemStart, blockLen, "<geo:long>", lonStr, sizeof(lonStr));
+    xmlExtractAttrValue(itemStart, blockLen, "<gdacs:severity", &windKmh);
+
+    float lat = strtof(latStr, nullptr);
+    float lon = strtof(lonStr, nullptr);
+
+    // Strip year suffix from eventname if present (e.g. "NURI-26" → "NURI")
+    char cleanName[20] = {};
+    strlcpy(cleanName, stormName, sizeof(cleanName));
+    char* dash = strchr(cleanName, '-');
+    if (dash) *dash = '\0';
+
+    // Derive category and type from wind speed
+    uint8_t cat = categoryFromWindKmh(windKmh);
+    char derivedType[4] = {};
+    stormTypeFromWindKmh(windKmh, derivedType, sizeof(derivedType));
+
+    // Apply same filtering as NOAA path + restrict to Atlantic basin.
+    // GDACS is global; Atlantic TCs are roughly lon -100 to 0.
+    bool qualifies = false;
+    bool inAtlantic = (lon >= -100.0f && lon <= 0.0f);
+    if (cleanName[0] != '\0' && inAtlantic) {
+      if (strcmp(derivedType, "HU") == 0 && cat >= 1) qualifies = true;
+      if (s_hurricaneIncludeTS && strcmp(derivedType, "TS") == 0) qualifies = true;
+      if (s_hurricaneIncludeTD && strcmp(derivedType, "TD") == 0) qualifies = true;
+    }
+
+    if (qualifies) {
+      HurricaneInfo& st = storms[*outCount];
+      memset(&st, 0, sizeof(st));
+      // Use GDACS eventid prefixed with "GD" to distinguish from NOAA IDs
+      snprintf(st.id, sizeof(st.id), "GD%s", eventId);
+      strlcpy(st.name, cleanName, sizeof(st.name));
+      strlcpy(st.stormType, derivedType, sizeof(st.stormType));
+      st.lat = lat;
+      st.lon = lon;
+      st.category = cat;
+      st.windKt = (uint16_t)(windKmh * 0.539957f + 0.5f); // km/h → knots
+      st.pressureMb = 0; // GDACS doesn't provide MSLP in RSS
+      st.advisoryUtc = time(nullptr);
+      (*outCount)++;
+    }
+    cursor = itemEnd + 7;
+  }
+  return (*outCount > 0);
+}
+
+static bool pollGdacsForHurricane(HurricaneInfo* storms, int maxStorms, int* outCount) {
+  *outCount = 0;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, "https://www.gdacs.org/xml/rss.xml");
+  http.setTimeout(10000);
+  int httpCode = http.GET();
+  if (syncProgressIsActive()) syncProgressTick(3);
   if (httpCode != HTTP_CODE_OK) {
-    Serial.printf("hurricane: NOAA HTTP %d\n", httpCode);
+    Serial.printf("hurricane: GDACS HTTP %d\n", httpCode);
     http.end();
     return false;
   }
   String body = http.getString();
   http.end();
   if (body.length() < 10) {
-    Serial.println("hurricane: NOAA response too short");
+    Serial.println("hurricane: GDACS response too short");
     return false;
   }
-  bool ok = parseNoaaStormJson(body, storms, maxStorms, outCount);
-  Serial.printf("hurricane: NOAA %d bytes, %d storms\n", (int)body.length(), *outCount);
+  bool ok = parseGdacsStormXml(body, storms, maxStorms, outCount);
+  Serial.printf("hurricane: GDACS %d bytes, %d storms\n", (int)body.length(), *outCount);
   return ok;
 }
 
@@ -4183,11 +4954,11 @@ static void exitFullscreen() {
   updateBarBufs(s_newestCachedIdx);
 }
 
-static void toggleCleanMode() {
-  s_cleanModeActive = !s_cleanModeActive;
+static void cycleDisplayMode() {
+  s_displayMode = (s_displayMode + 1) % 4;
   Preferences prefs;
   if (prefs.begin("satwatch", false)) {
-    prefs.putBool("clna", s_cleanModeActive);
+    prefs.putUChar("dmod", s_displayMode);
     prefs.end();
   }
   updateBarBufs(s_newestCachedIdx);
@@ -4257,11 +5028,13 @@ static void pollCleanModeToggle() {
   // New touch down on moon: start tracking
   if (irqFired && pressStartMs == 0) {
     if (touching == 0) {
-      // Fast tap: finger already lifted before poll — accept as moon tap
+      // Fast tap: finger lifted before I2C poll — no coords available.
+      // Moon is the only interactive zone in normal mode, so accept it
+      // as a moon tap to avoid swallowing quick taps.
       static uint32_t lastToggleMs = 0;
       uint32_t now = millis();
-      if (now - lastToggleMs >= 500) {
-        toggleCleanMode();
+      if (now - lastToggleMs >= 300) {
+        cycleDisplayMode();
         lastToggleMs = now;
       }
       return;
@@ -4287,8 +5060,8 @@ static void pollCleanModeToggle() {
     if (!longHandled) {
       static uint32_t lastToggleMs = 0;
       uint32_t now = millis();
-      if (now - lastToggleMs >= 500) {
-        toggleCleanMode();
+      if (now - lastToggleMs >= 300) {
+        cycleDisplayMode();
         lastToggleMs = now;
       }
     }
@@ -4368,6 +5141,8 @@ static void applyBarsToBuf(uint16_t* buf) {
   memcpy(buf + (size_t)botY * SCALED_W, s_botBarBuf, botBarBytes);
 }
 
+static void drawAlwaysOnClockOverlay(uint16_t* buf);  // defined after clock overlay helpers
+
 // Push a pre-scaled 410×360 canonical RGB565 buffer to the AMOLED display.
 // src must point to SCALED_FRAME_BYTES of little-endian RGB565.
 static void presentScaledBuf(uint16_t* src) {
@@ -4381,6 +5156,8 @@ static void presentScaledBuf(uint16_t* src) {
   if (!s_chunkBuf) return;
 
   if (s_fullscreenMode) {
+    // Zero rows 0–13: normally hidden by top bar, but fullscreen scaler samples them.
+    memset(src, 0, 14U * SCALED_W * 2U);
     // Fullscreen: center-crop 410×360 and scale to fill 410×502, no bars/moon/hints
     const int dstW = SCALED_W;      // 410
     const int dstH = AMOLED_HEIGHT; // 502
@@ -4410,6 +5187,58 @@ static void presentScaledBuf(uint16_t* src) {
   // --- Normal path ---
   // Stamp persistent timestamp bars over whatever is in src.
   applyBarsToBuf(src);
+
+  // Time-always-on: stamp clock into src, push to AMOLED, then restore src
+  // so downstream code (terrain crossfade, clock segment) sees a clean buffer.
+  ClockOverlayLayout clockSaveLayout = {};
+  bool clockOverlayApplied = false;
+  if (isTimeAlwaysOn()) {
+    clockSaveLayout = makeClockOverlayLayout();
+    // Save the clean bg region before the clock stamps over it
+    saveSpriteRegionToDlBuf(clockSaveLayout);
+    drawAlwaysOnClockOverlay(src);
+    clockOverlayApplied = true;
+  }
+
+  // Stamp location pin into buffer (on top of clock) when requested.
+  // Uses a temporary LGFX_Sprite for smooth anti-aliased circle rendering,
+  // then composites non-black pixels into src (transparent blit).
+  if (s_pinOverlayRequested && s_weatherGeoValid && !s_fullscreenMode) {
+    const int r = 10, centerDot = 4;
+    const int pinW = r * 2 + 2, pinH = r + 14 + 2;  // bounding box
+    const int headCy = r + 1;                         // circle center in sprite coords
+    const int tipSy  = headCy + 14;                   // point tip in sprite coords
+    LGFX_Sprite pinSpr;
+    pinSpr.setColorDepth(16);
+    pinSpr.setSwapBytes(s_barSpritePixelsByteSwapped);
+    if (pinSpr.createSprite(pinW, pinH)) {
+      pinSpr.fillScreen(0x0000);
+      pinSpr.fillCircle(r + 1, headCy, r, 0xF800);
+      pinSpr.fillTriangle(r + 1 - (r - 1), headCy + 3,
+                          r + 1 + (r - 1), headCy + 3,
+                          r + 1, tipSy, 0xF800);
+      pinSpr.fillCircle(r + 1, headCy, centerDot, 0xFFFF);
+      // Composite into src at display center
+      int destX = SCALED_W / 2 - (r + 1);
+      int destY = SCALED_H / 2 - tipSy;
+      const uint16_t* sp = (const uint16_t*)pinSpr.getBuffer();
+      for (int py = 0; py < pinH; py++) {
+        int dy = destY + py;
+        if (dy < 0 || dy >= SCALED_H) continue;
+        for (int px = 0; px < pinW; px++) {
+          uint16_t c = sp[py * pinW + px];
+          if (s_barSpritePixelsByteSwapped) c = __builtin_bswap16(c);
+          if (c != 0x0000) {
+            int dx = destX + px;
+            if (dx >= 0 && dx < SCALED_W) src[dy * SCALED_W + dx] = c;
+          }
+        }
+      }
+      pinSpr.deleteSprite();
+    }
+    s_pinOverlayRequested = false;
+  }
+
   if (s_amoledClearBeforeNextPresent) {
     s_amoledOut->fillScreen(0x0000);
     s_amoledClearBeforeNextPresent = false;
@@ -4426,7 +5255,13 @@ static void presentScaledBuf(uint16_t* src) {
     memcpy(s_chunkBuf, src + cy * outW, (size_t)rows * outW * 2U);
     s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, s_chunkBuf, outW, rows);
   }
-  if (s_hurricaneMode && !s_cleanModeActive) drawHurricaneRebootHint(nullptr);
+
+  // Restore clean buffer so terrain crossfade / subsequent reads see no clock residue
+  if (clockOverlayApplied) {
+    restoreSpriteRegionFromDlBuf(clockSaveLayout);
+  }
+
+  if (s_hurricaneMode && !isCleanMode()) drawHurricaneRebootHint(nullptr);
   drawMoonComplication();
 #else
   tft.startWrite(); sprite.pushSprite(0, 0); tft.waitDMA(); tft.endWrite();
@@ -5205,6 +6040,11 @@ static bool zoomSnapshotsCurrentAndUsable(time_t newestUtc) {
 // ─────────────────────────────────────────────────────────────
 //  SD helpers
 // ─────────────────────────────────────────────────────────────
+#ifndef ENABLE_DIAG_LOG
+#define ENABLE_DIAG_LOG 0
+#endif
+
+#if ENABLE_DIAG_LOG
 static void appendDiagLog(const char* fmt, ...) {
   File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
   if (!diagF) return;
@@ -5216,6 +6056,9 @@ static void appendDiagLog(const char* fmt, ...) {
   diagF.print(line);
   diagF.close();
 }
+#else
+static inline void appendDiagLog(const char*, ...) {}
+#endif
 
 // ─────────────────────────────────────────────────────────────
 //  Pre-allocated frame store helpers
@@ -5785,6 +6628,7 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
     while (WiFi.status() != WL_CONNECTED && wtries++ < 20) {
       delay(500);
       Serial.print(".");
+      if (syncProgressIsActive()) syncProgressTick(1);
     }
 
     if (WiFi.status() != WL_CONNECTED) {
@@ -5941,6 +6785,8 @@ static void saveLocationLabelToNvs(const char* label, const char* full) {
   if (!prefs.begin("satwatch", false)) return;
   if (label) prefs.putString("loclabel", label);
   if (full)  prefs.putString("locfull", full);
+  prefs.putString("geocc", s_geoCountryCode);
+  prefs.putString("georc", s_geoRegionCode);
   prefs.end();
 }
 
@@ -5955,7 +6801,34 @@ static void loadLocationLabelFromNvs(char* label, size_t labelLen, char* full, s
     String s = prefs.getString("locfull", "");
     if (s.length() > 0) strlcpy(full, s.c_str(), fullLen);
   }
+  {
+    String cc = prefs.getString("geocc", "");
+    if (cc.length() > 0) strlcpy(s_geoCountryCode, cc.c_str(), sizeof(s_geoCountryCode));
+    String rc = prefs.getString("georc", "");
+    if (rc.length() > 0) strlcpy(s_geoRegionCode, rc.c_str(), sizeof(s_geoRegionCode));
+  }
   prefs.end();
+}
+
+static void saveGeoToNvs(float lat, float lon) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", false)) return;
+  prefs.putFloat("geolat", lat);
+  prefs.putFloat("geolon", lon);
+  prefs.putBool("geovalid", true);
+  prefs.end();
+}
+
+static bool loadGeoFromNvs(float* lat, float* lon) {
+  Preferences prefs;
+  if (!prefs.begin("satwatch", true)) return false;
+  bool valid = prefs.getBool("geovalid", false);
+  if (valid) {
+    *lat = prefs.getFloat("geolat", 0.0f);
+    *lon = prefs.getFloat("geolon", 0.0f);
+  }
+  prefs.end();
+  return valid;
 }
 
 // Poll for a "skip" tap: touch INT pin (TP_INT = GPIO 38, active-low) or AXP2101 PKEY.
@@ -7635,9 +8508,9 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
   if (z1.valid) {
     drawScaledOutlineRect(s_frameDisplayBuf, z1.x, z1.y, z1.w, z1.h, 0xF800);
     presentScaledBuf(s_frameDisplayBuf);
-    delay(ditMs);
+    delayWithInputPoll(ditMs);
     restoreFrame();
-    delay(gapMs);
+    delayWithInputPoll(gapMs);
     consumedMs += ditMs + gapMs;
   }
 
@@ -7645,7 +8518,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
   if (z2.valid) {
     drawScaledOutlineRect(s_frameDisplayBuf, z2.x, z2.y, z2.w, z2.h, 0xF800);
     presentScaledBuf(s_frameDisplayBuf);
-    delay(ditMs);
+    delayWithInputPoll(ditMs);
     consumedMs += ditMs;
   }
 
@@ -7656,7 +8529,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
       drawScaledOutlineRect(s_frameDisplayBuf, z3.x, z3.y, z3.w, z3.h, 0xF800);
     }
     presentScaledBuf(s_frameDisplayBuf);
-    delay(dahMs);
+    delayWithInputPoll(dahMs);
     consumedMs += dahMs;
   }
 
@@ -7824,6 +8697,642 @@ static void refreshZoomSnapshotsForLatestFrame() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Forecast: Nowcast radar analysis + NWS/Open-Meteo fetch
+// ─────────────────────────────────────────────────────────────
+
+static void computeNowcastRadarBbox(float lat, float lon, float* bbox4) {
+  // bbox4 = {west, south, east, north}
+  float cosLat = cosf(lat * (float)M_PI / 180.0f);
+  if (cosLat < 0.1f) cosLat = 0.1f;
+  float lonHalf = NOWCAST_BBOX_HALF_DEG / cosLat;
+  float latHalf = NOWCAST_BBOX_HALF_DEG * 0.5f;  // tighter N/S
+  bbox4[0] = lon - lonHalf;  // west
+  bbox4[1] = lat - latHalf;  // south
+  bbox4[2] = lon + lonHalf;  // east
+  bbox4[3] = lat + latHalf;  // north
+}
+
+static uint16_t sampleRadarIntensityInPatch(LGFX_Sprite& spr, int sprW, int sprH,
+                                            int centerPxX, int centerPxY) {
+  uint16_t* px = (uint16_t*)spr.getBuffer();
+  if (!px) return 0;
+  const int half = NOWCAST_ANALYSIS_PATCH / 2;
+  int x0 = centerPxX - half; if (x0 < 0) x0 = 0;
+  int y0 = centerPxY - half; if (y0 < 0) y0 = 0;
+  int x1 = x0 + NOWCAST_ANALYSIS_PATCH; if (x1 > sprW) x1 = sprW;
+  int y1 = y0 + NOWCAST_ANALYSIS_PATCH; if (y1 > sprH) y1 = sprH;
+  uint32_t totalIntensity = 0;
+  uint32_t signalCount = 0;
+  bool swapped = s_mainSpritePixelsByteSwapped;
+  for (int y = y0; y < y1; y++) {
+    for (int x = x0; x < x1; x++) {
+      uint16_t c = px[y * sprW + x];
+      uint16_t n = swapped ? __builtin_bswap16(c) : c;
+      int r = (n >> 11) & 0x1F;
+      int g = (n >> 5) & 0x3F;
+      int b = n & 0x1F;
+      int g5 = (g + 1) >> 1;
+      int maxCh = r; if (g5 > maxCh) maxCh = g5; if (b > maxCh) maxCh = b;
+      int minCh = r; if (g5 < minCh) minCh = g5; if (b < minCh) minCh = b;
+      int sat = maxCh - minCh;
+      int lum = r + g5 + b;
+      if (sat >= NOWCAST_PIXEL_SAT_MIN && lum >= NOWCAST_PIXEL_LUM_MIN) {
+        totalIntensity += (uint32_t)lum;
+        signalCount++;
+      }
+    }
+  }
+  if (signalCount == 0) return 0;
+  return (uint16_t)(totalIntensity / signalCount);
+}
+
+static void analyzeNowcastTrend() {
+  const int nc = (int)s_forecast.nowcastCount;
+  if (nc < 2) {
+    s_forecast.rainEtaMinutes = -1;
+    s_forecast.rainUncertaintyMin = 0;
+    return;
+  }
+  // Latest sample is index 0 (most recent radar frame)
+  uint16_t userNow = s_forecast.nowcast[0].avgIntensityAtUser;
+  if (userNow >= NOWCAST_RAIN_INTENSITY) {
+    s_forecast.rainEtaMinutes = 0;
+    s_forecast.rainUncertaintyMin = 0;
+    return;
+  }
+  // Check upwind samples for approaching rain
+  bool upwindHasRain = false;
+  int upwindFirstIdx = -1;
+  for (int i = 0; i < nc; i++) {
+    if (s_forecast.nowcast[i].avgIntensityUpwind >= NOWCAST_RAIN_INTENSITY) {
+      upwindHasRain = true;
+      if (upwindFirstIdx < 0) upwindFirstIdx = i;
+    }
+  }
+  if (!upwindHasRain) {
+    s_forecast.rainEtaMinutes = -1;
+    s_forecast.rainUncertaintyMin = 0;
+    return;
+  }
+  // Estimate approach speed from intensity gradient over time
+  // Distance is NOWCAST_UPWIND_KM, time span from frame indices
+  float distKm = NOWCAST_UPWIND_KM;
+  // Check if rain is getting closer (increasing user-side intensity over frames)
+  bool approaching = false;
+  int consistentFrames = 0;
+  for (int i = 1; i < nc; i++) {
+    if (s_forecast.nowcast[i - 1].avgIntensityUpwind >= s_forecast.nowcast[i].avgIntensityUpwind) {
+      consistentFrames++;  // upwind weakening → moving toward user
+    }
+  }
+  approaching = (consistentFrames >= nc / 2);
+  if (!approaching) {
+    // Rain upwind but not clearly approaching
+    s_forecast.rainEtaMinutes = -1;
+    s_forecast.rainUncertaintyMin = 0;
+    return;
+  }
+  // Default approach speed: trade wind ~20 km/h = 0.33 km/min
+  float speedKmPerMin = 20.0f / 60.0f;
+  int etaMin = (int)(distKm / speedKmPerMin);
+  if (etaMin < 1) etaMin = 1;
+  if (etaMin > 300) etaMin = 300;
+  // Uncertainty based on how many frames agree on the trend
+  int unc;
+  if (consistentFrames >= nc - 1) unc = etaMin / 4;       // strong: ±25%
+  else if (consistentFrames >= nc / 2) unc = etaMin / 2;   // moderate: ±50%
+  else unc = etaMin;                                         // weak: ±100%
+  if (unc < 15) unc = 15;
+  if (unc > 120) unc = 120;
+  s_forecast.rainEtaMinutes = (int16_t)etaMin;
+  s_forecast.rainUncertaintyMin = (int16_t)unc;
+}
+
+static bool fetchAndAnalyzeNowcastRadar(WiFiClientSecure& client, HTTPClient& http) {
+  if (!s_weatherGeoValid) return false;
+  float bbox[4];
+  computeNowcastRadarBbox(s_weatherCenterLat, s_weatherCenterLon, bbox);
+  unsigned long long radarLatestMs = 0ULL;
+  if (!fetchRadarLatestTimeMs(http, client, &radarLatestMs) || radarLatestMs == 0ULL) {
+    Serial.println("nowcast: no radar time");
+    return false;
+  }
+  const int ncW = 320, ncH = 176;
+  LGFX_Sprite ncSprite;
+  ncSprite.setColorDepth(16);
+  if (!ncSprite.createSprite(ncW, ncH)) {
+    Serial.println("nowcast: sprite fail");
+    return false;
+  }
+  // User pixel coords within the nowcast sprite
+  float userPxX = (s_weatherCenterLon - bbox[0]) / (bbox[2] - bbox[0]) * (float)ncW;
+  float userPxY = (bbox[3] - s_weatherCenterLat) / (bbox[3] - bbox[1]) * (float)ncH;
+  // Upwind pixel coords (east of user for trade winds)
+  float upwindLon = s_weatherCenterLon + NOWCAST_UPWIND_KM / (111.32f * cosf(s_weatherCenterLat * (float)M_PI / 180.0f));
+  float upwindPxX = (upwindLon - bbox[0]) / (bbox[2] - bbox[0]) * (float)ncW;
+  float upwindPxY = userPxY;
+  if (upwindPxX >= (float)ncW) upwindPxX = (float)(ncW - NOWCAST_ANALYSIS_PATCH);
+
+  s_forecast.nowcastCount = 0;
+  unsigned long long cacheBust = (unsigned long long)(millis() & 0xFFFFU);
+  char url[640];
+  for (int i = 0; i < NOWCAST_FRAME_COUNT; i++) {
+    unsigned long long frameMs = radarLatestMs - (unsigned long long)i * NOWCAST_FRAME_STEP_MS;
+    snprintf(url, sizeof(url),
+      "https://mapservices.weather.noaa.gov/eventdriven/rest/services/radar/"
+      "radar_base_reflectivity_time/ImageServer/exportImage"
+      "?bbox=%.6f,%.6f,%.6f,%.6f&bboxSR=4326&size=%d,%d&format=jpg&f=image&time=%llu&_cb=%llu",
+      (double)bbox[0], (double)bbox[1], (double)bbox[2], (double)bbox[3],
+      ncW, ncH, frameMs, cacheBust + (unsigned long long)i);
+    http.begin(client, url);
+    http.setTimeout(8000);
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      http.end();
+      Serial.printf("nowcast: frame %d HTTP %d\n", i, code);
+      continue;
+    }
+    size_t jpegLen = 0;
+    if (!readHttpJpegBodyToDlBuf(http, "ncst", &jpegLen) || jpegLen == 0) continue;
+    size_t effLen = jpegEffectiveLength(s_dlBuf, jpegLen);
+    if (effLen < 100) continue;
+    ncSprite.fillScreen(TFT_BLACK);
+    g_drawTarget = &ncSprite;
+    resetJpegDrawStats();
+    if (jpeg.openRAM(s_dlBuf, (int)effLen, jpegDraw)) {
+      jpeg.setPixelType(RGB565_BIG_ENDIAN);
+      jpeg.decode(0, 0, 0);
+      jpeg.close();
+    } else {
+      continue;
+    }
+    int idx = (int)s_forecast.nowcastCount;
+    s_forecast.nowcast[idx].timestamp = (time_t)(frameMs / 1000ULL);
+    s_forecast.nowcast[idx].avgIntensityAtUser = sampleRadarIntensityInPatch(
+        ncSprite, ncW, ncH, (int)userPxX, (int)userPxY);
+    s_forecast.nowcast[idx].avgIntensityUpwind = sampleRadarIntensityInPatch(
+        ncSprite, ncW, ncH, (int)upwindPxX, (int)upwindPxY);
+    s_forecast.nowcast[idx].maxIntensityUpwind = s_forecast.nowcast[idx].avgIntensityUpwind;
+    s_forecast.nowcastCount++;
+    Serial.printf("nowcast: f%d user=%d upwind=%d\n", i,
+                  s_forecast.nowcast[idx].avgIntensityAtUser,
+                  s_forecast.nowcast[idx].avgIntensityUpwind);
+  }
+  g_drawTarget = &sprite;  // restore main sprite target
+  ncSprite.deleteSprite();
+  analyzeNowcastTrend();
+  Serial.printf("nowcast: eta=%d ±%d n=%d\n",
+                s_forecast.rainEtaMinutes, s_forecast.rainUncertaintyMin,
+                s_forecast.nowcastCount);
+  return s_forecast.nowcastCount > 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  ISO 8601 parser: "2026-03-11T14:00:00-04:00" → time_t (UTC)
+// ─────────────────────────────────────────────────────────────
+static time_t parseIso8601ToEpoch(const char* s) {
+  if (!s || !*s) return 0;
+  struct tm t = {};
+  int tzH = 0, tzM = 0;
+  char tzSign = '+';
+  // Accepts: "2026-03-11T14:00:00-04:00", "2026-03-11T14:00", "2026-03-11"
+  int n = sscanf(s, "%d-%d-%dT%d:%d:%d",
+                 &t.tm_year, &t.tm_mon, &t.tm_mday,
+                 &t.tm_hour, &t.tm_min, &t.tm_sec);
+  if (n < 3) return 0;  // need at least YYYY-MM-DD
+  t.tm_year -= 1900;
+  t.tm_mon -= 1;
+  // Find timezone part — scan for +/- or Z after the time portion
+  const char* p = s;
+  // Skip past the date-time portion to find timezone
+  while (*p && *p != 'Z' && *p != 'z') {
+    if ((*p == '+' || *p == '-') && p > s + 10) break;  // +/- after date portion
+    p++;
+  }
+  if (*p == 'Z' || *p == 'z') {
+    // UTC
+  } else if (*p == '+' || *p == '-') {
+    tzSign = *p;
+    sscanf(p + 1, "%d:%d", &tzH, &tzM);
+  }
+  time_t epoch = mktime(&t);
+  int offsetSec = (tzH * 3600 + tzM * 60);
+  if (tzSign == '-') epoch += offsetSec; else epoch -= offsetSec;
+  return epoch;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  NWS API fetch functions
+// ─────────────────────────────────────────────────────────────
+
+static bool fetchNwsGridUrl(WiFiClientSecure& client, HTTPClient& http) {
+  char url[128];
+  snprintf(url, sizeof(url), "https://api.weather.gov/points/%.4f,%.4f",
+           (double)s_weatherCenterLat, (double)s_weatherCenterLon);
+  http.begin(client, url);
+  http.setTimeout(8000);
+  http.addHeader("User-Agent", "LiveSat/1.0");
+  http.addHeader("Accept", "application/geo+json");
+  int code = http.GET();
+  if (code == 404) {
+    http.end();
+    Serial.println("nws: 404 not US territory");
+    s_forecast.nwsAvailable = false;
+    s_nwsGridUrlValid = false;
+    return false;
+  }
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    Serial.printf("nws: points HTTP %d\n", code);
+    s_forecast.nwsAvailable = false;
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  // Extract forecast URL from JSON: "forecast":"https://api.weather.gov/gridpoints/..."
+  char forecastUrl[128] = {};
+  jsonExtractStringField(body, "\"forecast\"", forecastUrl, sizeof(forecastUrl));
+  if (forecastUrl[0] == '\0' || strlen(forecastUrl) < 20) {
+    Serial.println("nws: no forecast URL in response");
+    s_forecast.nwsAvailable = false;
+    return false;
+  }
+  strlcpy(s_nwsGridUrl, forecastUrl, sizeof(s_nwsGridUrl));
+  s_nwsGridUrlValid = true;
+  s_forecast.nwsAvailable = true;
+  // Cache in NVS
+  Preferences prefs;
+  if (prefs.begin("satwatch", false)) {
+    prefs.putString("nwsgu", s_nwsGridUrl);
+    prefs.end();
+  }
+  Serial.printf("nws: grid=%s\n", s_nwsGridUrl);
+  return true;
+}
+
+static bool fetchNwsHourlyForecast(WiFiClientSecure& client, HTTPClient& http) {
+  if (!s_nwsGridUrlValid || s_nwsGridUrl[0] == '\0') return false;
+  char url[192];
+  snprintf(url, sizeof(url), "%s/hourly", s_nwsGridUrl);
+  http.begin(client, url);
+  http.setTimeout(10000);
+  http.addHeader("User-Agent", "LiveSat/1.0");
+  http.addHeader("Accept", "application/geo+json");
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    Serial.printf("nws: hourly HTTP %d\n", code);
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  if (body.length() < 100) return false;
+  // Parse periods by finding "number":N boundaries
+  s_forecast.hourlyCount = 0;
+  const char* s = body.c_str();
+  const char* cursor = s;
+  for (int i = 0; i < 12; i++) {
+    char numKey[16];
+    snprintf(numKey, sizeof(numKey), "\"number\":%d", i + 1);
+    const char* period = strstr(cursor, numKey);
+    if (!period) break;
+    // Find the end of this period object (next "number": or end of array)
+    char nextKey[16];
+    snprintf(nextKey, sizeof(nextKey), "\"number\":%d", i + 2);
+    const char* nextPeriod = strstr(period + 1, nextKey);
+    size_t blockLen = nextPeriod ? (size_t)(nextPeriod - period) : (size_t)(s + body.length() - period);
+    // Create a bounded substring for extraction
+    String block;
+    block.reserve(blockLen + 1);
+    block = body.substring((int)(period - s), (int)(period - s) + (int)blockLen);
+    int32_t temp = 0;
+    jsonExtractIntField(block, "\"temperature\"", &temp);
+    // NWS returns °F; convert to °C
+    int8_t tempC = (int8_t)((temp - 32) * 5 / 9);
+    int32_t precip = 0;
+    // precipitationProbability is nested: {"value": N}
+    const char* ppKey = strstr(block.c_str(), "\"probabilityOfPrecipitation\"");
+    if (ppKey) {
+      const char* valStr = strstr(ppKey, "\"value\"");
+      if (valStr) {
+        const char* colon = strchr(valStr + 7, ':');
+        if (colon) {
+          colon++;
+          while (*colon == ' ') colon++;
+          if (*colon >= '0' && *colon <= '9') {
+            precip = (int32_t)atoi(colon);
+          }
+        }
+      }
+    }
+    char shortFc[32] = {};
+    jsonExtractStringField(block, "\"shortForecast\"", shortFc, sizeof(shortFc));
+    char startTimeStr[32] = {};
+    jsonExtractStringField(block, "\"startTime\"", startTimeStr, sizeof(startTimeStr));
+    // Wind speed: "15 mph" string
+    char windStr[16] = {};
+    jsonExtractStringField(block, "\"windSpeed\"", windStr, sizeof(windStr));
+    int windMph = atoi(windStr);
+    uint8_t windKmh = (uint8_t)(windMph * 1.609f);
+    int idx = (int)s_forecast.hourlyCount;
+    s_forecast.hourly[idx].startTime = parseIso8601ToEpoch(startTimeStr);
+    s_forecast.hourly[idx].tempC = tempC;
+    s_forecast.hourly[idx].precipProbability = (uint8_t)((precip > 100) ? 100 : (precip < 0 ? 0 : precip));
+    s_forecast.hourly[idx].windSpeedKmh = windKmh;
+    s_forecast.hourly[idx].windDirDeg16 = 0;
+    strlcpy(s_forecast.hourly[idx].shortForecast, shortFc, sizeof(s_forecast.hourly[idx].shortForecast));
+    s_forecast.hourlyCount++;
+    cursor = period + 10;
+  }
+  Serial.printf("nws: hourly parsed %d periods\n", s_forecast.hourlyCount);
+  return s_forecast.hourlyCount > 0;
+}
+
+static bool fetchNwsDailyForecast(WiFiClientSecure& client, HTTPClient& http) {
+  if (!s_nwsGridUrlValid || s_nwsGridUrl[0] == '\0') return false;
+  http.begin(client, s_nwsGridUrl);
+  http.setTimeout(10000);
+  http.addHeader("User-Agent", "LiveSat/1.0");
+  http.addHeader("Accept", "application/geo+json");
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    Serial.printf("nws: daily HTTP %d\n", code);
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  if (body.length() < 100) return false;
+  // NWS /forecast returns day/night pairs. Odd numbers are day, even are night.
+  s_forecast.dailyCount = 0;
+  const char* s = body.c_str();
+  const char* cursor = s;
+  for (int dayIdx = 0; dayIdx < 5; dayIdx++) {
+    int dayNum = dayIdx * 2 + 1;
+    int nightNum = dayNum + 1;
+    char dayKey[16], nightKey[16];
+    snprintf(dayKey, sizeof(dayKey), "\"number\":%d", dayNum);
+    snprintf(nightKey, sizeof(nightKey), "\"number\":%d", nightNum);
+    const char* dayPeriod = strstr(cursor, dayKey);
+    if (!dayPeriod) break;
+    const char* nightPeriod = strstr(dayPeriod + 1, nightKey);
+    // Extract day period block
+    size_t dayBlockLen = nightPeriod ? (size_t)(nightPeriod - dayPeriod) : 2000;
+    if (dayBlockLen > 3000) dayBlockLen = 3000;
+    String dayBlock = body.substring((int)(dayPeriod - s), (int)(dayPeriod - s) + (int)dayBlockLen);
+    int32_t highTemp = 0;
+    jsonExtractIntField(dayBlock, "\"temperature\"", &highTemp);
+    int8_t highC = (int8_t)((highTemp - 32) * 5 / 9);
+    char dayFc[32] = {};
+    jsonExtractStringField(dayBlock, "\"shortForecast\"", dayFc, sizeof(dayFc));
+    char dayTimeStr[32] = {};
+    jsonExtractStringField(dayBlock, "\"startTime\"", dayTimeStr, sizeof(dayTimeStr));
+    int32_t dayPrecip = 0;
+    const char* dayPp = strstr(dayBlock.c_str(), "\"probabilityOfPrecipitation\"");
+    if (dayPp) {
+      const char* v = strstr(dayPp, "\"value\"");
+      if (v) {
+        const char* c = strchr(v + 7, ':');
+        if (c) { c++; while (*c == ' ') c++; if (*c >= '0' && *c <= '9') dayPrecip = atoi(c); }
+      }
+    }
+    // Night period for low temp
+    int8_t lowC = highC;
+    if (nightPeriod) {
+      char nextDayKey[16];
+      snprintf(nextDayKey, sizeof(nextDayKey), "\"number\":%d", nightNum + 1);
+      const char* nextDay = strstr(nightPeriod + 1, nextDayKey);
+      size_t nightBlockLen = nextDay ? (size_t)(nextDay - nightPeriod) : 2000;
+      if (nightBlockLen > 3000) nightBlockLen = 3000;
+      String nightBlock = body.substring((int)(nightPeriod - s), (int)(nightPeriod - s) + (int)nightBlockLen);
+      int32_t lowTemp = 0;
+      jsonExtractIntField(nightBlock, "\"temperature\"", &lowTemp);
+      lowC = (int8_t)((lowTemp - 32) * 5 / 9);
+    }
+    int idx = (int)s_forecast.dailyCount;
+    s_forecast.daily[idx].date = parseIso8601ToEpoch(dayTimeStr);
+    s_forecast.daily[idx].highC = highC;
+    s_forecast.daily[idx].lowC = lowC;
+    s_forecast.daily[idx].precipProbability = (uint8_t)(dayPrecip > 100 ? 100 : (dayPrecip < 0 ? 0 : dayPrecip));
+    s_forecast.daily[idx].weatherCode = 0;
+    strlcpy(s_forecast.daily[idx].shortForecast, dayFc, sizeof(s_forecast.daily[idx].shortForecast));
+    s_forecast.dailyCount++;
+    cursor = dayPeriod + 10;
+  }
+  Serial.printf("nws: daily parsed %d days\n", s_forecast.dailyCount);
+  return s_forecast.dailyCount > 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Open-Meteo ECMWF fallback (non-US locations)
+// ─────────────────────────────────────────────────────────────
+static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
+  char url[512];
+  snprintf(url, sizeof(url),
+    "https://api.open-meteo.com/v1/forecast"
+    "?latitude=%.4f&longitude=%.4f"
+    "&hourly=temperature_2m,precipitation_probability,weathercode,windspeed_10m,winddirection_10m"
+    "&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weathercode"
+    "&forecast_days=5&models=ecmwf_ifs025",
+    (double)s_weatherCenterLat, (double)s_weatherCenterLon);
+  http.begin(client, url);
+  http.setTimeout(10000);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    Serial.printf("openmeteo: HTTP %d\n", code);
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+  if (body.length() < 50) return false;
+  // Parse hourly arrays: find "hourly":{...} block
+  // Open-Meteo returns parallel arrays: "time":["...","..."], "temperature_2m":[...], etc.
+  s_forecast.hourlyCount = 0;
+  s_forecast.dailyCount = 0;
+  const char* s = body.c_str();
+  // Find hourly block
+  const char* hourlyBlock = strstr(s, "\"hourly\"");
+  if (hourlyBlock) {
+    // Find time array
+    const char* timeArr = strstr(hourlyBlock, "\"time\"");
+    const char* tempArr = strstr(hourlyBlock, "\"temperature_2m\"");
+    const char* precipArr = strstr(hourlyBlock, "\"precipitation_probability\"");
+    const char* wcArr = strstr(hourlyBlock, "\"weathercode\"");
+    const char* wsArr = strstr(hourlyBlock, "\"windspeed_10m\"");
+    const char* wdArr = strstr(hourlyBlock, "\"winddirection_10m\"");
+    if (timeArr && tempArr && precipArr) {
+      // Parse first 12 entries from each array
+      auto findArrayStart = [](const char* p) -> const char* {
+        const char* b = strchr(p, '[');
+        return b ? b + 1 : nullptr;
+      };
+      auto nextValue = [](const char*& p) -> float {
+        while (*p && (*p == ' ' || *p == ',' || *p == '"')) p++;
+        if (!*p || *p == ']') return 0;
+        float v = (float)atof(p);
+        while (*p && *p != ',' && *p != ']') p++;
+        return v;
+      };
+      auto nextString = [](const char*& p, char* out, size_t outLen) {
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;
+        size_t n = 0;
+        while (*p && *p != '"' && n < outLen - 1) { out[n++] = *p++; }
+        out[n] = '\0';
+        if (*p == '"') p++;
+      };
+      const char* tP = findArrayStart(timeArr);
+      const char* teP = findArrayStart(tempArr);
+      const char* prP = findArrayStart(precipArr);
+      const char* wcP = wcArr ? findArrayStart(wcArr) : nullptr;
+      const char* wsP = wsArr ? findArrayStart(wsArr) : nullptr;
+      const char* wdP = wdArr ? findArrayStart(wdArr) : nullptr;
+      if (tP && teP && prP) {
+        time_t nowUtc = time(nullptr);
+        // Open-Meteo returns hourly from midnight; scan up to 48 entries, keep only future ones (max 12)
+        for (int i = 0; i < 48 && *tP && *tP != ']' && s_forecast.hourlyCount < 12; i++) {
+          char timeStr[24] = {};
+          nextString(tP, timeStr, sizeof(timeStr));
+          float temp = nextValue(teP);
+          float precip = nextValue(prP);
+          float wc = wcP ? nextValue(wcP) : 0;
+          float ws = wsP ? nextValue(wsP) : 0;
+          float wd = wdP ? nextValue(wdP) : 0;
+          time_t entryTime = parseIso8601ToEpoch(timeStr);
+          if (entryTime <= nowUtc) continue;  // skip past entries
+          int idx = (int)s_forecast.hourlyCount;
+          s_forecast.hourly[idx].startTime = entryTime;
+          s_forecast.hourly[idx].tempC = (int8_t)roundf(temp);
+          s_forecast.hourly[idx].precipProbability = (uint8_t)(precip > 100 ? 100 : (precip < 0 ? 0 : (int)precip));
+          s_forecast.hourly[idx].windSpeedKmh = (uint8_t)(ws > 255 ? 255 : ws);
+          s_forecast.hourly[idx].windDirDeg16 = (uint8_t)((int)roundf(wd) / 16);
+          int wci = (int)wc;
+          if (wci >= 95) strlcpy(s_forecast.hourly[idx].shortForecast, "Thunderstorm", 32);
+          else if (wci >= 71) strlcpy(s_forecast.hourly[idx].shortForecast, "Snow", 32);
+          else if (wci >= 61) strlcpy(s_forecast.hourly[idx].shortForecast, "Rain", 32);
+          else if (wci >= 51) strlcpy(s_forecast.hourly[idx].shortForecast, "Drizzle", 32);
+          else if (wci >= 3) strlcpy(s_forecast.hourly[idx].shortForecast, "Cloudy", 32);
+          else strlcpy(s_forecast.hourly[idx].shortForecast, "Clear", 32);
+          s_forecast.hourlyCount++;
+        }
+      }
+    }
+  }
+  // Parse daily block
+  const char* dailyBlock = strstr(s, "\"daily\"");
+  if (dailyBlock) {
+    const char* timeArr = strstr(dailyBlock, "\"time\"");
+    const char* maxArr = strstr(dailyBlock, "\"temperature_2m_max\"");
+    const char* minArr = strstr(dailyBlock, "\"temperature_2m_min\"");
+    const char* precipArr = strstr(dailyBlock, "\"precipitation_probability_max\"");
+    const char* wcArr = strstr(dailyBlock, "\"weathercode\"");
+    if (timeArr && maxArr && minArr) {
+      auto findArrayStart = [](const char* p) -> const char* {
+        const char* b = strchr(p, '['); return b ? b + 1 : nullptr;
+      };
+      auto nextValue = [](const char*& p) -> float {
+        while (*p && (*p == ' ' || *p == ',' || *p == '"')) p++;
+        if (!*p || *p == ']') return 0;
+        float v = (float)atof(p);
+        while (*p && *p != ',' && *p != ']') p++;
+        return v;
+      };
+      auto nextString = [](const char*& p, char* out, size_t outLen) {
+        while (*p && *p != '"') p++;
+        if (*p == '"') p++;
+        size_t n = 0;
+        while (*p && *p != '"' && n < outLen - 1) { out[n++] = *p++; }
+        out[n] = '\0';
+        if (*p == '"') p++;
+      };
+      const char* tP = findArrayStart(timeArr);
+      const char* mxP = findArrayStart(maxArr);
+      const char* mnP = findArrayStart(minArr);
+      const char* prP = precipArr ? findArrayStart(precipArr) : nullptr;
+      const char* wcP = wcArr ? findArrayStart(wcArr) : nullptr;
+      if (tP && mxP && mnP) {
+        for (int i = 0; i < 5 && *tP && *tP != ']'; i++) {
+          char timeStr[16] = {};
+          nextString(tP, timeStr, sizeof(timeStr));
+          float maxT = nextValue(mxP);
+          float minT = nextValue(mnP);
+          float precip = prP ? nextValue(prP) : 0;
+          float wc = wcP ? nextValue(wcP) : 0;
+          int idx = (int)s_forecast.dailyCount;
+          s_forecast.daily[idx].date = parseIso8601ToEpoch(timeStr);
+          s_forecast.daily[idx].highC = (int8_t)roundf(maxT);
+          s_forecast.daily[idx].lowC = (int8_t)roundf(minT);
+          s_forecast.daily[idx].precipProbability = (uint8_t)(precip > 100 ? 100 : (precip < 0 ? 0 : (int)precip));
+          int wci = (int)wc;
+          s_forecast.daily[idx].weatherCode = (uint8_t)(wci > 99 ? 99 : (wci < 0 ? 0 : wci));
+          if (wci >= 95) strlcpy(s_forecast.daily[idx].shortForecast, "Thunderstorm", 32);
+          else if (wci >= 71) strlcpy(s_forecast.daily[idx].shortForecast, "Snow", 32);
+          else if (wci >= 61) strlcpy(s_forecast.daily[idx].shortForecast, "Rain", 32);
+          else if (wci >= 51) strlcpy(s_forecast.daily[idx].shortForecast, "Drizzle", 32);
+          else if (wci >= 3) strlcpy(s_forecast.daily[idx].shortForecast, "Cloudy", 32);
+          else strlcpy(s_forecast.daily[idx].shortForecast, "Clear", 32);
+          s_forecast.dailyCount++;
+        }
+      }
+    }
+  }
+  Serial.printf("openmeteo: hr=%d dy=%d\n", s_forecast.hourlyCount, s_forecast.dailyCount);
+  return (s_forecast.hourlyCount > 0 || s_forecast.dailyCount > 0);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Forecast orchestrator — called during sync after weather frames
+// ─────────────────────────────────────────────────────────────
+static void fetchForecastData() {
+  if (!s_forecastEnabled || !s_weatherGeoValid) return;
+  Serial.println("forecast: fetching...");
+  // Reset forecast state before fetching — prevents stale RTC_DATA_ATTR values
+  s_forecast.rainEtaMinutes = -1;
+  s_forecast.rainUncertaintyMin = 0;
+  s_forecast.nowcastCount = 0;
+  s_forecast.hourlyCount = 0;
+  s_forecast.dailyCount = 0;
+  s_forecast.valid = false;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setReuse(true);
+
+  // Tier 1: Nowcast via radar
+  if (syncProgressIsActive()) syncProgressTick(1);
+  fetchAndAnalyzeNowcastRadar(client, http);
+  if (syncProgressIsActive()) syncProgressTick(3);
+
+  // Tier 2+3: NWS → Open-Meteo fallback
+  if (!s_nwsGridUrlValid) {
+    fetchNwsGridUrl(client, http);
+    if (syncProgressIsActive()) syncProgressTick(2);
+  }
+  if (s_forecast.nwsAvailable) {
+    fetchNwsHourlyForecast(client, http);
+    if (syncProgressIsActive()) syncProgressTick(2);
+    fetchNwsDailyForecast(client, http);
+    if (syncProgressIsActive()) syncProgressTick(2);
+  }
+  // Fallback to Open-Meteo if NWS unavailable or returned no data
+  if (!s_forecast.nwsAvailable ||
+      (s_forecast.hourlyCount == 0 && s_forecast.dailyCount == 0)) {
+    fetchOpenMeteoFallback(client, http);
+    if (syncProgressIsActive()) syncProgressTick(3);
+  }
+
+  s_forecast.valid = (s_forecast.hourlyCount > 0 || s_forecast.dailyCount > 0 ||
+                      s_forecast.nowcastCount > 0);
+  s_forecast.lastSyncUtc = time(nullptr);
+  appendDiagLog("forecast: nc=%d hr=%d dy=%d nws=%d eta=%d±%d\n",
+                s_forecast.nowcastCount, s_forecast.hourlyCount,
+                s_forecast.dailyCount, s_forecast.nwsAvailable ? 1 : 0,
+                s_forecast.rainEtaMinutes, s_forecast.rainUncertaintyMin);
+  Serial.printf("forecast: done valid=%d\n", s_forecast.valid);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Download phase — sequential with connection reuse.
 //  One SSL handshake for the full weather window (frame count derives from
 //  HOURS_BACK and active cadence, clamped to MAX_FRAMES).
@@ -7835,14 +9344,23 @@ static void refreshZoomSnapshotsForLatestFrame() {
 static void syncWeatherFrames() {
   memset(s_sourceBlackLogged, 0, sizeof(s_sourceBlackLogged));
   if (!syncProgressIsActive()) showMessage("Syncing time...", "pool.ntp.org");
+  if (syncProgressIsActive()) syncProgressBeginPhase("ntp", 5U);
+  appendDiagLog("[SYNC] ntp start ms=%lu\n", millis());
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   struct tm ti;
   int tries = 0;
-  while (!getLocalTime(&ti, 1000) && tries++ < 20) {}
+  while (!getLocalTime(&ti, 1000) && tries++ < 20) {
+    if (syncProgressIsActive()) syncProgressTick(1);
+  }
   time_t now = time(nullptr);
-  Serial.printf("UTC: %s\n", ctime(&now));
+  appendDiagLog("[SYNC] ntp done tries=%d ms=%lu\n", tries, millis());
   appendDiagLog("sync: ntp utc=%lld millis=%lu ms\n", (long long)now, millis());
+  if (syncProgressIsActive()) syncProgressCompletePhase();
+
+  if (syncProgressIsActive()) syncProgressBeginPhase("geo", 10U);
+  appendDiagLog("[SYNC] refreshGeo start ms=%lu\n", millis());
   refreshDisplayLocationTimeFromIpInfo();
+  appendDiagLog("[SYNC] refreshGeo done ms=%lu\n", millis());
   if (syncProgressIsActive()) syncProgressCompletePhase();
 
   const int cadenceMin = activeCadenceMin();
@@ -7961,8 +9479,11 @@ static void syncWeatherFrames() {
 
   appendDiagLog("sync: totalFrames=%d shift=%d downloadCount=%d oldCount=%d\n",
                 totalFrames, shift, downloadCount, oldCount);
+  appendDiagLog("[SYNC] plan: total=%d shift=%d dl=%d old=%d ms=%lu\n",
+              totalFrames, shift, downloadCount, oldCount, millis());
 
   if (downloadCount == 0) {
+    appendDiagLog("[SYNC] downloadCount=0 fast path ms=%lu\n", millis());
     // Check if raw is all built
     bool allRawValid = true;
     for (int i = 0; i < (int)s_idx.count; i++) {
@@ -7996,15 +9517,18 @@ static void syncWeatherFrames() {
   }
 
   // Fetch GIBS available times
+  appendDiagLog("[SYNC] fetchGibs start ms=%lu\n", millis());
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setReuse(true);
   fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
+  appendDiagLog("[SYNC] fetchGibs done ms=%lu\n", millis());
 
   // Download frames
   if (!syncProgressIsActive()) showMessage("Updating cache...", "NASA GIBS");
   if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
+  appendDiagLog("[SYNC] download loop start dl=%d total=%d ms=%lu\n", downloadCount, totalFrames, millis());
 
   float bboxWest, bboxSouth, bboxEast, bboxNorth;
   getActiveWeatherBbox(&bboxWest, &bboxSouth, &bboxEast, &bboxNorth);
@@ -8485,7 +10009,18 @@ static void goToSleep(bool buttonOnly = false) {
   } while (true);
 
   // Remount SD before any file operations (logs, sync, playback).
-  SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+  {
+    bool sdOk = false;
+    for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+      if (sdTry > 0) delay(200);
+      sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+    }
+    if (!sdOk) {
+      Serial.println("SD remount failed after 5 attempts — re-sleeping");
+      goToSleep();
+      return;  // unreachable, but clarifies intent
+    }
+  }
 
   if (!buttonOnly && s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (s_hurricaneMode && s_hurricaneWatchEnabled) {
@@ -8506,6 +10041,7 @@ static void goToSleep(bool buttonOnly = false) {
         }
       }
       syncWeatherFrames();
+      fetchForecastData();
       maybeRefreshPendingZoomSnapshots();
     } else {
       Serial.println("timer refresh skip: no wifi");
@@ -8564,6 +10100,7 @@ static void goToSleep(bool buttonOnly = false) {
   if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
     if (connectWifiForSync(false)) {
       syncWeatherFrames();
+      fetchForecastData();
       maybeRefreshPendingZoomSnapshots();
     } else {
       Serial.println("timer refresh skip: no wifi");
@@ -8715,6 +10252,14 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 5000) delay(10);  // wait for USB host to open port
   delay(500);
+
+  // Generate per-device AP password from chip MAC (unique, not guessable)
+  {
+    uint64_t mac = ESP.getEfuseMac();
+    snprintf(s_portalApPass, sizeof(s_portalApPass), "%09lu",
+             (unsigned long)(mac % 1000000000ULL));
+  }
+
   Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
   loadWifiPortalConfig();  // needed before QMI decision below
   if (s_shakeToWakeEnabled && s_sleepModeEnabled) {
@@ -8773,21 +10318,28 @@ void setup() {
 
   Serial.printf("Free heap: %u\n", (unsigned)ESP.getFreeHeap());
 
-  // ── SD card ───────────────────────────────────────────────
+  // ── SD card (retry up to 5 times) ──────────────────────────
   showMessage("Mounting SD...", nullptr);
+  bool sdOk = false;
+  for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+    if (sdTry > 0) {
+      Serial.printf("SD retry %d/5...\n", sdTry + 1);
+      delay(200);
+    }
 #if BOARD_IS_AMOLED_206
-  SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
-  bool sdOk = SD_MMC.begin("/sdcard", /*mode1bit=*/true, /*format_if_failed=*/false,
-                            SDMMC_FREQ_DEFAULT);
+    SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
+    sdOk = SD_MMC.begin("/sdcard", /*mode1bit=*/true, /*format_if_failed=*/false,
+                         SDMMC_FREQ_DEFAULT);
 #elif defined(ARDUINO_WAVESHARE_ESP32_S3_LCD_147)
-  bool sdOk = SD.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN)
-           && SD.begin("/sdcard", true, false);
+    sdOk = SD.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN)
+         && SD.begin("/sdcard", true, false);
 #else
-  bool sdOk = SD.begin(SD_CS, SPI, 20000000);  // 20 MHz: within SD SPI spec, improves throughput
+    sdOk = SD.begin(SD_CS, SPI, 20000000);
 #endif
+  }
   if (!sdOk) {
     showMessage("SD FAILED", "Insert card and reset");
-    Serial.println("SD mount failed!");
+    Serial.println("SD mount failed after 5 attempts!");
     while (1) delay(5000);
   }
   Serial.printf("SD OK  %llu MB\n", SD.totalBytes() / (1024ULL * 1024ULL));
@@ -8823,10 +10375,17 @@ void setup() {
     s_timesLoaded = false;
     s_displayUtcOffsetSec = loadUtcOffsetFromNvs();  // restore from NVS; 0 if never synced
     s_displayUtcOffsetValid = loadUtcOffsetValidFromNvs();
-    // Keep a deterministic fallback location so pin/zoom/terrain paths still
-    // work even if IP geolocation is temporarily unavailable.
-    s_weatherCenterLat = (BBOX_SOUTH + BBOX_NORTH) * 0.5f;
-    s_weatherCenterLon = (BBOX_WEST + BBOX_EAST) * 0.5f;
+    // Restore last known good location from NVS; fall back to config defaults.
+    {
+      float nvsLat, nvsLon;
+      if (loadGeoFromNvs(&nvsLat, &nvsLon)) {
+        s_weatherCenterLat = nvsLat;
+        s_weatherCenterLon = nvsLon;
+      } else {
+        s_weatherCenterLat = (BBOX_SOUTH + BBOX_NORTH) * 0.5f;
+        s_weatherCenterLon = (BBOX_WEST + BBOX_EAST) * 0.5f;
+      }
+    }
     s_weatherGeoValid = true;
     selectSatelliteForLon(s_weatherCenterLon, true);
     s_lastRadarUtc = 0;
@@ -8887,6 +10446,7 @@ void setup() {
     }
   }
 
+
   // ── Diagnostic log to SD ─────────────────────────────────────────────────
   {
     File diagF = SD.open(SD_ROOT "/diag.txt", FILE_WRITE);
@@ -8935,20 +10495,24 @@ void setup() {
     }
   }
   if (needSync) {
-    bool wifiOk = connectWifiForSync(false);
-    { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("wifiOk=%d\n", (int)wifiOk); diagF.close(); } }
-    if (wifiOk) {
+    {
+      // Start progress bar before WiFi so user sees movement immediately
       uint32_t frameBudget = (uint32_t)targetFrameCount();
       if (frameBudget < 1U) frameBudget = 1U;
       if (frameBudget > MAX_FRAMES) frameBudget = MAX_FRAMES;
-      // Unified sync pipeline budget:
-      // sync + cache/roll + raw(remap/rebuild) + finalize + zoom/terrain refresh.
-      uint32_t totalBudget = 20U + frameBudget + (frameBudget + 8U) + 4U + 12U;
-      syncProgressBegin(totalBudget, "Updating cache...", "NASA GIBS");
-      syncProgressBeginPhase("sync", 20U);
-
+      // Budget: wifi(20) + noaa(10) + ntp(5) + geo(10) + cache + raw + forecast(15) + zoom(12)
+      uint32_t totalBudget = 20U + 10U + 5U + 10U + frameBudget + (frameBudget + 8U) + 15U + 12U;
+      syncProgressBegin(totalBudget, "Connecting...", "WiFi");
+      syncProgressBeginPhase("wifi", 20U);
+    }
+    bool wifiOk = connectWifiForSync(false);
+    appendDiagLog("[BOOT] wifi done ok=%d ms=%lu\n", (int)wifiOk, millis());
+    if (syncProgressIsActive()) syncProgressCompletePhase();
+    { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("wifiOk=%d\n", (int)wifiOk); diagF.close(); } }
+    if (wifiOk) {
       // Hurricane watch: check NOAA before sync so bbox is storm-centered if needed
       if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
+        syncProgressBeginPhase("noaa", 10U);
         HurricaneInfo hStorms[4]; int hCount = 0;
         if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
           cleanupSuppressedStorms(hStorms, hCount);
@@ -8959,15 +10523,31 @@ void setup() {
             }
           }
         }
+        syncProgressCompletePhase();
+      } else {
+        // Skip noaa budget — just advance past it
+        syncProgressBeginPhase("sync", 10U);
+        syncProgressCompletePhase();
       }
 
+      appendDiagLog("[BOOT] syncWeatherFrames start ms=%lu\n", millis());
       syncWeatherFrames();
+      appendDiagLog("[BOOT] syncWeatherFrames done ms=%lu\n", millis());
+      if (syncProgressIsActive()) syncProgressBeginPhase("forecast", 15U);
+      appendDiagLog("[BOOT] fetchForecastData start ms=%lu\n", millis());
+      fetchForecastData();
+      appendDiagLog("[BOOT] fetchForecastData done ms=%lu\n", millis());
+      if (syncProgressIsActive()) syncProgressCompletePhase();
       { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("syncWeatherFrames done fc=%d rdy=%d\n", frameCount, (int)framesReady); diagF.close(); } }
+      appendDiagLog("[BOOT] downloadMoon start ms=%lu\n", millis());
       downloadMoonFramesIfMissing();
+      appendDiagLog("[BOOT] downloadMoon done ms=%lu\n", millis());
+      appendDiagLog("[BOOT] zoomSnapshots start ms=%lu\n", millis());
       maybeRefreshPendingZoomSnapshots();
       noteSuccessfulScanNow();
       disconnectWifiAfterSync();
     } else {
+      if (syncProgressIsActive()) syncProgressEnd();
       tryApplyPcf85063Time();
       runWifiConfigPortal(framesReady && frameCount > 0);
     }
@@ -8975,6 +10555,9 @@ void setup() {
       File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
       if (diagF) {
         diagF.printf("post-sync: framesReady=%d frameCount=%d\n", (int)framesReady, frameCount);
+        diagF.printf("geo: lat=%.4f lon=%.4f valid=%d label=%s\n",
+                     (double)s_weatherCenterLat, (double)s_weatherCenterLon,
+                     (int)s_weatherGeoValid, s_displayLocationLabel);
         diagF.close();
       }
     }
@@ -9386,125 +10969,266 @@ static bool bssidGeoLocate(float* outLat, float* outLon) {
     WiFi.scanDelete();
     return false;
   }
-  if (n > 20) n = 20;  // Apple ignores extras; clamp to 20 strongest
+  Serial.printf("bssid-geo: found %d APs\n", n);
+  if (n > 20) n = 20;
 
-  // 2. Build protobuf request body
-  // Schema: outer field 13 (repeated WifiAP), each containing field1=bssid string + field3=rssi int32
-  // Worst-case size: 20 APs × (1 outer tag + 1 len + 19 bssid + 1 rssi tag + 10 varint) = 640 bytes
-  uint8_t body[1024];
-  int pos = 0;
+  // 2. Build protobuf: outer field 2 (repeated AP), inner field1=bssid + field3=0 + field4=rssi
+  uint8_t pbuf[1024];
+  int ppos = 0;
 
-  auto writeVarint = [&](uint64_t v) {
-    while (v > 0x7F) { body[pos++] = (uint8_t)((v & 0x7F) | 0x80); v >>= 7; }
-    body[pos++] = (uint8_t)v;
+  auto pbWriteVarint = [&](uint64_t v) {
+    while (v > 0x7F) { pbuf[ppos++] = (uint8_t)((v & 0x7F) | 0x80); v >>= 7; }
+    pbuf[ppos++] = (uint8_t)v;
   };
 
   for (int i = 0; i < n; i++) {
-    String mac = WiFi.BSSIDstr(i);  // "aa:bb:cc:dd:ee:ff"
+    String mac = WiFi.BSSIDstr(i);
     int32_t rssi = WiFi.RSSI(i);
 
-    // Build inner WifiAP sub-message
     uint8_t ap[64]; int ap_pos = 0;
-    // field 1 = bssid (wire type 2 = length-delimited string)
+    // field 1 = bssid string
     ap[ap_pos++] = 0x0a;
     ap[ap_pos++] = (uint8_t)mac.length();
     memcpy(ap + ap_pos, mac.c_str(), mac.length()); ap_pos += mac.length();
-    // field 3 = rssi (wire type 0 = varint, negative encoded as 64-bit two's complement)
+    // field 3 = 0 (channel/type placeholder)
     ap[ap_pos++] = 0x18;
+    ap[ap_pos++] = 0x00;
+    // field 4 = rssi (varint, negative = 64-bit two's complement)
+    ap[ap_pos++] = 0x20;
     uint64_t v = (uint64_t)(int64_t)rssi;
     do {
       ap[ap_pos++] = (uint8_t)((v & 0x7F) | (v > 0x7F ? 0x80 : 0));
       v >>= 7;
     } while (v);
 
-    // Wrap in outer field 13 (wire type 2)
-    writeVarint((13 << 3) | 2);
-    writeVarint(ap_pos);
-    memcpy(body + pos, ap, ap_pos); pos += ap_pos;
+    // Wrap in outer field 2 (wire type 2)
+    pbuf[ppos++] = 0x12;  // (2 << 3) | 2
+    pbWriteVarint(ap_pos);
+    memcpy(pbuf + ppos, ap, ap_pos); ppos += ap_pos;
   }
   WiFi.scanDelete();
 
-  // WiFi.scanNetworks() temporarily disconnects from the AP while scanning channels.
-  // Wait for the driver to reassociate before making an HTTPS request.
+  // 3. Build Apple binary header + protobuf
+  // Format: magic(2) + locale(2+N) + ident(2+N) + version(2+N) + padding(6) + pb_len(2) + protobuf
+  static const char kLocale[]  = "en_US";
+  static const char kIdent[]   = "com.apple.locationd";
+  static const char kVersion[] = "8.4.1.12H321";
+  uint8_t body[1200];
+  int bpos = 0;
+  body[bpos++] = 0x00; body[bpos++] = 0x01;  // magic
+  body[bpos++] = 0x00; body[bpos++] = (uint8_t)strlen(kLocale);
+  memcpy(body + bpos, kLocale, strlen(kLocale)); bpos += strlen(kLocale);
+  body[bpos++] = 0x00; body[bpos++] = (uint8_t)strlen(kIdent);
+  memcpy(body + bpos, kIdent, strlen(kIdent)); bpos += strlen(kIdent);
+  body[bpos++] = 0x00; body[bpos++] = (uint8_t)strlen(kVersion);
+  memcpy(body + bpos, kVersion, strlen(kVersion)); bpos += strlen(kVersion);
+  // Padding / flags before protobuf
+  body[bpos++] = 0x00; body[bpos++] = 0x00;
+  body[bpos++] = 0x00; body[bpos++] = 0x01;
+  body[bpos++] = 0x00; body[bpos++] = 0x00;
+  // 2-byte big-endian protobuf length
+  body[bpos++] = (uint8_t)((ppos >> 8) & 0xFF);
+  body[bpos++] = (uint8_t)(ppos & 0xFF);
+  memcpy(body + bpos, pbuf, ppos); bpos += ppos;
+
+  // Wait for WiFi reassociation after scan
   {
     unsigned long t = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t < 5000) delay(100);
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 8000) delay(100);
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("bssid-geo: WiFi lost after scan");
       return false;
     }
   }
 
-  // 3. POST to Apple BSSID geo API
+  // 4. POST to Apple BSSID geo API
   WiFiClientSecure appleClient;
   appleClient.setInsecure();
   HTTPClient http;
   http.begin(appleClient, "https://gs-loc.apple.com/clls/wloc");
-  http.setTimeout(6000);
+  http.setTimeout(8000);
   http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  int code = http.POST(body, pos);
+  int code = http.POST(body, bpos);
   if (code != HTTP_CODE_OK) {
     Serial.printf("bssid-geo: HTTP-%d\n", code);
     http.end();
     return false;
   }
 
-  // 4. Read response
-  WiFiClient* stream = http.getStreamPtr();
+  // 5. Read response (Apple returns many APs — we only need the first valid one)
+  // Response: 10-byte header + protobuf with field2 repeated AP entries
   int rlen = http.getSize();
-  if (rlen <= 0 || rlen > 128) { http.end(); return false; }
-  uint8_t resp[128]; int ri = 0;
+  if (rlen <= 10) { http.end(); return false; }
+  const int kMaxResp = 2048;  // read enough for several APs
+  int toRead = (rlen > kMaxResp) ? kMaxResp : rlen;
+  uint8_t* resp = (uint8_t*)malloc(toRead);
+  if (!resp) { http.end(); return false; }
+  WiFiClient* stream = http.getStreamPtr();
+  int ri = 0;
   unsigned long t0 = millis();
-  while (ri < rlen && millis() - t0 < 3000) {
-    if (stream->available()) resp[ri++] = stream->read();
+  while (ri < toRead && millis() - t0 < 4000) {
+    int avail = stream->available();
+    if (avail > 0) {
+      int chunk = (avail > (toRead - ri)) ? (toRead - ri) : avail;
+      int got = stream->readBytes(resp + ri, chunk);
+      ri += got;
+    } else {
+      delay(1);
+    }
   }
   http.end();
+  Serial.printf("bssid-geo: HTTP-200, read %d/%d bytes\n", ri, rlen);
 
-  // 5. Parse protobuf response
-  // Schema: field1 = Location { field1=lat sint64 ×1e-8, field2=lon sint64 ×1e-8 }
-  auto readVarint = [&](int& p) -> uint64_t {
+  // 6. Parse protobuf response (skip 10-byte Apple header)
+  // Schema: field2 repeated { field1=bssid, field2=Location { field1=lat int64×1e-8, field2=lon int64×1e-8 } }
+  auto readVarint = [&](const uint8_t* buf, int len, int& p) -> uint64_t {
     uint64_t result = 0; int shift = 0;
-    while (p < ri) {
-      uint8_t b = resp[p++];
+    while (p < len) {
+      uint8_t b = buf[p++];
       result |= (uint64_t)(b & 0x7F) << shift;
       if (!(b & 0x80)) break;
       shift += 7;
     }
     return result;
   };
-  auto zigzag = [](uint64_t n) -> int64_t { return (int64_t)((n >> 1) ^ -(n & 1)); };
 
-  float lat = 0, lon = 0; bool gotLat = false, gotLon = false;
-  for (int p = 0; p < ri; ) {
-    uint64_t tag = readVarint(p);
+  float sumLat = 0, sumLon = 0; int nLoc = 0;
+  const uint8_t* pb = resp + 10;  // skip Apple header
+  int pbLen = ri - 10;
+  for (int p = 0; p < pbLen; ) {
+    uint64_t tag = readVarint(pb, pbLen, p);
     int field = (int)(tag >> 3), wtype = (int)(tag & 7);
-    if (field == 1 && wtype == 2) {        // outer Location message
-      int mlen = (int)readVarint(p);
+    if (field == 2 && wtype == 2) {
+      int mlen = (int)readVarint(pb, pbLen, p);
       int mend = p + mlen;
+      if (mend > pbLen) break;
+      float aLat = 0, aLon = 0; bool hasLoc = false;
       while (p < mend) {
-        uint64_t itag = readVarint(p);
+        uint64_t itag = readVarint(pb, pbLen, p);
         int ifield = (int)(itag >> 3), iwtype = (int)(itag & 7);
-        if ((ifield == 1 || ifield == 2) && iwtype == 0) {
-          float deg = (float)(zigzag(readVarint(p)) * 1e-8);
-          if (ifield == 1) { lat = deg; gotLat = true; }
-          else             { lon = deg; gotLon = true; }
-        } else if (iwtype == 0) { readVarint(p); }
-        else break;
+        if (ifield == 2 && iwtype == 2) {  // Location sub-message
+          int llen = (int)readVarint(pb, pbLen, p);
+          int lend = p + llen;
+          if (lend > mend) { p = mend; break; }
+          while (p < lend) {
+            uint64_t lt = readVarint(pb, pbLen, p);
+            int lf = (int)(lt >> 3), lw = (int)(lt & 7);
+            if (lw == 0) {
+              uint64_t rv = readVarint(pb, pbLen, p);
+              // int64 (not zigzag) × 1e-8
+              float deg = (float)((int64_t)rv * 1e-8);
+              if (lf == 1) aLat = deg;
+              else if (lf == 2) aLon = deg;
+            } else if (lw == 2) {
+              int sl = (int)readVarint(pb, pbLen, p); p += sl;
+            } else break;
+          }
+          p = lend;
+          hasLoc = true;
+        } else if (iwtype == 0) { readVarint(pb, pbLen, p); }
+        else if (iwtype == 2) { int sl = (int)readVarint(pb, pbLen, p); p += sl; }
+        else { p = mend; break; }
       }
       p = mend;
-    } else if (wtype == 0) { readVarint(p); }
-    else if (wtype == 2)   { int l = (int)readVarint(p); p += l; }
+      if (hasLoc && aLat >= -90 && aLat <= 90 && aLon >= -180 && aLon <= 180
+          && (aLat != 0 || aLon != 0)) {
+        sumLat += aLat; sumLon += aLon; nLoc++;
+      }
+    } else if (wtype == 0) { readVarint(pb, pbLen, p); }
+    else if (wtype == 2) { int l = (int)readVarint(pb, pbLen, p); p += l; }
     else break;
   }
+  free(resp);
 
-  if (!gotLat || !gotLon || lat < -90 || lat > 90 || lon < -180 || lon > 180) {
-    Serial.println("bssid-geo: parse fail");
+  if (nLoc == 0) {
+    Serial.println("bssid-geo: no valid locations in response");
     return false;
   }
-  *outLat = lat; *outLon = lon;
-  Serial.printf("bssid-geo: lat=%ld lon=%ld\n",
-                (long)(lat * 10000), (long)(lon * 10000));
+  *outLat = sumLat / nLoc;
+  *outLon = sumLon / nLoc;
+  Serial.printf("bssid-geo: avg of %d APs → lat=%.4f lon=%.4f\n",
+                nLoc, (double)*outLat, (double)*outLon);
   return true;
+}
+
+// Reverse-geocode lat/lon to city/region label via OpenStreetMap Nominatim.
+// Sets s_displayLocationLabel ("BC, CA") and s_displayLocationFull ("Vernon, BC, CA").
+static void reverseGeocode(float lat, float lon) {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  char url[192];
+  snprintf(url, sizeof(url),
+           "https://nominatim.openstreetmap.org/reverse?format=json&lat=%.4f&lon=%.4f&zoom=10&addressdetails=1",
+           (double)lat, (double)lon);
+  http.begin(client, url);
+  http.addHeader("User-Agent", "SatWatch/1.0");
+  http.setTimeout(8000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("revgeo: HTTP %d\n", code);
+    http.end();
+    return;
+  }
+  String body = http.getString();
+  http.end();
+
+  // Parse city/town, state/province code, country code from JSON address block.
+  // Nominatim returns: "address":{"city":"Vernon","state":"British Columbia",
+  //   "ISO3166-2-lvl4":"CA-BC","country_code":"ca",...}
+  auto extractField = [&](const char* key, char* out, size_t outLen) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    int idx = body.indexOf(needle);
+    if (idx < 0) { out[0] = '\0'; return; }
+    idx += strlen(needle);
+    int end = body.indexOf('"', idx);
+    if (end < 0) { out[0] = '\0'; return; }
+    size_t len = (size_t)(end - idx);
+    if (len >= outLen) len = outLen - 1;
+    memcpy(out, body.c_str() + idx, len);
+    out[len] = '\0';
+  };
+
+  char city[48] = {}, region[8] = {}, country[4] = {};
+  // Try city, then town, then village for the locality name
+  extractField("city", city, sizeof(city));
+  if (!city[0]) extractField("town", city, sizeof(city));
+  if (!city[0]) extractField("village", city, sizeof(city));
+  extractField("country_code", country, sizeof(country));
+  // ISO3166-2-lvl4 gives "CA-BC" — extract the part after the dash
+  char iso[12] = {};
+  extractField("ISO3166-2-lvl4", iso, sizeof(iso));
+  if (iso[0]) {
+    const char* dash = strchr(iso, '-');
+    if (dash) strlcpy(region, dash + 1, sizeof(region));
+    else strlcpy(region, iso, sizeof(region));
+  }
+  // Uppercase country code
+  for (int i = 0; country[i]; i++) country[i] = toupper(country[i]);
+
+  // Store country/region codes for bar flag rendering
+  strlcpy(s_geoCountryCode, country, sizeof(s_geoCountryCode));
+  strlcpy(s_geoRegionCode, region, sizeof(s_geoRegionCode));
+
+  if (region[0] && country[0]) {
+    snprintf(s_displayLocationLabel, sizeof(s_displayLocationLabel), "%s, %s", region, country);
+    if (city[0])
+      snprintf(s_displayLocationFull, sizeof(s_displayLocationFull), "%s, %s, %s", city, region, country);
+    else
+      strlcpy(s_displayLocationFull, s_displayLocationLabel, sizeof(s_displayLocationFull));
+  } else if (country[0]) {
+    strlcpy(s_displayLocationLabel, country, sizeof(s_displayLocationLabel));
+    if (city[0])
+      snprintf(s_displayLocationFull, sizeof(s_displayLocationFull), "%s, %s", city, country);
+    else
+      strlcpy(s_displayLocationFull, country, sizeof(s_displayLocationFull));
+  }
+
+  if (s_displayLocationFull[0]) {
+    saveLocationLabelToNvs(s_displayLocationLabel, s_displayLocationFull);
+    Serial.printf("revgeo: %s\n", s_displayLocationFull);
+  }
 }
 
 static void refreshDisplayLocationTimeFromIpInfo() {
@@ -9513,133 +11237,53 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   // ── Phase 1: Lat/lon via Starlink GPS or Apple BSSID multi-AP scan ──
   // These run independently of any IP API and are the primary geo source.
   float lat = 0.0f, lon = 0.0f;
+  if (syncProgressIsActive()) syncProgressTick(1);
   bool gotGeo = starlinkGeoLocate(&lat, &lon);
   if (gotGeo) Serial.println("geo: starlink GPS");
   if (!gotGeo) {
+    if (syncProgressIsActive()) syncProgressTick(1);
     gotGeo = bssidGeoLocate(&lat, &lon);
     if (gotGeo) Serial.println("geo: Apple BSSID multi-AP");
   }
-
-  // ── Phase 2: Timezone offset + location labels via ip-api.com (HTTP) ──
-  // Free tier: 45 req/min, no API key, HTTP only. More reliable than ipapi.co.
-  // ip-api.com fields: offset (seconds), regionName, countryCode, timezone, lat, lon
-  bool gotIpApi = false;
-  String body;
-  {
-    WiFiClient plainClient;
-    HTTPClient http;
-    if (http.begin(plainClient, "http://ip-api.com/json/?fields=status,lat,lon,timezone,regionName,countryCode,offset")) {
-      http.setTimeout(5000);
-      int code = http.GET();
-      if (code == HTTP_CODE_OK) {
-        body = http.getString();
-        // Verify status field
-        char status[16] = {};
-        if (jsonExtractStringField(body, "\"status\"", status, sizeof(status))
-            && strcmp(status, "success") == 0) {
-          gotIpApi = true;
-        }
-      } else {
-        Serial.printf("ip-api HTTP-%d\n", code);
-      }
-      http.end();
-    }
-  }
-
-  // Extract timezone offset from ip-api.com (integer seconds, not a string)
-  if (gotIpApi) {
-    int32_t offsetSec = 0;
-    if (jsonExtractIntField(body, "\"offset\"", &offsetSec)) {
-      s_displayUtcOffsetSec = offsetSec;
-      s_displayUtcOffsetValid = true;
-      saveUtcOffsetToNvs(offsetSec);
-    }
-  }
-
-  // If BSSID/Starlink failed, use ip-api.com lat/lon as fallback
-  if (!gotGeo && gotIpApi) {
-    gotGeo = jsonExtractFloatField(body, "\"lat\"", &lat) &&
-             jsonExtractFloatField(body, "\"lon\"", &lon) &&
-             lat >= -90.0f && lat <= 90.0f && lon >= -180.0f && lon <= 180.0f;
-    if (gotGeo) Serial.println("geo: fell back to ip-api.com lat/lon");
-  }
+  if (syncProgressIsActive()) syncProgressTick(2);
 
   // Apply geo position — skip in hurricane mode to preserve storm-centered bbox
   if (s_hurricaneMode) {
     // Still extract timezone offset above, but don't override center/satellite
   } else if (gotGeo) {
+    // BSSID is high-confidence — always accept it.
+    // NVS is just a fallback for when BSSID fails, not a lock.
     float stableLat = roundf(lat * 100.0f) * 0.01f;
     float stableLon = roundf(lon * 100.0f) * 0.01f;
-    // Suppress cache invalidation for small drifts (BSSID geo is accurate to tens of metres).
     if (s_weatherGeoValid) {
-      float dLat = fabsf(stableLat - s_weatherCenterLat);
-      float dLon = fabsf(normalizeLon180(stableLon - s_weatherCenterLon));
-      if (dLat < 0.15f && dLon < 0.15f) {
-        stableLat = s_weatherCenterLat;
-        stableLon = s_weatherCenterLon;
-      }
+      Serial.printf("geo: updating (%.4f,%.4f) -> (%.4f,%.4f)\n",
+                    (double)s_weatherCenterLat, (double)s_weatherCenterLon,
+                    (double)stableLat, (double)stableLon);
     }
     s_weatherCenterLat = stableLat;
     s_weatherCenterLon = stableLon;
     s_weatherGeoValid = true;
+    saveGeoToNvs(stableLat, stableLon);
+    reverseGeocode(stableLat, stableLon);
+    if (syncProgressIsActive()) syncProgressTick(3);
     selectSatelliteForLon(s_weatherCenterLon);
-  } else {
-    s_weatherGeoValid = false;
+  } else if (!s_weatherGeoValid) {
+    // BSSID failed and we have no prior location — stay invalid
     selectSatelliteForLon(s_weatherCenterLon, true);
   }
 
-  // Extract location labels from ip-api.com
-  // ip-api.com: regionName = full region name, countryCode = 2-letter country
-  if (gotIpApi) {
-    char regionName[40] = {};
-    char countryCode[8] = {};
-    bool haveRegion = jsonExtractStringField(body, "\"regionName\"", regionName, sizeof(regionName)) && regionName[0];
-    bool haveCountry = jsonExtractStringField(body, "\"countryCode\"", countryCode, sizeof(countryCode)) && countryCode[0];
-
-    // Compact label: "BC, CA" style
-    if (haveRegion && haveCountry) {
-      // Abbreviate regionName to first 2 chars if it's long, else use as-is
-      char regionShort[12] = {};
-      strlcpy(regionShort, regionName, sizeof(regionShort));
-      snprintf(s_displayLocationLabel, sizeof(s_displayLocationLabel), "%s, %s", regionShort, countryCode);
-    } else if (haveCountry) {
-      strlcpy(s_displayLocationLabel, countryCode, sizeof(s_displayLocationLabel));
-    } else {
-      strlcpy(s_displayLocationLabel, "Local", sizeof(s_displayLocationLabel));
-    }
-
-    // Full label: "British Columbia, CA"
-    if (haveRegion && haveCountry) {
-      snprintf(s_displayLocationFull, sizeof(s_displayLocationFull), "%s, %s", regionName, countryCode);
-    } else if (haveRegion) {
-      strlcpy(s_displayLocationFull, regionName, sizeof(s_displayLocationFull));
-    } else if (haveCountry) {
-      strlcpy(s_displayLocationFull, countryCode, sizeof(s_displayLocationFull));
-    } else {
-      strlcpy(s_displayLocationFull, s_displayLocationLabel, sizeof(s_displayLocationFull));
-    }
-
-    saveLocationLabelToNvs(s_displayLocationLabel, s_displayLocationFull);
-  }
-
-  char tzName[40] = {};
-  if (gotIpApi) jsonExtractStringField(body, "\"timezone\"", tzName, sizeof(tzName));
-  Serial.printf("geo: off=%ld loc=%s tz=%s lat=%ld lon=%ld g=%d bssid=%d ipapi=%d\n",
-                (long)s_displayUtcOffsetSec,
+  Serial.printf("geo: loc=%s lat=%.4f lon=%.4f valid=%d bssid=%d\n",
                 s_displayLocationLabel,
-                tzName[0] ? tzName : "?",
-                (long)(s_weatherCenterLat * 10000.0f),
-                (long)(s_weatherCenterLon * 10000.0f),
-                (int)s_weatherGeoValid,
-                (int)gotGeo, (int)gotIpApi);
+                (double)s_weatherCenterLat, (double)s_weatherCenterLon,
+                (int)s_weatherGeoValid, (int)gotGeo);
   Serial.printf("wx src=%s layer=%s cad=%d lag=%d\n",
                 s_activeWeatherSource, s_activeGibsLayer,
                 activeCadenceMin(), activeLagHours());
-  appendDiagLog("geo: off=%ld loc=%s lat=%.4f lon=%.4f src=%s cad=%d g=%d bssid=%d ipapi=%d millis=%lu ms\n",
-                (long)s_displayUtcOffsetSec, s_displayLocationLabel,
+  appendDiagLog("geo: loc=%s lat=%.4f lon=%.4f src=%s cad=%d valid=%d bssid=%d millis=%lu ms\n",
+                s_displayLocationLabel,
                 (double)s_weatherCenterLat, (double)s_weatherCenterLon,
                 s_activeWeatherSource, activeCadenceMin(),
-                (int)s_weatherGeoValid, (int)gotGeo, (int)gotIpApi, millis());
+                (int)s_weatherGeoValid, (int)gotGeo, millis());
 }
 
 static void formatDisplayLocalClockNow(char* out, size_t len) {
@@ -9776,6 +11420,59 @@ static void copyClockFxSpriteToMainSprite(const ClockOverlayLayout& l) {
   }
 }
 
+// Stamp the current time onto s_frameDisplayBuf at full opacity (time-always-on mode).
+// Reuses the clock overlay layout/sprite infrastructure — reads bg from buf, draws
+// shadow + text, copies result back. ~2-3ms per call, well within 31ms frame budget.
+static void drawAlwaysOnClockOverlay(uint16_t* buf) {
+  if (!isTimeAlwaysOn() || !buf) return;
+
+  ClockOverlayLayout layout = makeClockOverlayLayout();
+  if (!ensureClockFxSpriteForLayout(layout)) return;
+
+  char clockBuf[16] = {};
+  formatDisplayLocalClockNow(clockBuf, sizeof(clockBuf));
+  if (clockBuf[0] == '\0') return;
+
+  // Load background from buf directly into clockFxSprite
+  uint16_t* dst = (uint16_t*)s_clockFxSprite.getBuffer();
+  if (!dst) return;
+  for (int row = 0; row < layout.bgH; row++) {
+    const uint16_t* srcRow = buf + (layout.bgY + row) * SCALED_W + layout.bgX;
+    uint16_t* dstRow = dst + row * layout.bgW;
+    if (s_clockFxSpritePixelsByteSwapped) {
+      for (int col = 0; col < layout.bgW; col++) dstRow[col] = __builtin_bswap16(srcRow[col]);
+    } else {
+      memcpy(dstRow, srcRow, (size_t)layout.bgW * 2U);
+    }
+  }
+
+  // Draw text
+  s_clockFxSprite.setFont(clockFontForIdx(s_clockFontIdx));
+  s_clockFxSprite.setTextSize(layout.textSize);
+  s_clockFxSprite.setTextDatum(top_left);
+  int actualTextW = s_clockFxSprite.textWidth(clockBuf);
+  if (actualTextW <= 0 || actualTextW > layout.bgW) actualTextW = layout.textW;
+  int textLocalX = (layout.bgW - actualTextW) / 2;
+  if (textLocalX < 0) textLocalX = 0;
+  const int textLocalY = layout.textY - layout.bgY;
+
+  // Drop shadow
+  {
+    uint8_t sr = ((s_clockColorRGB >> 16) & 0xFF) * 160 / 255;
+    uint8_t sg = ((s_clockColorRGB >>  8) & 0xFF) * 160 / 255;
+    uint8_t sb = ( s_clockColorRGB        & 0xFF) * 160 / 255;
+    s_clockFxSprite.setTextColor(rgb565((sr << 16) | (sg << 8) | sb));
+  }
+  s_clockFxSprite.drawString(clockBuf, textLocalX + 1, textLocalY + 1);
+
+  // Main text
+  s_clockFxSprite.setTextColor(rgb565(s_clockColorRGB));
+  s_clockFxSprite.drawString(clockBuf, textLocalX, textLocalY);
+
+  // Copy result back to buf
+  copyClockFxSpriteToMainSprite(layout);
+}
+
 static bool loadSavedClockBgIntoFxSprite(const ClockOverlayLayout& l) {
   if (!ensureClockFxSpriteForLayout(l)) return false;
   uint16_t* dst = (uint16_t*)s_clockFxSprite.getBuffer();
@@ -9908,19 +11605,19 @@ static bool runTerrainCrossfadeSegment(int newestIdx, bool baseAlreadyShown) {
   // Wipe terrain rows progressively from top (startY) into s_frameDisplayBuf.
   // Both buffers are canonical little-endian RGB565 — no bswap needed.
   const int startY = 14;
+  // Zero rows 0–13 so fullscreen scaler doesn't sample residual garbage.
+  memset(s_frameDisplayBuf, 0, (size_t)startY * SCALED_W * 2U);
   const int usableRows = SCALED_H - startY;
   const int steps = 18;
-  const int featherRows = 24;
+  const int featherRows = 72;
   int prevFullRows = 0;
   int prevTargetRows = 0;
   uint32_t startMs = millis();
 
   for (int step = 1; step <= steps; step++) {
-    uint8_t stepProgressLin = (uint8_t)(((uint32_t)step * 255U) / (uint32_t)steps);
-    uint8_t stepProgressEased = smoothstep8(stepProgressLin);
     int targetRows = (step == steps)
                    ? usableRows
-                   : (int)(((uint32_t)stepProgressEased * (uint32_t)usableRows + 127U) / 255U);
+                   : (int)(((uint32_t)step * (uint32_t)usableRows) / (uint32_t)steps);
     if (targetRows < prevTargetRows) targetRows = prevTargetRows;
     if (targetRows > usableRows) targetRows = usableRows;
 
@@ -9942,7 +11639,7 @@ static bool runTerrainCrossfadeSegment(int newestIdx, bool baseAlreadyShown) {
         int y = startY + r;
         uint16_t* dst = s_frameDisplayBuf + y * SCALED_W;
         const uint16_t* ter = s_terrainDisplayBuf + y * SCALED_W;
-        uint8_t alphaLin = (uint8_t)(((uint32_t)(r - fullRows + 1) * 255U) / (uint32_t)(bandLen + 1));
+        uint8_t alphaLin = 255U - (uint8_t)(((uint32_t)(r - fullRows + 1) * 255U) / (uint32_t)(bandLen + 1));
         uint8_t alpha = smoothstep8(alphaLin);
         if (alpha == 0) continue;
         for (int x = 0; x < SCALED_W; x++) {
@@ -9999,8 +11696,8 @@ static bool drawApproxLocationPinOnClockFxSprite(const ClockOverlayLayout& l,
 
   int tipX = (SCALED_W / 2) - l.bgX;
   int tipY = (SCALED_H / 2) - l.bgY;
-  int r = 5;
-  int headCy = tipY - 7;
+  int r = 10;
+  int headCy = tipY - 14;
 
   int minX = tipX - r - 1;
   int minY = headCy - r - 1;
@@ -10009,10 +11706,10 @@ static bool drawApproxLocationPinOnClockFxSprite(const ClockOverlayLayout& l,
   if (maxX < 0 || maxY < 0 || minX >= l.bgW || minY >= l.bgH) return false;
 
   s_clockFxSprite.fillCircle(tipX, headCy, r, 0xF800);
-  s_clockFxSprite.fillTriangle(tipX - (r - 1), headCy + 2,
-                               tipX + (r - 1), headCy + 2,
+  s_clockFxSprite.fillTriangle(tipX - (r - 1), headCy + 3,
+                               tipX + (r - 1), headCy + 3,
                                tipX, tipY, 0xF800);
-  s_clockFxSprite.fillCircle(tipX, headCy, 2, 0xFFFF);
+  s_clockFxSprite.fillCircle(tipX, headCy, 4, 0xFFFF);
 
   if (outX && outY && outW && outH) {
     int x = minX;
@@ -10135,6 +11832,9 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
     }
   }
 
+  // Re-draw location pin on top so clock text never occludes it.
+  drawApproxLocationPinOnClockFxSprite(l, nullptr, nullptr, nullptr, nullptr);
+
   // Copy blended clock region into s_frameDisplayBuf at display resolution,
   // then push the full frame. Restoring s_dlBuf after each push keeps the
   // background clean for the next tick without re-reading from SD.
@@ -10175,7 +11875,7 @@ static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadySho
   const uint32_t totalMs = clkTotals[s_clockDurIdx < 3 ? s_clockDurIdx : 1];
   const uint32_t tickMs  = 31U;     // avoid 33ms (~2x60Hz) phase-lock with panel scanout
   // Future UX knob: make the pin lead-in configurable from the UI/settings layer.
-  const uint32_t pinLeadMs = 0U;    // show pin before the time animation starts
+  const uint32_t pinLeadMs = 500U;  // show pin before the time animation starts
 
   if (!baseAlreadyShown) {
     if (!showFrame(newestIdx) &&
@@ -10216,7 +11916,7 @@ static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadySho
     drawApproxLocationPinOnClockFxSprite(layout, nullptr, nullptr, nullptr, nullptr);
     copyClockFxSpriteToMainSprite(layout);
     presentScaledBuf(s_frameDisplayBuf);
-    delay(pinLeadMs);
+    if (pinLeadMs > 0) delayWithInputPoll(pinLeadMs);
     // Re-save so pin is part of the animation background (no text-fade flicker).
     saveSpriteRegionToDlBuf(layout);
   }
@@ -10506,7 +12206,7 @@ void loop() {
   serviceUserButtons();
   if (!framesReady || frameCount == 0) {
     showMessage("No frames", "Reset to retry download");
-    delay(5000);
+    delayWithInputPoll(5000);
     return;
   }
 
@@ -10522,8 +12222,8 @@ void loop() {
     char l1[32], l2[32];
     snprintf(l1, sizeof(l1), "NO STREAM fc=%d", frameCount);
     snprintf(l2, sizeof(l2), "rdy=%d meta=%d", (int)s_streamReady, s_idx.count);
-    showMessage(l1, nullptr); delay(4000);
-    showMessage(l2, nullptr); delay(4000);
+    showMessage(l1, nullptr); delayWithInputPoll(4000);
+    showMessage(l2, nullptr); delayWithInputPoll(4000);
     return;
   }
 
@@ -10546,14 +12246,14 @@ void loop() {
     char l1[32], l2[32];
     snprintf(l1, sizeof(l1), "0 frames fc=%d", frameCount);
     snprintf(l2, sizeof(l2), "vbm=%d meta=%d", validInBitmap, s_idx.count);
-    showMessage(l1, nullptr); delay(4000);
-    showMessage(l2, nullptr); delay(4000);
+    showMessage(l1, nullptr); delayWithInputPoll(4000);
+    showMessage(l2, nullptr); delayWithInputPoll(4000);
     return;
   }
 
   if (autoUpdateDueNow()) {
     showMessage("Auto update", "Rebooting to rescan");
-    delay(300);
+    delayWithInputPoll(300);
     SD_MMC.end();
     ESP.restart();
   }
@@ -10650,7 +12350,7 @@ void loop() {
         }
       }
       uint32_t el2 = millis() - loopStartMs;
-      if (el2 < animationDurationMs) delay(animationDurationMs - el2);
+      if (el2 < animationDurationMs) delayWithInputPoll(animationDurationMs - el2);
       break;
     }
 
@@ -10731,7 +12431,17 @@ void loop() {
   }
 
   pollCleanModeToggle();
-  runCurrentTimeSweepOverlaySegment(newestIdx, baseForClockOverlay);
+  if (!isTimeAlwaysOn()) {
+    runCurrentTimeSweepOverlaySegment(newestIdx, baseForClockOverlay);
+  } else {
+    // Clock is already stamped on every frame by drawAlwaysOnClockOverlay —
+    // request pin overlay so it's rendered into the buffer on top of the clock,
+    // then pushed to AMOLED as part of the normal pixel stream (no tearing).
+    s_pinOverlayRequested = true;
+    presentScaledBuf(s_frameDisplayBuf);
+    delayWithInputPoll(500);
+    delayWithInputPoll(clockOverlayMs > 500 ? clockOverlayMs - 500 : 0);
+  }
 
   // Periodic NOAA re-check during hurricane mode
   if (s_hurricaneMode && ++s_hurricaneLoopsSinceCheck >= 3) {
@@ -10741,6 +12451,7 @@ void loop() {
     if (!s_hurricaneMode && !framesReady) {
       if (connectWifiForSync(false)) {
         syncWeatherFrames();
+        fetchForecastData();
         disconnectWifiAfterSync();
       }
     }
@@ -10749,7 +12460,8 @@ void loop() {
   loopsDone++;
   uint32_t loopElapsedMs = millis() - loopStartMs;
   uint32_t loopExpectedMs = animationDurationMs + latestFrameHoldMs
-                            + (3U * zoomPreviewStepMs) + terrainTransitionMs + clockOverlayMs;
+                            + (3U * zoomPreviewStepMs) + terrainTransitionMs
+                            + clockOverlayMs;
   int32_t loopDriftMs = (int32_t)loopElapsedMs - (int32_t)loopExpectedMs;
   Serial.printf("loop %d/%d v=%d elapsed=%ums expected=%ums drift=%dms\n",
                 loopsDone, s_loopsBeforeSleep,
