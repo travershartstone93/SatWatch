@@ -23,7 +23,7 @@
 // =============================================================
 //  Animation
 // =============================================================
-#define FRAME_DELAY_MS       33   // ms per frame slot; ~30fps target (pre-scaled frames read fast)
+#define FRAME_DELAY_MS       33   // ms per frame slot; used for pre-freeze timing
 #define LOOPS_BEFORE_SLEEP   10   // full loops to play before sleeping
 
 // =============================================================

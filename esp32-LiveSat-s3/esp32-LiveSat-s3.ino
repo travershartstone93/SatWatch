@@ -369,6 +369,11 @@ static uint16_t* s_terrainDisplayBuf = nullptr;
 static uint16_t* s_topBarBuf = nullptr;
 static uint16_t* s_botBarBuf = nullptr;
 
+// Scrolling forecast ticker — wide pre-rendered strip, memcpy window into s_botBarBuf each frame.
+static uint16_t* s_tickerBuf = nullptr;  // wide strip: s_tickerWidth × SCALED_BAR_H
+static int       s_tickerWidth = 0;      // total pixel width of rendered content + padding
+static int       s_tickerScrollPx = 0;   // current scroll offset (advanced inside presentScaledBuf)
+
 // Dirty-rect state for clock overlay partial scale.
 // When s_dirtyRectDstW > 0, presentSpriteToDisplay() scales only the clock
 // sub-rect instead of the full 410×360 frame.
@@ -668,6 +673,7 @@ static bool s_audioCueReady = false;
 static char s_audioCueLoadedPath[START_CUE_PATH_MAX] = "";
 #endif
 static bool s_buttonSleepTransition = false;
+static bool s_serviceButtonsWakeReset = false;
 static void serviceUserButtons();
 
 static constexpr uint32_t TOP_BTN_SHORT_PRESS_MS = 5U;
@@ -839,7 +845,6 @@ static void loadWifiPortalConfig() {
                (modePath && modePath[0]) ? modePath : "/power_up.raw");
       s_chimeVolume = prefs.getUChar("chmv", 80);
       s_sleepModeEnabled = prefs.getBool("slp", true);
-      s_autoUpdateInSleep = prefs.getBool("ausl", true);
       int lbsl = prefs.getInt("lbsl", LOOPS_BEFORE_SLEEP);
       if (lbsl < 1) lbsl = 1;
       if (lbsl > 99) lbsl = 99;
@@ -962,7 +967,6 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
                                  UpdateMode updateMode, uint16_t autoUpdateIntervalMin,
                                  bool autoUpdateTopOfHour,
                                  StartCueMode startCueMode, uint8_t chimeVolume,
-                                 bool autoUpdateInSleep,
                                  uint8_t schedCount, const uint16_t* schedMinutes,
                                  int loopsBeforeSleep, bool shakeToWake,
                                  int shakeEntryIgnoreMs, int shakeConfirmMs,
@@ -989,7 +993,6 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   prefs.putUChar("chmv", chimeVolume);
   const char* derivedPath = cuePathForMode(startCueMode);
   prefs.putString("cuep", (derivedPath && derivedPath[0]) ? derivedPath : "/power_up.raw");
-  prefs.putBool("ausl", autoUpdateInSleep);
   prefs.putInt("lbsl", loopsBeforeSleep);
   prefs.putBool("stwk", shakeToWake);
   prefs.putInt("stwksetms", shakeEntryIgnoreMs);
@@ -1014,7 +1017,6 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   s_chimeVolume = chimeVolume;
   snprintf(s_startCuePath, sizeof(s_startCuePath), "%s",
            (derivedPath && derivedPath[0]) ? derivedPath : "/power_up.raw");
-  s_autoUpdateInSleep = autoUpdateInSleep;
   s_loopsBeforeSleep = loopsBeforeSleep;
   s_shakeToWakeEnabled = shakeToWake;
   s_shakeEntryIgnoreMs = (uint16_t)shakeEntryIgnoreMs;
@@ -1059,6 +1061,46 @@ static void noteSuccessfulScanNow() {
   if (!prefs.begin("satwatch", false)) return;
   prefs.putULong64("lsyn", (uint64_t)nowUtc);
   prefs.end();
+}
+
+// Seconds until the next clock-aligned auto-update boundary.
+// Returns 0 if time is unknown or update mode has no schedule.
+static int secondsUntilNextUpdate() {
+  time_t nowUtc = time(nullptr);
+  if (nowUtc <= 0) return 0;
+  time_t localNow = nowUtc + (time_t)(s_displayUtcOffsetValid ? s_displayUtcOffsetSec : (-4 * 3600));
+
+  if (s_updateMode == UPDATE_MODE_SCHEDULED) {
+    if (s_scheduledUpdateCount == 0) return 0;
+    int minuteOfDay = (int)((localNow % 86400) / 60);
+    if (minuteOfDay < 0) minuteOfDay += 1440;
+    int secInMinute = (int)(localNow % 60);
+    if (secInMinute < 0) secInMinute += 60;
+    int bestDelta = 1440;  // worst case: full day
+    for (int i = 0; i < s_scheduledUpdateCount; i++) {
+      int delta = (int)s_scheduledUpdateMinutes[i] - minuteOfDay;
+      if (delta <= 0) delta += 1440;
+      if (delta < bestDelta) bestDelta = delta;
+    }
+    int secs = bestDelta * 60 - secInMinute;
+    return (secs < 60) ? secs + 1440 * 60 : secs;  // skip if < 1 min away
+  }
+
+  // For AUTO or MANUAL mode, align to s_autoUpdateIntervalMin boundaries.
+  // s_autoUpdateInSleep is independent of s_updateMode.
+  {
+    int intervalMin = 60;
+    if (s_autoUpdateTopOfHour) {
+      intervalMin = 60;
+    } else if (s_autoUpdateIntervalMin == 15 || s_autoUpdateIntervalMin == 30 || s_autoUpdateIntervalMin == 60) {
+      intervalMin = (int)s_autoUpdateIntervalMin;
+    }
+    int intervalSec = intervalMin * 60;
+    int localSec = (int)(localNow % (time_t)intervalSec);
+    if (localSec < 0) localSec += intervalSec;
+    int remaining = intervalSec - localSec;
+    return (remaining < 60) ? remaining + intervalSec : remaining;
+  }
 }
 
 static bool autoUpdateDueNow() {
@@ -1233,10 +1275,6 @@ static void sendWifiPortalPage() {
   html += F("'>");
   html += F("<div class='hint'>Chime 1 = power_up.raw &nbsp;|&nbsp; Chime 2 = chime2.raw &nbsp;|&nbsp; Chime 3 = chime3.raw &nbsp;|&nbsp; Vibe pulse uses fixed volume 80.</div>");
   html += F("<div class='mb-4'><label class='block text-sm font-medium text-gray-300 mb-1'>Sleep behaviour</label>");
-  html += F("<label class='flex items-center gap-2 text-sm text-gray-200'>");
-  html += F("<input type='checkbox' name='ausl' value='1'");
-  if (s_autoUpdateInSleep) html += F(" checked");
-  html += F(">Wake device from sleep on auto update</label>");
   html += F("<div style='margin-top:8px'><label class='text-sm text-gray-200'>Animation loops before sleep: ");
   html += F("<input type='number' name='lbsl' min='1' max='99' style='width:4em' value='");
   html += String(s_loopsBeforeSleep);
@@ -1263,6 +1301,11 @@ static void sendWifiPortalPage() {
     html += htmlEscape(WiFi.localIP().toString().c_str());
     html += F("</div>");
   }
+  html += F("<div class='hint' style='margin-top:12px;border-top:1px solid #444;padding-top:12px'>"
+            "<b>GPS Tracking (mobile use):</b><br>"
+            "Open <a href='/track' style='color:#38bdf8'>satwatch.local/track</a> in Safari, "
+            "then tap Share &rarr; Add to Home Screen.<br>"
+            "Tap the icon anytime to push iPhone GPS to the watch.</div>");
   html += F("</div>");
   html += F("<script>"
             "var s_rowCount=0;"
@@ -1526,7 +1569,6 @@ static void handleWifiPortalSave() {
   int chimeVol = s_wifiPortalServer.arg("chimevol").toInt();
   if (chimeVol < 0) chimeVol = 0;
   if (chimeVol > 100) chimeVol = 100;
-  bool autoUpdateInSleep = s_wifiPortalServer.hasArg("ausl");
   int loopsBeforeSleep = s_wifiPortalServer.arg("lbsl").toInt();
   if (loopsBeforeSleep < 1) loopsBeforeSleep = 1;
   if (loopsBeforeSleep > 99) loopsBeforeSleep = 99;
@@ -1589,7 +1631,7 @@ static void handleWifiPortalSave() {
   }
 
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
-                       (StartCueMode)mode, (uint8_t)chimeVol, autoUpdateInSleep,
+                       (StartCueMode)mode, (uint8_t)chimeVol,
                        schedCount, schedMins, loopsBeforeSleep, shakeToWake,
                        shakeEntryIgnoreMs, shakeConfirmMs, cleanModeEnabled);
   s_wifiPortalServer.send(200, "text/html",
@@ -1788,6 +1830,138 @@ static void sendLsHandler() {
   s_wifiPortalServer.send(200, "text/plain", out);
 }
 
+// Download any file from SD card: /dl?path=/frames/vz3.jpg
+static void handleDownloadFile() {
+  if (!s_wifiPortalServer.hasArg("path")) {
+    s_wifiPortalServer.send(400, "text/plain", "missing path param");
+    return;
+  }
+  String path = s_wifiPortalServer.arg("path");
+  if (path.indexOf("..") >= 0) {
+    s_wifiPortalServer.send(403, "text/plain", "invalid path");
+    return;
+  }
+  String sdPath = String(SD_ROOT) + path;
+  File f = SD.open(sdPath, FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    s_wifiPortalServer.send(404, "text/plain", "not found");
+    return;
+  }
+  size_t fSize = f.size();
+  String ct = "application/octet-stream";
+  if (path.endsWith(".jpg") || path.endsWith(".jpeg")) ct = "image/jpeg";
+  else if (path.endsWith(".txt")) ct = "text/plain";
+  else if (path.endsWith(".bin")) ct = "application/octet-stream";
+  s_wifiPortalServer.sendHeader("Content-Disposition", "attachment; filename=\"" + path.substring(path.lastIndexOf('/') + 1) + "\"");
+  s_wifiPortalServer.setContentLength(fSize);
+  s_wifiPortalServer.send(200, ct, "");
+  uint8_t buf[1024];
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    if (n == 0) break;
+    s_wifiPortalServer.client().write(buf, n);
+  }
+  f.close();
+}
+
+static void handleTrackPage() {
+  const char* html = R"rawhtml(<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="SatWatch GPS">
+<title>SatWatch GPS</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;
+display:flex;flex-direction:column;align-items:center;justify-content:center;
+min-height:100vh;padding:2em;text-align:center}
+h2{color:#38bdf8;margin-bottom:.5em;font-size:1.4em}
+.status{font-size:1.3em;margin:1em 0;min-height:1.5em}
+.coords{font-family:ui-monospace,monospace;color:#7dd3fc;font-size:1.1em;margin:.5em 0}
+.detail{color:#94a3b8;font-size:.85em;margin:.3em 0}
+.active{color:#4ade80}
+.error{color:#f87171}
+.pulse{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+</style>
+</head><body>
+<h2>&#127757; SatWatch GPS</h2>
+<div class="status" id="status"><span class="pulse">Acquiring GPS...</span></div>
+<div class="coords" id="coords"></div>
+<div class="detail" id="detail"></div>
+<script>
+let lastLat=null,lastLon=null,pushCount=0;
+if(navigator.geolocation){
+navigator.geolocation.watchPosition(p=>{
+lastLat=p.coords.latitude;lastLon=p.coords.longitude;
+document.getElementById('coords').textContent=
+lastLat.toFixed(6)+', '+lastLon.toFixed(6);
+document.getElementById('status').innerHTML='<span class="active">&#9679; Tracking Active</span>';
+push();
+},e=>{
+document.getElementById('status').innerHTML='<span class="error">'+e.message+'</span>';
+},{enableHighAccuracy:true,maximumAge:10000,timeout:30000});
+setInterval(push,30000);
+}else{
+document.getElementById('status').innerHTML='<span class="error">Geolocation unavailable</span>';
+}
+async function push(){
+if(!lastLat)return;
+try{
+const r=await fetch('/setlocation?lat='+lastLat+'&lon='+lastLon);
+const t=await r.text();
+pushCount++;
+document.getElementById('detail').textContent=t+' (push #'+pushCount+')';
+}catch(e){document.getElementById('detail').textContent='Watch unreachable';}
+}
+</script>
+</body></html>)rawhtml";
+  s_wifiPortalServer.send(200, "text/html", html);
+}
+
+static void handleSetLocation() {
+  if (!s_wifiPortalServer.hasArg("lat") || !s_wifiPortalServer.hasArg("lon")) {
+    s_wifiPortalServer.send(400, "text/plain", "missing lat or lon");
+    return;
+  }
+  String latStr = s_wifiPortalServer.arg("lat");
+  String lonStr = s_wifiPortalServer.arg("lon");
+  if (latStr.length() == 0 || lonStr.length() == 0) {
+    s_wifiPortalServer.send(400, "text/plain", "empty lat or lon");
+    return;
+  }
+  float lat = latStr.toFloat();
+  float lon = lonStr.toFloat();
+  if ((lat == 0.0f && latStr.indexOf('0') < 0) ||
+      (lon == 0.0f && lonStr.indexOf('0') < 0)) {
+    s_wifiPortalServer.send(400, "text/plain", "unparseable coordinates");
+    return;
+  }
+  if (lat < -90.0f || lat > 90.0f || lon < -180.0f || lon > 180.0f) {
+    s_wifiPortalServer.send(400, "text/plain", "invalid coordinates");
+    return;
+  }
+  float stableLat = roundf(lat * 100.0f) * 0.01f;
+  float stableLon = roundf(lon * 100.0f) * 0.01f;
+  s_weatherCenterLat = stableLat;
+  s_weatherCenterLon = stableLon;
+  s_weatherGeoValid = true;
+  saveGeoToNvs(stableLat, stableLon);
+  reverseGeocode(stableLat, stableLon);
+  selectSatelliteForLon(s_weatherCenterLon);
+  s_zoomSnapshotsRefreshPending = true;
+  appendDiagLog("setlocation: lat=%.4f lon=%.4f label=%s\n",
+                (double)stableLat, (double)stableLon, s_displayLocationLabel);
+  char resp[128];
+  snprintf(resp, sizeof(resp), "Location set: %s (%.4f, %.4f)",
+           s_displayLocationLabel, (double)stableLat, (double)stableLon);
+  s_wifiPortalServer.send(200, "text/plain", resp);
+}
+
 static void ensureWifiPortalHandlers() {
   if (s_wifiPortalHandlersReady) return;
   s_wifiPortalServer.on("/", HTTP_GET, sendWifiPortalPage);
@@ -1802,6 +1976,9 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/clearframes", HTTP_POST, handleClearFrames);
   s_wifiPortalServer.on("/hwclearsup", HTTP_POST, handleClearHurricaneSuppression);
   s_wifiPortalServer.on("/frame", HTTP_GET, handleServeFrame);
+  s_wifiPortalServer.on("/dl", HTTP_GET, handleDownloadFile);
+  s_wifiPortalServer.on("/setlocation", HTTP_GET, handleSetLocation);
+  s_wifiPortalServer.on("/track", HTTP_GET, handleTrackPage);
 
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
   s_wifiPortalHandlersReady = true;
@@ -2470,7 +2647,19 @@ static const uint32_t kStormCloud[] = {
   0b0000110000,  //     **
   0b0001100000,  //    **
 };
-// Draw a weather icon for precipitation type. Returns drawn width (0 if type is 0/unknown).
+static const uint32_t kSunIcon[] = {
+  0b0001010000,  //    * *
+  0b0100100100,  //  *  *  *
+  0b0011111000,  //   *****
+  0b0111111100,  //  *******
+  0b1101110110,  // ** *** **
+  0b0111111100,  //  *******
+  0b0011111000,  //   *****
+  0b0100100100,  //  *  *  *
+  0b0001010000,  //    * *
+  0b0000000000,
+};
+// Draw a weather icon. Returns drawn width (0 if type is 0/unknown).
 static int drawWeatherIcon(LGFX_Sprite& spr, int x, int y, int h, char type) {
   const uint32_t* bm = nullptr;
   uint16_t color = 0;
@@ -2478,6 +2667,7 @@ static int drawWeatherIcon(LGFX_Sprite& spr, int x, int y, int h, char type) {
     case 'R': bm = kRainCloud;  color = spr.color565(100, 180, 255); break;
     case 'S': bm = kSnowflake;  color = 0xFFFF; break;
     case 'T': bm = kStormCloud; color = spr.color565(255, 220, 50); break;
+    case 'C': bm = kSunIcon;    color = spr.color565(255, 200, 50); break;
     default: return 0;
   }
   constexpr int baseW = 10, baseH = 10;
@@ -2978,6 +3168,44 @@ static void resetJpegDrawStats() {
   s_jpegDrawOutOfBounds = false;
 }
 
+// Grayscale decode callback — counts 8x8 MCU blocks that are entirely zero.
+// At 8-bit grayscale, nighttime IR ocean is 1-3 (never all-zero MCUs).
+// Partial composites have true (0,0,0) regions → all-zero MCUs at 8-bit.
+static int s_blackMcuCount = 0;
+static int jpegDrawGrayCount(JPEGDRAW* pDraw) {
+  const uint8_t* px = (const uint8_t*)pDraw->pPixels;
+  int w = pDraw->iWidth;
+  int h = pDraw->iHeight;
+  // Check 8x8 sub-blocks within this MCU strip
+  for (int by = 0; by < h; by += 8) {
+    for (int bx = 0; bx < w; bx += 8) {
+      bool allZero = true;
+      for (int dy = 0; dy < 8 && (by + dy) < h && allZero; dy++) {
+        const uint8_t* row = px + (by + dy) * w + bx;
+        int bw = (bx + 8 <= w) ? 8 : (w - bx);
+        for (int dx = 0; dx < bw; dx++) {
+          if (row[dx] != 0) { allZero = false; break; }
+        }
+      }
+      if (allZero) s_blackMcuCount++;
+    }
+  }
+  return 1;
+}
+
+// Check if JPEG has any all-black 8x8 MCUs at 8-bit grayscale.
+// Returns the count. Nighttime IR = 0. Partial composites = 200+.
+static int countBlackMcusGrayscale(const uint8_t* buf, size_t jpegLen) {
+  s_blackMcuCount = 0;
+  JPEGDEC grayJpeg;
+  if (grayJpeg.openRAM((uint8_t*)buf, (int)jpegLen, jpegDrawGrayCount)) {
+    grayJpeg.setPixelType(EIGHT_BIT_GRAYSCALE);
+    grayJpeg.decode(0, 0, 0);
+    grayJpeg.close();
+  }
+  return s_blackMcuCount;
+}
+
 static bool jpegDrawLooksFullFrame() {
   if (s_jpegDrawCalls == 0) return false;
   if (s_jpegDrawOutOfBounds) return false;
@@ -3033,6 +3261,84 @@ static void showMessage(const char* line1, const char* line2 = nullptr) {
 }
 
 static uint32_t s_progBarLastPct = 0;   // last drawn bar percentage (0-100)
+
+// ── Background progress bar interpolation task ──────────────────────
+// The main thread sets the target percentage; a background FreeRTOS task
+// smoothly advances the displayed bar using exponential ease-out so it
+// always appears to be moving, but never overshoots the target.
+static volatile uint32_t s_progTargetPct = 0;      // real target (set by main thread)
+static volatile float    s_progDisplayPct = 0.0f;   // smoothed display value
+static volatile bool     s_progTaskRunning = false;  // background task active flag
+static volatile bool     s_progFinished = false;     // allow snap to 100%
+static char              s_progTaskLabel[24] = "sync";
+static portMUX_TYPE      s_progLabelMux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t      s_progTaskHandle = nullptr;
+
+static void progBarInterpolateTask(void*) {
+  s_progTaskRunning = true;
+  while (s_progTaskRunning) {
+    uint32_t target = s_progTargetPct;
+    float display = s_progDisplayPct;
+    bool finished = s_progFinished;
+
+    // Cap: never exceed target-1 unless finished
+    float ceiling = finished ? 100.0f : (target > 0 ? (float)(target - 1) : 0.0f);
+    if (ceiling < 0.0f) ceiling = 0.0f;
+
+    if (display < ceiling) {
+      float gap = ceiling - display;
+      float step = gap * 0.08f;  // 8% of remaining distance per tick
+      if (step < 0.15f) step = 0.15f;  // minimum creep so bar never fully stalls
+      display += step;
+      if (display > ceiling) display = ceiling;
+      s_progDisplayPct = display;
+
+      uint32_t drawPct = (uint32_t)(display + 0.5f);
+      if (drawPct > 100) drawPct = 100;
+      if (drawPct != s_progBarLastPct) {
+        s_progBarLastPct = drawPct;
+        char lbl[24];
+        portENTER_CRITICAL(&s_progLabelMux);
+        memcpy(lbl, s_progTaskLabel, sizeof(lbl));
+        portEXIT_CRITICAL(&s_progLabelMux);
+        drawProgressBarRaw(drawPct, lbl);
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(33));
+  }
+  s_progTaskHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+
+static void startProgBarTask() {
+  if (s_progTaskHandle) return;
+  s_progTargetPct = 0;
+  s_progDisplayPct = 0.0f;
+  s_progFinished = false;
+  s_progBarLastPct = 0;
+  xTaskCreatePinnedToCore(progBarInterpolateTask, "progBar", 3072, nullptr, 1, &s_progTaskHandle, 1);
+}
+
+static void stopProgBarTask() {
+  if (!s_progTaskHandle) return;
+  s_progTaskRunning = false;
+  vTaskDelay(pdMS_TO_TICKS(50));  // let task exit
+  if (s_progTaskHandle) {
+    vTaskDelete(s_progTaskHandle);
+    s_progTaskHandle = nullptr;
+  }
+}
+
+static void setProgBarTarget(uint32_t pct, const char* label) {
+  if (pct > 100) pct = 100;
+  s_progTargetPct = pct;
+  if (label) {
+    portENTER_CRITICAL(&s_progLabelMux);
+    strlcpy(s_progTaskLabel, label, sizeof(s_progTaskLabel));
+    portEXIT_CRITICAL(&s_progLabelMux);
+  }
+}
 
 // Raw draw — no animation, just paint the bar at the given percentage
 static void drawProgressBarRaw(uint32_t percent, const char* label) {
@@ -3097,25 +3403,19 @@ static void drawProgressBarRaw(uint32_t percent, const char* label) {
   serviceWifiPortalServer();
 }
 
-// Smooth progress bar — animates jumps so the bar never teleports
+// Update progress bar — sets target for background interpolation task.
+// If the task isn't running, falls back to direct draw.
 static void drawProgressBarUi(uint32_t current, uint32_t total, const char* label) {
   if (total == 0) total = 1;
   if (current > total) current = total;
   uint32_t targetPct = (uint32_t)(((uint64_t)current * 100ULL) / (uint64_t)total);
   if (targetPct > 100U) targetPct = 100U;
 
-  appendDiagLog("[PROG] %s %lu/%lu (%lu%%) last=%lu ms=%lu\n",
-               label ? label : "?", (unsigned long)current, (unsigned long)total,
-               (unsigned long)targetPct, (unsigned long)s_progBarLastPct, millis());
-
-  // Animate in 1% steps if jumping more than 2%
-  if (targetPct > s_progBarLastPct + 2) {
-    while (s_progBarLastPct < targetPct) {
-      s_progBarLastPct++;
-      drawProgressBarRaw(s_progBarLastPct, label);
-      delay(15);
-    }
+  if (s_progTaskHandle) {
+    // Background task handles smooth drawing
+    setProgBarTarget(targetPct, label);
   } else {
+    // No background task — draw directly
     s_progBarLastPct = targetPct;
     drawProgressBarRaw(targetPct, label);
   }
@@ -3137,6 +3437,7 @@ static void syncProgressBegin(uint32_t totalUnits, const char* line1, const char
   s_progBarLastPct = 0;
   strlcpy(s_syncProgPhaseLabel, "sync", sizeof(s_syncProgPhaseLabel));
   showMessage(line1 ? line1 : "Updating cache...", line2 ? line2 : "Validating data");
+  startProgBarTask();
   drawProgressBarUi(0, s_syncProgTotalUnits, s_syncProgPhaseLabel);
 }
 
@@ -3197,8 +3498,15 @@ static void syncProgressEnd() {
   if (!syncProgressIsActive()) return;
   appendDiagLog("[PROG] END done=%lu total=%lu ms=%lu\n",
                (unsigned long)s_syncProgDoneUnits, (unsigned long)s_syncProgTotalUnits, millis());
-  s_syncProgDoneUnits = s_syncProgTotalUnits;
-  drawProgressBarUi(s_syncProgDoneUnits, s_syncProgTotalUnits, "done");
+  // Signal completion — let background task snap to 100%
+  s_progFinished = true;
+  setProgBarTarget(100, "done");
+  // Give the task a moment to render 100%, then stop it
+  vTaskDelay(pdMS_TO_TICKS(200));
+  stopProgBarTask();
+  // Final direct draw to ensure 100% is shown
+  s_progBarLastPct = 100;
+  drawProgressBarRaw(100, "done");
   s_syncProgActive = false;
   s_syncProgTotalUnits = 0;
   s_syncProgDoneUnits = 0;
@@ -3501,11 +3809,262 @@ static void ensureBarSpriteReady() {
   }
 }
 
+// ── Scrolling forecast ticker ──────────────────────────────────────────
+
+// Convert wind direction degrees to compass string (N, NNE, NE, etc.)
+static const char* degToCompass(int deg) {
+  static const char* dirs[] = {
+    "N","NNE","NE","ENE","E","ESE","SE","SSE",
+    "S","SSW","SW","WSW","W","WNW","NW","NNW"
+  };
+  int idx = ((deg % 360) + 11) / 22;
+  if (idx < 0) idx += 16;
+  return dirs[idx % 16];
+}
+
+// Pre-render the full forecast ticker into a wide PSRAM buffer.
+// Content: for each day — "Day Icon HighC/LowC  Wind  [precip info]"
+// Returns total width in pixels. Caller stores in s_tickerWidth.
+static int renderForecastTicker() {
+  ensureBarSpriteReady();
+  if (!s_barSpriteReady) return 0;
+  if (!s_forecast.valid) return 0;
+
+  // Helper lambdas (same as in renderBarsAtScaledRes)
+  auto isPrecipKeyword = [](const char* s) -> char {
+    if (!s) return 0;
+    char buf[32]; int n = 0;
+    for (const char* q = s; *q && n < 30; q++) buf[n++] = tolower(*q);
+    buf[n] = '\0';
+    if (strstr(buf, "thunder") || strstr(buf, "tstorm") || strstr(buf, "storm")) return 'T';
+    if (strstr(buf, "snow") || strstr(buf, "flurr") || strstr(buf, "sleet") || strstr(buf, "ice")) return 'S';
+    if (strstr(buf, "rain") || strstr(buf, "shower") || strstr(buf, "drizzle")) return 'R';
+    return 0;
+  };
+  auto fmtLocalTime = [](time_t t, char* out, int outSz) {
+    time_t local = t + (time_t)(s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0);
+    struct tm lt; gmtime_r(&local, &lt);
+    int h = lt.tm_hour;
+    const char* ap = (h < 12) ? "am" : "pm";
+    if (h == 0) h = 12; else if (h > 12) h -= 12;
+    if (lt.tm_min > 0) snprintf(out, outSz, "%d:%02d%s", h, lt.tm_min, ap);
+    else               snprintf(out, outSz, "%d%s", h, ap);
+  };
+  auto fmtDayName = [](time_t t, char* out, int outSz) {
+    time_t local = t + (time_t)(s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0);
+    struct tm lt; gmtime_r(&local, &lt);
+    static const char* days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+    strlcpy(out, days[lt.tm_wday], outSz);
+  };
+
+  // -- First pass: measure total width --
+  s_barSprite.setFont(&fonts::FreeSans12pt7b);
+  float ts = 0.85f;
+  s_barSprite.setTextSize(ts);
+  int fh = s_barSprite.fontHeight();
+  while (fh > SCALED_BAR_H && ts > 0.5f) {
+    ts -= 0.05f;
+    s_barSprite.setTextSize(ts);
+    fh = s_barSprite.fontHeight();
+  }
+
+  const int iconH = SCALED_BAR_H - 2;
+  const int iconDrawW = max(1, iconH / 10) * 10;
+  const int iconGap = 3;
+  const int entryGap = 20;  // gap between daily entries
+  time_t nowUtcFc = time(nullptr);
+
+  // Build ticker text segments
+  struct TickerSegment {
+    char type;      // 'R','T','S',0
+    char text[48];
+  };
+  TickerSegment segs[32];
+  int segCount = 0;
+
+  // Nowcast if rain approaching
+  if (s_forecast.rainEtaMinutes == 0) {
+    segs[segCount++] = {'R', "Rain now"};
+  } else if (s_forecast.rainEtaMinutes > 0) {
+    char tb[12];
+    time_t arrival = nowUtcFc + (time_t)s_forecast.rainEtaMinutes * 60;
+    fmtLocalTime(arrival, tb, sizeof(tb));
+    TickerSegment seg; seg.type = 'R';
+    int um = s_forecast.rainUncertaintyMin;
+    if (um >= 60)
+      snprintf(seg.text, sizeof(seg.text), "Rain ~%s +/-%dh", tb, um / 60);
+    else
+      snprintf(seg.text, sizeof(seg.text), "Rain ~%s +/-%dm", tb, um);
+    segs[segCount++] = seg;
+  }
+
+  // Hourly entries for today (first precip blocks + wind)
+  {
+    char lastPtype = 0;
+    for (int i = 0; i < (int)s_forecast.hourlyCount && segCount < 10; i++) {
+      int hoursOut = (int)((s_forecast.hourly[i].startTime - nowUtcFc) / 3600);
+      if (hoursOut < 0) continue;
+      if (hoursOut > 24) break;
+      if (s_forecast.hourly[i].precipProbability < 20) { lastPtype = 0; continue; }
+      char pType = isPrecipKeyword(s_forecast.hourly[i].shortForecast);
+      if (!pType) { lastPtype = 0; continue; }
+      if (pType == lastPtype) continue;
+      lastPtype = pType;
+      TickerSegment seg; seg.type = pType;
+      char tb[12];
+      fmtLocalTime(s_forecast.hourly[i].startTime, tb, sizeof(tb));
+      snprintf(seg.text, sizeof(seg.text), "%s", tb);
+      segs[segCount++] = seg;
+    }
+  }
+
+  // Wind from hourly[0]
+  if (s_forecast.hourlyCount > 0 && segCount < 30) {
+    int kmh = s_forecast.hourly[0].windSpeedKmh;
+    int deg = s_forecast.hourly[0].windDirDeg16 * 16;
+    int kts = (kmh * 10) / 19;
+    TickerSegment seg; seg.type = 0;
+    snprintf(seg.text, sizeof(seg.text), "Wind %dkts %s", kts, degToCompass(deg));
+    segs[segCount++] = seg;
+  }
+
+  // Daily entries — each day with conditions + temp + precip if any
+  for (int i = 0; i < (int)s_forecast.dailyCount && segCount < 28; i++) {
+    int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
+    if (hoursOut < -12) continue;
+    char dayName[8];
+    fmtDayName(s_forecast.daily[i].date, dayName, sizeof(dayName));
+    char pType = isPrecipKeyword(s_forecast.daily[i].shortForecast);
+
+    // Day name + temp + icon
+    TickerSegment seg;
+    seg.type = pType ? pType : 'C';  // sun icon for clear/cloudy days
+    int hi = s_forecastUseFahrenheit ? s_forecast.daily[i].highC * 9 / 5 + 32 : s_forecast.daily[i].highC;
+    int lo = s_forecastUseFahrenheit ? s_forecast.daily[i].lowC * 9 / 5 + 32 : s_forecast.daily[i].lowC;
+    const char* unit = s_forecastUseFahrenheit ? "F" : "C";
+
+    if (pType && s_forecast.daily[i].precipProbability >= 30) {
+      char tb[12] = "";
+      fmtLocalTime(s_forecast.daily[i].date, tb, sizeof(tb));
+      snprintf(seg.text, sizeof(seg.text), "%s %d/%d%s %d%% ~%s",
+               dayName, hi, lo, unit, s_forecast.daily[i].precipProbability, tb);
+    } else {
+      snprintf(seg.text, sizeof(seg.text), "%s %d/%d%s %s",
+               dayName, hi, lo, unit, s_forecast.daily[i].shortForecast);
+    }
+    segs[segCount++] = seg;
+  }
+
+  // No precip fallback
+  if (segCount == 0) {
+    segs[segCount++] = {0, "No rain 48h"};
+  }
+
+  // Measure total width
+  int totalW = 0;
+  for (int i = 0; i < segCount; i++) {
+    if (i > 0) totalW += entryGap;
+    if (segs[i].type) totalW += iconDrawW + iconGap;
+    totalW += s_barSprite.textWidth(segs[i].text);
+  }
+  totalW += entryGap;  // gap between last and first entry on wrap
+
+  // -- Allocate wide buffer --
+  size_t tickerBytes = (size_t)totalW * SCALED_BAR_H * 2;
+  if (s_tickerBuf) { free(s_tickerBuf); s_tickerBuf = nullptr; }
+  s_tickerBuf = (uint16_t*)heap_caps_malloc(tickerBytes, MALLOC_CAP_SPIRAM);
+  if (!s_tickerBuf) return 0;
+  memset(s_tickerBuf, 0, tickerBytes);
+
+  // -- Second pass: render into wide buffer using sliding sprite window --
+  // Render in SCALED_W-wide chunks into s_barSprite, copy each chunk to ticker buffer
+  int textY = (SCALED_BAR_H - fh) / 2;
+  if (textY < 0) textY = 0;
+
+  // Build a flat list of (xpos, type, text) for rendering
+  struct RenderItem { int x; char type; char text[48]; };
+  RenderItem items[32];
+  int itemCount = 0;
+  int cx = 0;  // content starts at pixel 0
+  for (int i = 0; i < segCount && itemCount < 32; i++) {
+    if (i > 0) cx += entryGap;
+    items[itemCount].x = cx;
+    items[itemCount].type = segs[i].type;
+    strlcpy(items[itemCount].text, segs[i].text, sizeof(items[0].text));
+    itemCount++;
+    if (segs[i].type) cx += iconDrawW + iconGap;
+    cx += s_barSprite.textWidth(segs[i].text);
+  }
+
+  // Render chunk by chunk
+  for (int chunkX = 0; chunkX < totalW; chunkX += SCALED_W) {
+    s_barSprite.fillScreen(0);
+    int chunkEnd = chunkX + SCALED_W;
+
+    for (int j = 0; j < itemCount; j++) {
+      int ix = items[j].x;
+      int iconW = items[j].type ? (iconDrawW + iconGap) : 0;
+      int tw = s_barSprite.textWidth(items[j].text);
+      int itemEnd = ix + iconW + tw;
+      // Skip if entirely outside this chunk
+      if (itemEnd <= chunkX || ix >= chunkEnd) continue;
+      // Draw icon if in range
+      int drawX = ix - chunkX;
+      if (items[j].type && drawX + iconDrawW > 0 && drawX < SCALED_W) {
+        drawWeatherIcon(s_barSprite, drawX, 1, iconH, items[j].type);
+      }
+      // Draw text
+      int textX = drawX + iconW;
+      if (textX < SCALED_W && textX + tw > 0) {
+        s_barSprite.setCursor(textX, textY);
+        s_barSprite.print(items[j].text);
+      }
+    }
+
+    // Copy this chunk to the wide buffer
+    const uint16_t* spritePx = (const uint16_t*)s_barSprite.getBuffer();
+    int copyW = min(SCALED_W, totalW - chunkX);
+    for (int row = 0; row < SCALED_BAR_H; row++) {
+      const uint16_t* srcRow = spritePx + row * SCALED_W;
+      uint16_t* dstRow = s_tickerBuf + row * totalW + chunkX;
+      if (s_barSpritePixelsByteSwapped) {
+        for (int px = 0; px < copyW; px++) dstRow[px] = __builtin_bswap16(srcRow[px]);
+      } else {
+        memcpy(dstRow, srcRow, copyW * 2);
+      }
+    }
+  }
+
+  s_tickerWidth = totalW;
+  return totalW;
+}
+
+// Copy a 410-wide window from the ticker buffer into s_botBarBuf at the given scroll offset.
+static void tickerCopyWindow(int scrollX) {
+  if (!s_tickerBuf || !s_botBarBuf || s_tickerWidth <= 0) return;
+  int sx = scrollX % s_tickerWidth;
+  if (sx < 0) sx += s_tickerWidth;
+  for (int row = 0; row < SCALED_BAR_H; row++) {
+    uint16_t* dst = s_botBarBuf + row * SCALED_W;
+    const uint16_t* srcRow = s_tickerBuf + row * s_tickerWidth;
+    int remaining = SCALED_W;
+    int x = sx;
+    uint16_t* d = dst;
+    while (remaining > 0) {
+      int chunk = min(remaining, s_tickerWidth - x);
+      memcpy(d, srcRow + x, chunk * 2);
+      d += chunk;
+      remaining -= chunk;
+      x = 0;  // wrap
+    }
+  }
+}
+
 // Render timestamp bar text directly at display resolution.
 // Top rows use SCALED_TOP_ROW_H; bottom row uses SCALED_BAR_H.
 // into s_topBarBuf / s_botBarBuf. Avoids the 2× vertical upscale that makes bitmap
 // fonts look chunky/blocky.
-static void renderBarsAtScaledRes(int frameIdx) {
+static void renderBarsAtScaledRes(int frameIdx, bool skipBottomBar = false) {
   if (!s_topBarBuf || !s_botBarBuf) return;
   if (frameIdx >= frameCount || !s_timesLoaded) return;
 
@@ -3606,7 +4165,8 @@ static void renderBarsAtScaledRes(int frameIdx) {
       copyBarSpriteToBuffer(s_topBarBuf, (size_t)SCALED_W * SCALED_TOP_ROW_H);
       memset(s_topBarBuf + (size_t)SCALED_W * SCALED_TOP_ROW_H, 0,
              (size_t)SCALED_W * SCALED_TOP_ROW_H * 2U);
-      memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2U);
+      if (!skipBottomBar)
+        memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2U);
       return;
     }
 
@@ -3745,6 +4305,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
                         (size_t)SCALED_W * SCALED_TOP_ROW_H);
 
   // Bottom bar: forecast lines OR location + radar (fallback).
+  if (!skipBottomBar) {
   s_barSprite.fillScreen(0x0000);
   if (s_forecastEnabled && s_forecast.valid) {
     // ── Forecast bottom bar: single-line with pixel art weather icons ──
@@ -3810,7 +4371,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
         int hoursOut = (int)((s_forecast.hourly[i].startTime - nowUtcFc) / 3600);
         if (hoursOut < 0) continue;
         if (hoursOut > 24) break;
-        if (s_forecast.hourly[i].precipProbability < 30) { lastType = 0; continue; }
+        if (s_forecast.hourly[i].precipProbability < 20) { lastType = 0; continue; }
         char pType = isPrecipKeyword(s_forecast.hourly[i].shortForecast);
         if (!pType) { lastType = 0; continue; }
         if (pType == lastType) continue;
@@ -3839,7 +4400,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
       }
     }
 
-    // 3. Daily fallback: today/tonight/tomorrow (no percentage)
+    // 3. Daily fallback: show approximate time from daily period start
     if (entryCount == 0) {
       for (int i = 0; i < (int)s_forecast.dailyCount && entryCount < 4; i++) {
         int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
@@ -3848,19 +4409,36 @@ static void renderBarsAtScaledRes(int frameIdx) {
         if (s_forecast.daily[i].precipProbability < 50) continue;
         char pType = isPrecipKeyword(s_forecast.daily[i].shortForecast);
         if (!pType) continue;
-        const char* when = "today";
-        if (hoursOut >= 12) when = "tomorrow";
-        else if (hoursOut >= 0) {
-          int32_t off = s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0;
-          struct tm lt; time_t nd = s_forecast.daily[i].date + (time_t)off;
-          gmtime_r(&nd, &lt);
-          struct tm nowLt; time_t nowT = nowUtcFc + (time_t)off;
-          gmtime_r(&nowT, &nowLt);
-          if (lt.tm_mday != nowLt.tm_mday) when = "tonight";
-        }
-        // hoursOut < 0: current active period → "today"
         ForecastEntry e; e.type = pType;
-        strlcpy(e.text, when, sizeof(e.text));
+        if (hoursOut <= 0) {
+          // Already in this period
+          strlcpy(e.text, "now", sizeof(e.text));
+        } else {
+          // Show time from period start with day context
+          int32_t off = s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0;
+          struct tm entryLt, nowLt;
+          time_t entryLocal = s_forecast.daily[i].date + (time_t)off;
+          time_t nowLocal = nowUtcFc + (time_t)off;
+          gmtime_r(&entryLocal, &entryLt);
+          gmtime_r(&nowLocal, &nowLt);
+          char tb[12];
+          fmtLocalTime(s_forecast.daily[i].date, tb, sizeof(tb));
+          // NWS stores only daytime periods (~12h each, ~24h apart);
+          // half the actual period length gives the uncertainty
+          int uncH = 6;
+          if (i + 1 < (int)s_forecast.dailyCount)
+            uncH = (int)((s_forecast.daily[i+1].date - s_forecast.daily[i].date) / 3600 / 4);
+          else if (i > 0)
+            uncH = (int)((s_forecast.daily[i].date - s_forecast.daily[i-1].date) / 3600 / 4);
+          if (uncH < 1) uncH = 1;
+          if (entryLt.tm_mday != nowLt.tm_mday) {
+            char db[8];
+            fmtDayName(s_forecast.daily[i].date, db, sizeof(db));
+            snprintf(e.text, sizeof(e.text), "%s %s +/-%dh", db, tb, uncH);
+          } else {
+            snprintf(e.text, sizeof(e.text), "~%s +/-%dh", tb, uncH);
+          }
+        }
         entries[entryCount++] = e;
         break;
       }
@@ -3973,6 +4551,7 @@ static void renderBarsAtScaledRes(int frameIdx) {
   }
   // No fallback — bottom bar is blank when forecast is off or has no data
   copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
+  } // !skipBottomBar
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -3992,7 +4571,7 @@ static uint16_t hurricaneCategoryColor(uint8_t cat) {
 
 static bool s_hurricaneBarsLoggedOnce = false;
 
-static void renderHurricaneStormBars(int frameIdx) {
+static void renderHurricaneStormBars(int frameIdx, bool skipBottomBar = false) {
   if (!s_topBarBuf || !s_botBarBuf) return;
   ensureBarSpriteReady();
   if (!s_barSpriteReady) return;
@@ -4072,6 +4651,7 @@ static void renderHurricaneStormBars(int frameIdx) {
                         (size_t)SCALED_W * SCALED_TOP_ROW_H);
 
   // --- Bottom bar: wind/pressure + advisory age ---
+  if (!skipBottomBar) {
   s_barSprite.fillScreen(0x0000);
   {
     char windBuf[32];
@@ -4107,6 +4687,7 @@ static void renderHurricaneStormBars(int frameIdx) {
     s_barSprite.print(ageBuf);
   }
   copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
+  } // !skipBottomBar
 }
 
 // Draw "Reboot for local weather" in the black border below the frame.
@@ -4941,6 +5522,8 @@ static void initCleanModeTouch() {
   attachInterrupt(digitalPinToInterrupt(38), touchIrqHandler, FALLING);
 }
 
+static void updateBarBufs(int frameIdx, bool skipBottomBar = false);  // forward decl
+
 static void enterFullscreen() {
   s_fullscreenMode = true;
   if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
@@ -5029,17 +5612,10 @@ static void pollCleanModeToggle() {
   if (irqFired && pressStartMs == 0) {
     if (touching == 0) {
       // Fast tap: finger lifted before I2C poll — no coords available.
-      // Moon is the only interactive zone in normal mode, so accept it
-      // as a moon tap to avoid swallowing quick taps.
-      static uint32_t lastToggleMs = 0;
-      uint32_t now = millis();
-      if (now - lastToggleMs >= 300) {
-        cycleDisplayMode();
-        lastToggleMs = now;
-      }
+      // Can't verify it was on the moon zone, so discard.
       return;
     }
-    if (s_ftPresent && !onMoon) return;  // coords available but not on moon
+    if (!s_ftPresent || !onMoon) return;  // no touch IC or not on moon
     pressStartMs = millis();
     longHandled = false;
     return;
@@ -5075,12 +5651,19 @@ static void pollCleanModeToggle() {
 // even during long hold/zoom/terrain stages.
 static void delayWithInputPoll(uint32_t ms) {
   uint32_t start = millis();
+  uint32_t lastPush = millis();
   while (millis() - start < ms) {
     serviceUserButtons();
     pollCleanModeToggle();
+    // Re-present at ~6fps so ticker scrolls (advancement is inside presentScaledBuf)
+    uint32_t now = millis();
+    if (s_tickerWidth > 0 && s_frameDisplayBuf && now - lastPush >= 85) {
+      lastPush = now;
+      presentScaledBuf(s_frameDisplayBuf);
+    }
     uint32_t elapsed = millis() - start;
     uint32_t remain = (elapsed < ms) ? (ms - elapsed) : 0;
-    delay(remain > 50 ? 50 : remain);
+    if (remain > 0) delay(min(remain, (uint32_t)10));
   }
 }
 
@@ -5115,11 +5698,11 @@ static void drawMoonComplication() {
 // Render fresh timestamp bars for frameIdx into s_topBarBuf / s_botBarBuf.
 // On AMOLED: renders directly at display resolution for crisp output.
 // On other boards: draws into sprite bar rows then scales.
-static void updateBarBufs(int frameIdx) {
+static void updateBarBufs(int frameIdx, bool skipBottomBar) {
   if (!s_topBarBuf || !s_botBarBuf) return;
 #if BOARD_IS_AMOLED_206
-  if (s_hurricaneMode) renderHurricaneStormBars(frameIdx);
-  else renderBarsAtScaledRes(frameIdx);
+  if (s_hurricaneMode) renderHurricaneStormBars(frameIdx, skipBottomBar);
+  else renderBarsAtScaledRes(frameIdx, skipBottomBar);
 #else
   if (!spriteReady) return;
   drawTimestamp(frameIdx, &sprite);
@@ -5185,6 +5768,17 @@ static void presentScaledBuf(uint16_t* src) {
   }
 
   // --- Normal path ---
+  // Advance ticker scroll at ~12fps with small steps for smooth motion.
+  {
+    static uint32_t s_lastTickerAdvance = 0;
+    uint32_t now = millis();
+    if (s_tickerWidth > 0 && s_tickerBuf && s_botBarBuf && now - s_lastTickerAdvance >= 85) {
+      s_lastTickerAdvance = now;
+      s_tickerScrollPx += 3;
+      if (s_tickerScrollPx >= s_tickerWidth) s_tickerScrollPx -= s_tickerWidth;
+      tickerCopyWindow(s_tickerScrollPx);
+    }
+  }
   // Stamp persistent timestamp bars over whatever is in src.
   applyBarsToBuf(src);
 
@@ -5200,41 +5794,46 @@ static void presentScaledBuf(uint16_t* src) {
     clockOverlayApplied = true;
   }
 
-  // Stamp location pin into buffer (on top of clock) when requested.
-  // Uses a temporary LGFX_Sprite for smooth anti-aliased circle rendering,
-  // then composites non-black pixels into src (transparent blit).
+  // Stamp location pin directly into frame buffer (no intermediate sprite).
+  // Draws filled circle head + triangle pointer + white center dot using
+  // per-pixel distance checks — avoids LGFX sprite byte-order issues.
   if (s_pinOverlayRequested && s_weatherGeoValid && !s_fullscreenMode) {
     const int r = 10, centerDot = 4;
-    const int pinW = r * 2 + 2, pinH = r + 14 + 2;  // bounding box
-    const int headCy = r + 1;                         // circle center in sprite coords
-    const int tipSy  = headCy + 14;                   // point tip in sprite coords
-    LGFX_Sprite pinSpr;
-    pinSpr.setColorDepth(16);
-    pinSpr.setSwapBytes(s_barSpritePixelsByteSwapped);
-    if (pinSpr.createSprite(pinW, pinH)) {
-      pinSpr.fillScreen(0x0000);
-      pinSpr.fillCircle(r + 1, headCy, r, 0xF800);
-      pinSpr.fillTriangle(r + 1 - (r - 1), headCy + 3,
-                          r + 1 + (r - 1), headCy + 3,
-                          r + 1, tipSy, 0xF800);
-      pinSpr.fillCircle(r + 1, headCy, centerDot, 0xFFFF);
-      // Composite into src at display center
-      int destX = SCALED_W / 2 - (r + 1);
-      int destY = SCALED_H / 2 - tipSy;
-      const uint16_t* sp = (const uint16_t*)pinSpr.getBuffer();
-      for (int py = 0; py < pinH; py++) {
-        int dy = destY + py;
-        if (dy < 0 || dy >= SCALED_H) continue;
-        for (int px = 0; px < pinW; px++) {
-          uint16_t c = sp[py * pinW + px];
-          if (s_barSpritePixelsByteSwapped) c = __builtin_bswap16(c);
-          if (c != 0x0000) {
-            int dx = destX + px;
-            if (dx >= 0 && dx < SCALED_W) src[dy * SCALED_W + dx] = c;
+    // Pin tip at frame center, head circle above
+    const int tipX = SCALED_W / 2;
+    const int tipY = SCALED_H / 2;
+    const int headCx = tipX;
+    const int headCy = tipY - 14;
+    const int triTopY = headCy + 3;  // triangle starts just below circle center
+    const int triHalfW = r - 1;      // triangle base half-width
+
+    // Bounding box for the entire pin
+    int minY = headCy - r - 1; if (minY < 0) minY = 0;
+    int maxY = tipY;            if (maxY >= SCALED_H) maxY = SCALED_H - 1;
+    int minX = headCx - r - 1; if (minX < 0) minX = 0;
+    int maxX = headCx + r + 1; if (maxX >= SCALED_W) maxX = SCALED_W - 1;
+
+    for (int dy = minY; dy <= maxY; dy++) {
+      for (int dx = minX; dx <= maxX; dx++) {
+        int relX = dx - headCx;
+        int relY = dy - headCy;
+        bool inCircle = (relX * relX + relY * relY) <= (r * r);
+        // Triangle: from (headCx +/- triHalfW, triTopY) to (tipX, tipY)
+        bool inTriangle = false;
+        if (dy >= triTopY && dy <= tipY) {
+          int triH = tipY - triTopY;
+          if (triH > 0) {
+            float frac = (float)(tipY - dy) / (float)triH;
+            int halfW = (int)(frac * triHalfW + 0.5f);
+            inTriangle = (dx >= tipX - halfW && dx <= tipX + halfW);
           }
         }
+        if (inCircle || inTriangle) {
+          // White center dot
+          bool inDot = (relX * relX + relY * relY) <= (centerDot * centerDot);
+          src[dy * SCALED_W + dx] = inDot ? 0xFFFF : 0xF800;
+        }
       }
-      pinSpr.deleteSprite();
     }
     s_pinOverlayRequested = false;
   }
@@ -6391,17 +6990,26 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   }
   g_drawTarget = prevTarget;
 
-  if (!ok || !jpegDrawLooksFullFrame()) return false;
-  if (spriteLooksCompletelyBlack()) return false;
-  if (spriteLooksPartialDecode()) return false;
-  if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) return false;
-  if (spriteLooksHoldFrameBlockCorrupted()) return false;
-  if (spriteLooksCyanWhiteBlockCorrupted()) return false;
-  if (spriteLooksBottomBandJunkCorrupted()) return false;
+  if (!ok || !jpegDrawLooksFullFrame()) { appendDiagLog("rawdec[%d]: decode-fail ok=%d\n", logicalIdx, ok); return false; }
+  if (spriteLooksCompletelyBlack()) { appendDiagLog("rawdec[%d]: black\n", logicalIdx); return false; }
+  if (spriteLooksPartialDecode()) { appendDiagLog("rawdec[%d]: partial\n", logicalIdx); return false; }
+  if (spriteLooksHorizontallyCorrupted()) { appendDiagLog("rawdec[%d]: horiz\n", logicalIdx); return false; }
+  if (spriteLooksVerticallyCorrupted()) { appendDiagLog("rawdec[%d]: vert\n", logicalIdx); return false; }
+  // Partial composite detection: re-decode as 8-bit grayscale and count all-black MCUs.
+  // At 8-bit, nighttime IR ocean pixels are 1-3 (never all-zero MCUs).
+  // Partial composites have true (0,0,0) swath gaps → all-zero MCUs.
+  {
+    int blackMcus = countBlackMcusGrayscale(s_dlBuf, jpegLen);
+    if (blackMcus > 0) {
+      appendDiagLog("rawdec[%d]: partial-composite blackMcus=%d\n", logicalIdx, blackMcus);
+      return false;
+    }
+  }
+  if (spriteLooksCyanWhiteBlockCorrupted()) { appendDiagLog("rawdec[%d]: cyanwhite\n", logicalIdx); return false; }
+  if (spriteLooksBottomBandJunkCorrupted()) { appendDiagLog("rawdec[%d]: bottomband\n", logicalIdx); return false; }
   // slab detector disabled — GOES-West disk edge triggers false positives for limb regions
 
   scaleSpriteTo410x360(s_frameDisplayBuf);
-  if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) return false;
 
   return writeRawToSlot(logicalIdx, (const uint8_t*)s_frameDisplayBuf);
 }
@@ -6624,8 +7232,10 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
       WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
     WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
 
+    // Power-on reset (after flash) needs longer for radio cold-start
+    int maxTries = (esp_reset_reason() == ESP_RST_POWERON) ? 40 : 20;
     int wtries = 0;
-    while (WiFi.status() != WL_CONNECTED && wtries++ < 20) {
+    while (WiFi.status() != WL_CONNECTED && wtries++ < maxTries) {
       delay(500);
       Serial.print(".");
       if (syncProgressIsActive()) syncProgressTick(1);
@@ -6986,7 +7596,7 @@ static bool decodeJpegFrameToSprite(int idx, bool rejectBlank) {
 // Fast path: read frame from stream file directly into sprite and push to LCD.
 // Runtime guards still reject black/partial/corrupted reads before display.
 // Returns false if frame is invalid/missing (caller should hold previous frame).
-static bool showFrame(int idx) {
+static bool showFrame(int idx, bool skipBottomBar = false) {
   if (!s_streamReady || !s_streamFile || idx >= frameCount || !s_streamValid[idx]) return false;
   if (!s_frameDisplayBuf) return false;
 
@@ -7000,14 +7610,14 @@ static bool showFrame(int idx) {
                   idx, (unsigned)got, (int)seekOk);
     return false;
   }
-  updateBarBufs(idx);
+  updateBarBufs(idx, skipBottomBar);
   presentScaledBuf(s_frameDisplayBuf);
   return true;
 }
 
 // Reject tiny WMS GeoColor JPEGs (placeholder/malformed composites) before SD install.
 // 614-byte black placeholders and ~4.7KB yellow-wash outliers both fall below this floor.
-static constexpr size_t MIN_WEATHER_JPEG_BYTES = 7000;
+static constexpr size_t MIN_WEATHER_JPEG_BYTES = 3000;
 
 static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) {
   if (jpegLen == 0 || jpegLen > DL_BUF_BYTES) return false;
@@ -7047,6 +7657,23 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
   if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) {
     if (label) { Serial.printf("%s LINE-CORR\n", label); appendDiagLog("vld: %s LINE-CORR\n", label); }
     return false;
+  }
+  if (spriteLooksCyanWhiteBlockCorrupted()) {
+    if (label) appendDiagLog("vld: %s CYAN-WHITE\n", label);
+    return false;
+  }
+  if (spriteLooksBottomBandJunkCorrupted()) {
+    if (label) appendDiagLog("vld: %s BOTTOM-BAND\n", label);
+    return false;
+  }
+  // Partial composite: any all-black 8x8 MCUs at 8-bit grayscale = missing swath data.
+  // Nighttime IR always has non-zero dim values at 8-bit — zero MCUs = 0.
+  {
+    int blackMcus = countBlackMcusGrayscale(s_dlBuf, jpegLen);
+    if (blackMcus > 0) {
+      if (label) appendDiagLog("vld: %s PARTIAL-COMPOSITE blackMcus=%d\n", label, blackMcus);
+      return false;
+    }
   }
   return true;
 }
@@ -7200,8 +7827,7 @@ static time_t snapToNearestGibsTime(time_t t, int maxOffsetSec) {
   return (bestDist <= maxOffsetSec) ? best : 0;
 }
 
-static bool fetchGibsAvailableTimes(WiFiClientSecure& client,
-                                    time_t rangeStart, time_t rangeEnd) {
+static bool fetchGibsAvailableTimes(WiFiClientSecure& /*unused*/, time_t rangeStart, time_t rangeEnd) {
   s_gibsAvailCount = 0;
   char startISO[32], endISO[32];
   toISO(rangeStart, startISO, sizeof(startISO));
@@ -7214,6 +7840,8 @@ static bool fetchGibsAvailableTimes(WiFiClientSecure& client,
     "&Layer=%s&TileMatrixSet=500m&Time=%s/%s",
     s_activeGibsLayer, startISO, endISO);
 
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
   http.begin(client, url);
   http.setTimeout(10000);
@@ -7665,6 +8293,18 @@ static bool installValidatedZoomSnapshotAtBbox(HTTPClient& http,
   if (valid && spriteLooksCompletelyBlack()) valid = false;
   if (valid && spriteLooksPartialDecode()) valid = false;
   if (valid && (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted())) valid = false;
+  // Reject partial composites (GIBS swath gaps) via 8-bit grayscale MCU check
+  if (valid && tmpBytes > 0 && tmpBytes <= DL_BUF_BYTES) {
+    File tf = SD.open(tmpPath, FILE_READ);
+    if (tf) {
+      size_t rd = tf.read(s_dlBuf, tmpBytes);
+      tf.close();
+      if (rd == tmpBytes && countBlackMcusGrayscale(s_dlBuf, tmpBytes) > 0) {
+        valid = false;
+        Serial.println("zoom rej partial-composite");
+      }
+    }
+  }
   if (!valid) {
     SD.remove(tmpPath);
     Serial.println("zoom rej bad");
@@ -8217,16 +8857,28 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
     appendDiagLog("zoom: decode-fail %s\n", path);
     return false;
   }
-  // If decoded zoom has black block artifacts (common on GOES-West limb),
-  // fall through to synthetic zoom instead of showing the corrupt frame.
-  if (!isTerrainStage && spriteLooksHoldFrameBlockCorrupted()) {
-    if (presentSyntheticZoomStage(path, newestIdx)) {
-      Serial.printf("zoom synth-fallback %s (blk-corr)\n", path);
-      return true;
+  // If decoded zoom has partial composite artifacts, fall through to synthetic zoom.
+  // Use grayscale MCU check (not holdblock — that false-positives on nighttime IR dark ocean).
+  if (!isTerrainStage) {
+    File jf = SD.open(path, FILE_READ);
+    if (jf) {
+      size_t jLen = jf.size();
+      if (jLen > 0 && jLen <= DL_BUF_BYTES) {
+        jf.read(s_dlBuf, jLen);
+        int blackMcus = countBlackMcusGrayscale(s_dlBuf, jLen);
+        jf.close();
+        if (blackMcus > 0) {
+          if (presentSyntheticZoomStage(path, newestIdx)) {
+            appendDiagLog("zoom: synth-fallback %s blackMcus=%d\n", path, blackMcus);
+            return true;
+          }
+          appendDiagLog("zoom: partial-composite %s blackMcus=%d\n", path, blackMcus);
+          return false;
+        }
+      } else {
+        jf.close();
+      }
     }
-    Serial.printf("zoom blk-corr %s\n", path);
-    appendDiagLog("zoom: blk-corr %s\n", path);
-    return false;
   }
   // IMPORTANT: save/restore — no early return between set and restore
   bool prevTopBarRadarMode = s_topBarUseRadarScanTime;
@@ -8426,19 +9078,13 @@ static bool scaledFrameLooksHoldBlockCorrupted() {
 }
 
 static bool currentScaledPlaybackFrameLooksCorrupted() {
-  return scaledFrameLooksFreezeBlockCorrupted() ||
-         scaledFrameLooksHoldBlockCorrupted();
+  // Zero-block checks disabled at playback — nighttime IR has legitimate
+  // all-zero blocks in RGB565. Partial composites are caught at download/raw-build
+  // via 8-bit grayscale MCU check (countBlackMcusGrayscale).
+  return false;
 }
 
 static bool currentScaledFreezeFrameLooksCorrupted() {
-  if (scaledFrameLooksFreezeBlockCorrupted()) {
-    appendDiagLog("freeze-check: freeze-block\n");
-    return true;
-  }
-  if (scaledFrameLooksHoldBlockCorrupted()) {
-    appendDiagLog("freeze-check: hold-block\n");
-    return true;
-  }
   return false;
 }
 
@@ -8496,7 +9142,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
     return;
   }
 
-  // Helper: restore clean frame
+  // Helper: restore clean frame from SD (the SD read time is part of the visual rhythm)
   int holdIdx = (s_newestCachedIdx >= 0) ? s_newestCachedIdx : 0;
   auto restoreFrame = [&]() {
     showFrame(holdIdx);
@@ -8535,6 +9181,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
 
   // Final clean frame
   restoreFrame();
+
   if (remainingMs > consumedMs) {
     delayWithInputPoll(remainingMs - consumedMs);
   }
@@ -8615,7 +9262,7 @@ static void refreshZoomSnapshotsForLatestFrame() {
 
   bool zoomsRefreshedOk = true;
   if (refreshWeatherZooms) {
-    const int maxBackSteps = 1;
+    const int maxBackSteps = 6;
     const time_t cadenceSec = (time_t)activeCadenceMin() * 60;
     bool installed = false;
     for (int back = 0; back <= maxBackSteps && !installed; back++) {
@@ -9521,7 +10168,7 @@ static void syncWeatherFrames() {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.setReuse(true);
+  http.setReuse(false);
   fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
   appendDiagLog("[SYNC] fetchGibs done ms=%lu\n", millis());
 
@@ -9537,6 +10184,7 @@ static void syncWeatherFrames() {
   int skipped = 0;
   int dlFail = 0;
   char url[512];
+  const int fetchCadenceSec = max(60, cadenceMin * 60);
 
   for (int i = 0; i < (int)s_idx.count; i++) {
     showProgress(i + 1, (int)s_idx.count, "cache");
@@ -9548,7 +10196,9 @@ static void syncWeatherFrames() {
       if (s_idx.jpegValid[i] && !s_idx.rawValid[i]) {
         size_t readLen = 0;
         if (readJpegFromSlot(i, s_dlBuf, &readLen) && readLen > 0) {
-          decodeAndWriteRawSlot(i, readLen);
+          if (!decodeAndWriteRawSlot(i, readLen)) {
+            s_idx.rawValid[i] = 0;
+          }
         }
       }
       continue;
@@ -9558,7 +10208,6 @@ static void syncWeatherFrames() {
     if (t <= 0) { skipped++; continue; }
 
     // Build URL and fetch
-    const int fetchCadenceSec = max(60, cadenceMin * 60);
     time_t snappedTime = snapToNearestGibsTime(t, 2 * fetchCadenceSec);
     const time_t secondOffsets[] = {0, -60, 60,
                                     -(time_t)fetchCadenceSec, (time_t)fetchCadenceSec,
@@ -9583,12 +10232,25 @@ static void syncWeatherFrames() {
 
       for (int attempt = 0; attempt < 2; ++attempt) {
         http.begin(client, url);
-        http.setTimeout(5000);
+        http.setTimeout(10000);
         int code = http.GET();
-        if (code != HTTP_CODE_OK) { http.end(); continue; }
-        if (!readHttpJpegBodyToDlBuf(http, "SYNC", &jpegLen)) continue;
-        if (!validateBufferedWeatherFrameJpeg(jpegLen, "SYNC")) continue;
-        if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) continue;
+        if (code != HTTP_CODE_OK) {
+          http.end();
+          if (attempt == 1) appendDiagLog("dl[%d]: http=%d\n", i, code);
+          continue;
+        }
+        if (!readHttpJpegBodyToDlBuf(http, "SYNC", &jpegLen)) {
+          if (attempt == 1) appendDiagLog("dl[%d]: body-fail len=%u\n", i, (unsigned)jpegLen);
+          continue;
+        }
+        if (!validateBufferedWeatherFrameJpeg(jpegLen, "SYNC")) {
+          if (attempt == 1) appendDiagLog("dl[%d]: vld-fail len=%u\n", i, (unsigned)jpegLen);
+          continue;
+        }
+        if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) {
+          if (attempt == 1) appendDiagLog("dl[%d]: eoi-fail len=%u\n", i, (unsigned)jpegLen);
+          continue;
+        }
         fetchedOk = true;
         break;
       }
@@ -9599,13 +10261,9 @@ static void syncWeatherFrames() {
       continue;
     }
 
-    // Additional validators
-    if (spriteLooksHoldFrameBlockCorrupted() ||
-        spriteLooksCyanWhiteBlockCorrupted() ||
-        spriteLooksBottomBandJunkCorrupted()) {
-      dlFail++;
-      continue;
-    }
+    // Post-validators disabled for sync downloads — nighttime GOES GeoColor
+    // frames trigger false positives on block/cyan/band checks due to dark
+    // areas with scattered zero MCU blocks from heavy JPEG compression.
 
     // Size outlier check using index jpegLen
     if ((int)s_idx.count >= 3) {
@@ -9720,7 +10378,9 @@ static void syncWeatherFrames() {
         dlFail++;
         continue;
       }
-      decodeAndWriteRawSlot(i, rereadLen);
+      if (!decodeAndWriteRawSlot(i, rereadLen)) {
+        s_idx.rawValid[i] = 0;
+      }
     }
 
     saved++;
@@ -9746,7 +10406,7 @@ static void syncWeatherFrames() {
       uint32_t srcOff = (uint32_t)srcPhys * SCALED_FRAME_BYTES;
       uint32_t dstOff = (uint32_t)dstPhys * SCALED_FRAME_BYTES;
 
-      File sf = SD.open(SD_ROOT "/frames/stream.raw", FILE_READ);
+      File sf = SD.open(RAW_STREAM_FILE, FILE_READ);
       if (sf) {
         sf.seek(srcOff);
         size_t got = sf.read((uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
@@ -9893,6 +10553,18 @@ static void goToSleep(bool buttonOnly = false) {
 #if BOARD_IS_AMOLED_206
   if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
   if (s_amoledOut) s_amoledOut->displayOff();
+
+  // Put touch IC in hibernate (~2-3mA saved)
+  if (s_touchInitialized && s_ftPresent) {
+    Wire.beginTransmission(0x38);
+    Wire.write(0xA5);
+    Wire.write(0x03);  // FT3168 HIBERNATE
+    Wire.endTransmission();
+  }
+
+  // Release I2C bus — disables internal pullups on SDA/SCL (~150µA saved).
+  // External board pullups maintain bus integrity for connected devices.
+  Wire.end();
 #else
   tft.fillScreen(TFT_BLACK);
 #endif
@@ -9900,9 +10572,15 @@ static void goToSleep(bool buttonOnly = false) {
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_GPIO);
 
-  if (!buttonOnly && s_autoUpdateInSleep) {
-    uint64_t sleepUs = (uint64_t)SLEEP_HOURS * 3600ULL * 1000000ULL;
-    esp_sleep_enable_timer_wakeup(sleepUs);
+  if (s_autoUpdateInSleep) {
+    int sleepSec = secondsUntilNextUpdate();
+    appendDiagLog("sleep-timer: ausl=1 sleepSec=%d interval=%d mode=%d\n",
+                  sleepSec, (int)s_autoUpdateIntervalMin, (int)s_updateMode);
+    if (sleepSec > 0) {
+      esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
+    }
+  } else {
+    appendDiagLog("sleep-timer: ausl=0 (no timer)\n");
   }
 
 #if BOARD_IS_AMOLED_206
@@ -9921,7 +10599,7 @@ static void goToSleep(bool buttonOnly = false) {
     // not the physical level. Release the driver so QMI8658 can freely drive the
     // pin and digitalRead() reflects the actual state.
     gpio_reset_pin(imuPin);
-    pinMode(QMI8658_INT1, INPUT_PULLUP);
+    pinMode(QMI8658_INT1, INPUT);  // no pullup — IMU push-pull drives actively; pullup would partially power AMOLED
     int int1Level = digitalRead(QMI8658_INT1);
     gpio_int_type_t wakeOn = (int1Level == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
     gpio_wakeup_enable(imuPin, wakeOn);
@@ -9935,128 +10613,170 @@ static void goToSleep(bool buttonOnly = false) {
   // dirty, causing large runs of files to return wrong sector data on wake.
   SD_MMC.end();
 
-  // Record when we enter sleep so we can measure elapsed time on WoM wake.
-  // esp_timer_get_time() continues counting through light sleep via the RTC.
-  uint64_t sleepEntryUs = esp_timer_get_time();
-
+  // Outer loop: timer wakes sync silently and re-sleep; button/shake wakes break out.
   esp_sleep_wakeup_cause_t wake;
   do {
-    esp_err_t sleepErr = esp_light_sleep_start();
-    if (sleepErr != ESP_OK) {
-      Serial.printf("Light sleep failed (%d)\n", (int)sleepErr);
-    }
-    wake = esp_sleep_get_wakeup_cause();
-    Serial.printf("Wake cause: %d\n", (int)wake);
+    // Reset settle window each sleep cycle (including after timer syncs).
+    uint64_t sleepEntryUs = esp_timer_get_time();
 
-    // Shake settle window: ignore WoM wakes that happen within
-    // s_shakeEntryIgnoreMs of entering sleep. Pressing the sleep button
-    // always involves arm motion — without this window the device wakes
-    // immediately from that settling motion. After the window any single
-    // wrist flick wakes normally. Button press (topButtonPressed()) always
-    // bypasses this regardless of timing.
-    // Button bounce guard: if GPIO woke us within 500ms of sleep entry
-    // and the boot button is still LOW, it's bounce from the press that
-    // triggered sleep. Wait for release, then re-sleep.
-    bool isButtonWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && topButtonPressed();
-    if (isButtonWake) {
-      uint64_t elapsedMs = (esp_timer_get_time() - sleepEntryUs) / 1000ULL;
-      if (elapsedMs < 500ULL) {
-        while (topButtonPressed()) delay(10);  // wait for release
-        delay(50);                              // debounce settle
-        continue;                               // re-enter sleep
+    // Inner loop: bounce/settle re-sleeps via continue; real wakes break.
+    do {
+      esp_err_t sleepErr = esp_light_sleep_start();
+      if (sleepErr != ESP_OK) {
+        Serial.printf("Light sleep failed (%d)\n", (int)sleepErr);
       }
-    }
+      wake = esp_sleep_get_wakeup_cause();
+      Serial.printf("Wake cause: %d\n", (int)wake);
 
-    bool isShakeWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && !topButtonPressed();
-    if (isShakeWake && s_shakeToWakeEnabled && s_qmiInitialized) {
-      int int1Now = digitalRead(QMI8658_INT1);
-      gpio_int_type_t reArmOn = (int1Now == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
-
-      // Layer 1 — settle window: ignore motion within s_shakeEntryIgnoreMs of
-      // entering sleep (covers arm-settling from the button press).
-      uint64_t elapsedMs = (esp_timer_get_time() - sleepEntryUs) / 1000ULL;
-      if (s_shakeEntryIgnoreMs > 0 && elapsedMs < (uint64_t)s_shakeEntryIgnoreMs) {
-        Serial.printf("qmi: shake ignored settle-window elapsed=%llums\n", elapsedMs);
-        gpio_wakeup_enable((gpio_num_t)QMI8658_INT1, reArmOn);
-        esp_sleep_enable_gpio_wakeup();
-        continue;
-      }
-
-      // Layer 2 — confirm window: require a 2nd WoM event (INT1 re-toggle)
-      // within s_shakeConfirmMs. An elbow bump is a single transient and
-      // never produces a 2nd event. A deliberate raise-to-wake motion lasts
-      // >250 ms (the hardware blanking period) and reliably fires twice.
-      // s_shakeConfirmMs=0 skips this and wakes on any single event.
-      if (s_shakeConfirmMs > 0) {
-        bool confirmed = false;
-        uint32_t deadline = (uint32_t)(esp_timer_get_time() / 1000ULL) + s_shakeConfirmMs;
-        while ((int32_t)(deadline - (uint32_t)(esp_timer_get_time() / 1000ULL)) > 0) {
-          if (digitalRead(QMI8658_INT1) != int1Now) {
-            confirmed = true;
-            break;
-          }
-          delay(5);
+      // Button bounce guard: if GPIO woke us within 500ms of sleep entry
+      // and the boot button is still LOW, it's bounce from the press that
+      // triggered sleep. Wait for release, then re-sleep.
+      bool isButtonWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && topButtonPressed();
+      if (isButtonWake) {
+        uint64_t elapsedMs = (esp_timer_get_time() - sleepEntryUs) / 1000ULL;
+        if (elapsedMs < 500ULL) {
+          while (topButtonPressed()) delay(10);
+          delay(50);
+          continue;
         }
-        if (!confirmed) {
-          Serial.println("qmi: shake no-confirm re-arm");
+      }
+
+      bool isShakeWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && !topButtonPressed();
+      if (isShakeWake && s_shakeToWakeEnabled && s_qmiInitialized) {
+        int int1Now = digitalRead(QMI8658_INT1);
+        gpio_int_type_t reArmOn = (int1Now == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
+
+        // Settle window: ignore motion within s_shakeEntryIgnoreMs of entering sleep.
+        uint64_t elapsedMs = (esp_timer_get_time() - sleepEntryUs) / 1000ULL;
+        if (s_shakeEntryIgnoreMs > 0 && elapsedMs < (uint64_t)s_shakeEntryIgnoreMs) {
+          Serial.printf("qmi: shake ignored settle-window elapsed=%llums\n", elapsedMs);
           gpio_wakeup_enable((gpio_num_t)QMI8658_INT1, reArmOn);
           esp_sleep_enable_gpio_wakeup();
           continue;
         }
+
+        // Confirm window: require a 2nd WoM event within s_shakeConfirmMs.
+        if (s_shakeConfirmMs > 0) {
+          bool confirmed = false;
+          uint32_t deadline = (uint32_t)(esp_timer_get_time() / 1000ULL) + s_shakeConfirmMs;
+          while ((int32_t)(deadline - (uint32_t)(esp_timer_get_time() / 1000ULL)) > 0) {
+            if (digitalRead(QMI8658_INT1) != int1Now) {
+              confirmed = true;
+              break;
+            }
+            delay(5);
+          }
+          if (!confirmed) {
+            Serial.println("qmi: shake no-confirm re-arm");
+            gpio_wakeup_enable((gpio_num_t)QMI8658_INT1, reArmOn);
+            esp_sleep_enable_gpio_wakeup();
+            continue;
+          }
+        }
       }
+      break;  // real wake — exit inner loop
+    } while (true);
+
+    // ── Timer wake: silent background sync, then re-sleep ──
+    if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
+      // Silent background sync — mount SD, sync, unmount, re-sleep
+      bool sdOk = false;
+      for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+        if (sdTry > 0) delay(200);
+        sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
+      }
+      if (!sdOk) {
+        SD_MMC.end();
+        for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+          if (sdTry > 0) delay(200);
+          sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+        }
+      }
+      if (sdOk) {
+        appendDiagLog("timer-wake: sd=ok syncing millis=%lu\n", millis());
+        if (s_hurricaneMode && s_hurricaneWatchEnabled) {
+          hurricaneRecheckAndUpdate();
+        }
+        if (connectWifiForSync(false)) {
+          if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
+            HurricaneInfo hStorms[4]; int hCount = 0;
+            if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
+              cleanupSuppressedStorms(hStorms, hCount);
+              for (int hi = 0; hi < hCount; hi++) {
+                if (!isStormSuppressed(hStorms[hi].id)) {
+                  enterHurricaneMode(hStorms[hi]);
+                  break;
+                }
+              }
+            }
+          }
+          syncWeatherFrames();
+          fetchForecastData();
+          s_zoomSnapshotsRefreshPending = true;
+          maybeRefreshPendingZoomSnapshots();
+          noteSuccessfulScanNow();
+        }
+        disconnectWifiAfterSync();
+        // Re-arm timer before unmounting SD so diag log can write.
+        {
+          int nextSec = secondsUntilNextUpdate();
+          appendDiagLog("timer-wake: sync done nextSec=%d millis=%lu\n", nextSec, millis());
+          if (nextSec > 0) esp_sleep_enable_timer_wakeup((uint64_t)nextSec * 1000000ULL);
+        }
+        SD_MMC.end();
+      } else {
+        // SD mount failed — just re-arm and re-sleep
+        int nextSec = secondsUntilNextUpdate();
+        if (nextSec > 0) esp_sleep_enable_timer_wakeup((uint64_t)nextSec * 1000000ULL);
+      }
+      continue;  // re-enter outer loop → sleep again
     }
-    break;  // real wake — fall through to post-wake handling
+
+    break;  // button/shake wake — exit outer loop for full wake
   } while (true);
 
-  // Remount SD before any file operations (logs, sync, playback).
+  // ── Full wake path (button/shake only) ──
+
+  // Re-init I2C bus (was released before sleep)
+  Wire.begin(SDA, SCL);
+
+  // Clear any PKEY IRQs that accumulated during sleep to prevent
+  // stale short-press bits from triggering ESP.restart() on first poll.
+  {
+    int staleIrq = readAxp2101Register(0x49);
+    if (staleIrq > 0) writeAxp2101Register(0x49, (uint8_t)staleIrq);
+  }
+
+  // Restore AMOLED_PWR_EN strong output driver (released for QMI8658 INT1 sharing).
+  pinMode(LCD_PWR, OUTPUT);
+  digitalWrite(LCD_PWR, HIGH);
+
+  // Remount SD for playback.
   {
     bool sdOk = false;
     for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
       if (sdTry > 0) delay(200);
-      sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+      sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
+    }
+    if (!sdOk) {
+      SD_MMC.end();
+      for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+        if (sdTry > 0) delay(200);
+        sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+      }
     }
     if (!sdOk) {
       Serial.println("SD remount failed after 5 attempts — re-sleeping");
       goToSleep();
-      return;  // unreachable, but clarifies intent
+      return;
     }
-  }
-
-  if (!buttonOnly && s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
-    if (s_hurricaneMode && s_hurricaneWatchEnabled) {
-      hurricaneRecheckAndUpdate();
-    }
-    if (connectWifiForSync(false)) {
-      // Hurricane check on timer wake (if not already in mode)
-      if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
-        HurricaneInfo hStorms[4]; int hCount = 0;
-        if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
-          cleanupSuppressedStorms(hStorms, hCount);
-          for (int hi = 0; hi < hCount; hi++) {
-            if (!isStormSuppressed(hStorms[hi].id)) {
-              enterHurricaneMode(hStorms[hi]);
-              break;
-            }
-          }
-        }
-      }
-      syncWeatherFrames();
-      fetchForecastData();
-      maybeRefreshPendingZoomSnapshots();
-    } else {
-      Serial.println("timer refresh skip: no wifi");
-    }
-    disconnectWifiAfterSync();
   }
   resetTopButtonStateAfterWake(buttonOnly);
 
-  // Restore AMOLED_PWR_EN strong output driver (released for QMI8658 INT1 sharing).
-  // INPUT_PULLUP kept the pin ~HIGH during sleep so display register state is intact.
-  pinMode(LCD_PWR, OUTPUT);
-  digitalWrite(LCD_PWR, HIGH);
-
   if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(s_displayBrightness);
+  s_touchInitialized = false;   // force touch re-init (was hibernated before sleep)
+  s_serviceButtonsWakeReset = true;
   s_buttonSleepTransition = false;
   s_moonDrawn = false;          // border was cleared — redraw moon
   return;
@@ -10122,27 +10842,40 @@ static void goToSleep(bool buttonOnly = false) {
 static void serviceUserButtons() {
   if (s_buttonSleepTransition) return;
 
-#if BOARD_IS_AMOLED_206
-  static uint32_t lastPekPollMs = 0;
-  uint32_t nowMs = millis();
-  if ((uint32_t)(nowMs - lastPekPollMs) >= 80U) {
-    lastPekPollMs = nowMs;
-    int irq2 = readAxp2101Register(0x49);  // INTSTS2
-    if (irq2 > 0) {
-      writeAxp2101Register(0x49, (uint8_t)irq2);
-      if (irq2 & 0x08) {  // PKEY short press
-        SD_MMC.end();
-        ESP.restart();
-      }
-    }
-  }
-#endif
-
   static bool longHandled = false;
   static uint32_t suppressUntilMs = 0;
+  static uint32_t lastLongPressMs = 0;
+
+  if (s_serviceButtonsWakeReset) {
+    s_serviceButtonsWakeReset = false;
+    longHandled = false;
+    suppressUntilMs = 0;
+    lastLongPressMs = 0;
+  }
 
   uint32_t now = millis();
   bool allowAction = ((int32_t)(now - suppressUntilMs) >= 0);
+
+#if BOARD_IS_AMOLED_206
+  // Poll AXP2101 PKEY interrupts.  PKEY short-press (bit 3 of INTSTS2) fires
+  // on button release when held < ~1s.  Use it as the reboot trigger, but
+  // suppress for 2s after a GPIO long-press to avoid the race where a long
+  // press release also fires PKEY short-press.
+  static uint32_t lastPekPollMs = 0;
+  if ((uint32_t)(now - lastPekPollMs) >= 80U) {
+    lastPekPollMs = now;
+    int irq2 = readAxp2101Register(0x49);  // INTSTS2
+    if (irq2 > 0) {
+      if ((irq2 & 0x08) && allowAction && !topButtonPressed() &&
+          (lastLongPressMs == 0 || (uint32_t)(now - lastLongPressMs) > 2000U)) {
+        writeAxp2101Register(0x49, (uint8_t)irq2);
+        SD_MMC.end();
+        ESP.restart();
+      }
+      writeAxp2101Register(0x49, (uint8_t)irq2);  // acknowledge all
+    }
+  }
+#endif
 
   bool stablePressed = false;
   bool releasePending = false;
@@ -10170,19 +10903,20 @@ static void serviceUserButtons() {
       (uint32_t)(now - pressStartMs) >= TOP_BTN_LONG_PRESS_MS) {
     s_sleepModeEnabled = !s_sleepModeEnabled;
     saveSleepModePreference(s_sleepModeEnabled);
-    // Init WoM when toggling INTO sleep mode; it was skipped at boot in always-on mode.
     if (s_sleepModeEnabled && s_shakeToWakeEnabled && !s_qmiInitialized) {
       initQmiShakeToWake();
     }
-    updateBarBufs(s_newestCachedIdx);  // refresh cached bar buffers so glyph updates immediately
+    updateBarBufs(s_newestCachedIdx);
     longHandled = true;
+    lastLongPressMs = now;
     suppressUntilMs = now + TOP_BTN_SUPPRESS_MS;
   } else if (releasePending) {
     uint32_t heldMs = (pressStartMs > 0 && releaseMs >= pressStartMs) ? (releaseMs - pressStartMs) : 0U;
     if (allowAction && !longHandled && heldMs >= TOP_BTN_SHORT_PRESS_MS) {
       goToSleep(true);
-      suppressUntilMs = millis() + TOP_BTN_SUPPRESS_MS;
     }
+    lastLongPressMs = now;  // suppress PKEY reboot after any top button release
+    if (longHandled) suppressUntilMs = now + TOP_BTN_SUPPRESS_MS;
     longHandled = false;
   } else if (!stablePressed) {
     longHandled = false;
@@ -10318,25 +11052,41 @@ void setup() {
 
   Serial.printf("Free heap: %u\n", (unsigned)ESP.getFreeHeap());
 
-  // ── SD card (retry up to 5 times) ──────────────────────────
+  // ── SD card (try 40MHz first, fall back to 20MHz) ──────────
   showMessage("Mounting SD...", nullptr);
   bool sdOk = false;
+#if BOARD_IS_AMOLED_206
+  SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
+  // Try 40MHz (SDMMC_FREQ_HIGHSPEED) first — doubles read throughput
+  for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+    if (sdTry > 0) delay(200);
+    sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
+  }
+  if (sdOk) {
+    Serial.println("SD mounted at 40MHz");
+  } else {
+    // Card doesn't support 40MHz — fall back to 20MHz
+    SD_MMC.end();
+    for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+      if (sdTry > 0) delay(200);
+      sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+    }
+    if (sdOk) Serial.println("SD mounted at 20MHz (40MHz failed)");
+  }
+#else
   for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
     if (sdTry > 0) {
       Serial.printf("SD retry %d/5...\n", sdTry + 1);
       delay(200);
     }
-#if BOARD_IS_AMOLED_206
-    SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
-    sdOk = SD_MMC.begin("/sdcard", /*mode1bit=*/true, /*format_if_failed=*/false,
-                         SDMMC_FREQ_DEFAULT);
-#elif defined(ARDUINO_WAVESHARE_ESP32_S3_LCD_147)
+#if defined(ARDUINO_WAVESHARE_ESP32_S3_LCD_147)
     sdOk = SD.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN)
          && SD.begin("/sdcard", true, false);
 #else
     sdOk = SD.begin(SD_CS, SPI, 20000000);
 #endif
   }
+#endif
   if (!sdOk) {
     showMessage("SD FAILED", "Insert card and reset");
     Serial.println("SD mount failed after 5 attempts!");
@@ -10537,6 +11287,7 @@ void setup() {
       appendDiagLog("[BOOT] fetchForecastData start ms=%lu\n", millis());
       fetchForecastData();
       appendDiagLog("[BOOT] fetchForecastData done ms=%lu\n", millis());
+      s_tickerWidth = 0;  // invalidate ticker so it re-renders with fresh forecast
       if (syncProgressIsActive()) syncProgressCompletePhase();
       { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("syncWeatherFrames done fc=%d rdy=%d\n", frameCount, (int)framesReady); diagF.close(); } }
       appendDiagLog("[BOOT] downloadMoon start ms=%lu\n", millis());
@@ -11339,6 +12090,21 @@ static ClockOverlayLayout makeClockOverlayLayout() {
   l.bgY = l.textY - 4; if (l.bgY < SCALED_BAR_H) l.bgY = SCALED_BAR_H;
   l.bgW = l.textW + 10; if (l.bgX + l.bgW > SCALED_W) l.bgW = SCALED_W - l.bgX;
   l.bgH = l.textH + 12; if (l.bgY + l.bgH > SCALED_H) l.bgH = SCALED_H - l.bgY;
+  // Ensure region extends high enough for the location pin (circle r=10, center 14px above tip).
+  // Pin tip = SCALED_H/2, circle top = SCALED_H/2 - 14 - 10 - 1 = SCALED_H/2 - 25.
+  {
+    int pinTopY = SCALED_H / 2 - 25;
+    if (pinTopY < SCALED_BAR_H) pinTopY = SCALED_BAR_H;
+    if (l.bgY > pinTopY) {
+      int expand = l.bgY - pinTopY;
+      l.bgY = pinTopY;
+      l.bgH += expand;
+      if (l.bgY + l.bgH > SCALED_H) l.bgH = SCALED_H - l.bgY;
+    }
+    // Also ensure region extends low enough to include pin tip + 1
+    int pinBotY = SCALED_H / 2 + 1;
+    if (l.bgY + l.bgH < pinBotY) l.bgH = pinBotY - l.bgY;
+  }
   return l;
 }
 
@@ -12275,15 +13041,52 @@ void loop() {
   if (!s_animStartLogged) {
     s_animStartLogged = true;
     appendDiagLog("anim-start: millis=%lu ms\n", millis());
+    appendDiagLog("anim: validCount=%d frameCount=%d newestIdx=%d\n",
+                  validCount, frameCount, newestIdx);
+    // Dump valid/invalid map: 'V'=valid, '.'=invalid, in groups of 24
+    for (int row = 0; row < frameCount; row += 24) {
+      char map[32];
+      int end = min(row + 24, frameCount);
+      for (int j = row; j < end; j++) map[j - row] = s_streamValid[j] ? 'V' : '.';
+      map[end - row] = '\0';
+      appendDiagLog("vmap[%03d]: %s\n", row, map);
+    }
+    // Log jpegLen for all slots so we can see nighttime sizes
+    for (int row = 0; row < frameCount; row += 8) {
+      char buf[128];
+      int pos = 0;
+      int end = min(row + 8, frameCount);
+      for (int j = row; j < end; j++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%u%s",
+                        (unsigned)s_idx.jpegLen[j], j < end - 1 ? "," : "");
+      }
+      appendDiagLog("jlen[%03d]: %s\n", row, buf);
+    }
+  }
+
+  // Pre-render bars. Top bar is static; bottom bar scrolls if forecast is available.
+  updateBarBufs(newestIdx, true);  // skip bottom bar — ticker handles it
+  if (s_forecastEnabled && s_forecast.valid) {
+    if (s_tickerWidth <= 0) {
+      renderForecastTicker();
+      s_tickerScrollPx = 0;
+    }
+  }
+  if (s_tickerWidth > 0) {
+    tickerCopyWindow(s_tickerScrollPx);
+  } else {
+    updateBarBufs(newestIdx);  // fallback: static bottom bar
   }
 
   uint32_t loopStartMs = millis();
   int lastDisplayedFrameIdx = -1;
+  int animFramesPushed = 0;
   // Time-based frame selection over the valid-frame list.
   // This keeps playback monotonic even when the raw validity map has holes.
   for (;;) {
     serviceUserButtons();
     pollCleanModeToggle();
+    serviceWifiPortalServer();
     uint32_t elapsed = millis() - loopStartMs;
     if (elapsed >= animationDurationMs) break;
 
@@ -12296,7 +13099,7 @@ void loop() {
     if (remaining <= targetFrameDelayMs * 2U + 50U) {
       int freezeFrameIdx = validIdx[srcPos];
       if (lastDisplayedFrameIdx != freezeFrameIdx) {
-        if (showFrame(freezeFrameIdx)) {
+        if (showFrame(freezeFrameIdx, true)) {
           if (startCueArmed) {
             if (playStartCueIfEnabled()) {
               s_startCuePending = false;
@@ -12320,7 +13123,7 @@ void loop() {
             bool foundClean = false;
             for (int back = 1; back <= 12 && (int)srcPos - back >= 0; ++back) {
               int backIdx = validIdx[(int)srcPos - back];
-              if (showFrame(backIdx)) {
+              if (showFrame(backIdx, true)) {
                 if (!currentScaledFreezeFrameLooksCorrupted()) {
                   lastDisplayedFrameIdx = backIdx;
                   foundClean = true;
@@ -12337,7 +13140,7 @@ void loop() {
             }
             if (!foundClean) {
               // No clean alternative — re-show the original freeze frame.
-              showFrame(freezeFrameIdx);
+              showFrame(freezeFrameIdx, true);
               appendDiagLog("loop: freeze-back-fail\n");
             }
             // Write updated index so evicted slots get re-downloaded next sync
@@ -12354,15 +13157,33 @@ void loop() {
       break;
     }
 
-    if (showFrame(validIdx[srcPos])) {
-      if (startCueArmed) {
-        if (playStartCueIfEnabled()) {
-          s_startCuePending = false;
-          startCueArmed = false;
+    int frameToShow = validIdx[srcPos];
+    if (frameToShow != lastDisplayedFrameIdx) {
+      bool ok = showFrame(frameToShow, true);
+      if (ok) {
+        animFramesPushed++;
+        if (startCueArmed) {
+          if (playStartCueIfEnabled()) {
+            s_startCuePending = false;
+            startCueArmed = false;
+          }
         }
+        lastDisplayedFrameIdx = frameToShow;
+      } else if (animFramesPushed < 3) {
+        appendDiagLog("showFrame-fail: idx=%d srcPos=%lu\n", frameToShow, srcPos);
       }
-      lastDisplayedFrameIdx = validIdx[srcPos];
+    } else if (s_tickerWidth > 0 && s_frameDisplayBuf) {
+      // Same frame — re-present so ticker scrolls between SD reads
+      presentScaledBuf(s_frameDisplayBuf);
     }
+  }
+
+  static int s_animLoopNum = 0;
+  s_animLoopNum++;
+  if (s_animLoopNum <= 3) {
+    appendDiagLog("anim-loop[%d]: pushed=%d last=%d vc=%d dur=%lu\n",
+                  s_animLoopNum, animFramesPushed, lastDisplayedFrameIdx,
+                  validCount, animationDurationMs);
   }
 
   // Freeze on the already-displayed final animation frame.
@@ -12466,9 +13287,11 @@ void loop() {
   Serial.printf("loop %d/%d v=%d elapsed=%ums expected=%ums drift=%dms\n",
                 loopsDone, s_loopsBeforeSleep,
                 validCount, loopElapsedMs, loopExpectedMs, loopDriftMs);
-  appendDiagLog("loop: %d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d ms\n",
+  float animFps = (animationDurationMs > 0) ? (float)animFramesPushed * 1000.0f / (float)animationDurationMs : 0.0f;
+  appendDiagLog("loop: %d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d fps=%.1f (%d frames/%ums)\n",
                 loopsDone, s_loopsBeforeSleep, validCount, frameCount, newestIdx,
-                loopElapsedMs, loopExpectedMs, loopDriftMs);
+                loopElapsedMs, loopExpectedMs, loopDriftMs,
+                (double)animFps, animFramesPushed, animationDurationMs);
 
   // Prevent sleep during hurricane mode
   if (s_sleepModeEnabled && !s_hurricaneMode && loopsDone >= s_loopsBeforeSleep) {
