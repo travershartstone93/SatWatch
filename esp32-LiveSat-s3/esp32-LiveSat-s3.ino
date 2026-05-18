@@ -372,7 +372,8 @@ static uint16_t* s_botBarBuf = nullptr;
 // Scrolling forecast ticker — wide pre-rendered strip, memcpy window into s_botBarBuf each frame.
 static uint16_t* s_tickerBuf = nullptr;  // wide strip: s_tickerWidth × SCALED_BAR_H
 static int       s_tickerWidth = 0;      // total pixel width of rendered content + padding
-static int       s_tickerScrollPx = 0;   // current scroll offset (advanced inside presentScaledBuf)
+static int       s_tickerScrollPx = 0;   // current scroll offset (advanced by background task)
+
 
 // Dirty-rect state for clock overlay partial scale.
 // When s_dirtyRectDstW > 0, presentSpriteToDisplay() scales only the clock
@@ -4060,6 +4061,7 @@ static void tickerCopyWindow(int scrollX) {
   }
 }
 
+
 // Render timestamp bar text directly at display resolution.
 // Top rows use SCALED_TOP_ROW_H; bottom row uses SCALED_BAR_H.
 // into s_topBarBuf / s_botBarBuf. Avoids the 2× vertical upscale that makes bitmap
@@ -5655,7 +5657,6 @@ static void delayWithInputPoll(uint32_t ms) {
   while (millis() - start < ms) {
     serviceUserButtons();
     pollCleanModeToggle();
-    // Re-present at ~6fps so ticker scrolls (advancement is inside presentScaledBuf)
     uint32_t now = millis();
     if (s_tickerWidth > 0 && s_frameDisplayBuf && now - lastPush >= 85) {
       lastPush = now;
@@ -5716,12 +5717,17 @@ static void updateBarBufs(int frameIdx, bool skipBottomBar) {
 static void applyBarsToBuf(uint16_t* buf) {
   if (!buf || !s_topBarBuf || !s_botBarBuf) return;
   size_t topBarBytes = (size_t)SCALED_W * (size_t)SCALED_TOP_BAR_H * 2U;
-  size_t botBarBytes = (size_t)SCALED_W * (size_t)SCALED_BAR_H * 2U;
   // Top bar: rows 0..SCALED_TOP_BAR_H-1 (flush against top of frame)
   memcpy(buf, s_topBarBuf, topBarBytes);
   // Bottom bar: rows SCALED_H-SCALED_BAR_H..SCALED_H-1 (flush against bottom)
+  // When ticker task owns the bar, skip stamping — it pushes directly to AMOLED.
   int botY = SCALED_H - SCALED_BAR_H;
-  memcpy(buf + (size_t)botY * SCALED_W, s_botBarBuf, botBarBytes);
+  size_t botBarBytes = (size_t)SCALED_W * (size_t)SCALED_BAR_H * 2U;
+  if (isCleanMode()) {
+    memset(buf + (size_t)botY * SCALED_W, 0, botBarBytes);
+  } else {
+    memcpy(buf + (size_t)botY * SCALED_W, s_botBarBuf, botBarBytes);
+  }
 }
 
 static void drawAlwaysOnClockOverlay(uint16_t* buf);  // defined after clock overlay helpers
@@ -5779,7 +5785,6 @@ static void presentScaledBuf(uint16_t* src) {
       tickerCopyWindow(s_tickerScrollPx);
     }
   }
-  // Stamp persistent timestamp bars over whatever is in src.
   applyBarsToBuf(src);
 
   // Time-always-on: stamp clock into src, push to AMOLED, then restore src
@@ -13064,7 +13069,7 @@ void loop() {
     }
   }
 
-  // Pre-render bars. Top bar is static; bottom bar scrolls if forecast is available.
+  // Pre-render bars. Top bar is static; bottom bar scrolls via background task.
   updateBarBufs(newestIdx, true);  // skip bottom bar — ticker handles it
   if (s_forecastEnabled && s_forecast.valid) {
     if (s_tickerWidth <= 0) {
@@ -13172,9 +13177,6 @@ void loop() {
       } else if (animFramesPushed < 3) {
         appendDiagLog("showFrame-fail: idx=%d srcPos=%lu\n", frameToShow, srcPos);
       }
-    } else if (s_tickerWidth > 0 && s_frameDisplayBuf) {
-      // Same frame — re-present so ticker scrolls between SD reads
-      presentScaledBuf(s_frameDisplayBuf);
     }
   }
 
