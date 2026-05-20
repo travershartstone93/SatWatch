@@ -59,6 +59,7 @@
 #include <JPEGDEC.h>
 
 #include "config-s3.h"
+#include "scramble_glyphs.h"
 #include "flags_rgb565.h"
 
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
@@ -376,6 +377,9 @@ static uint16_t* s_botBarBuf = nullptr;
 // Scrolling forecast ticker — wide pre-rendered strip, memcpy window into s_botBarBuf each frame.
 static uint16_t* s_tickerBuf = nullptr;  // wide strip: s_tickerWidth × SCALED_BAR_H
 static int       s_tickerWidth = 0;      // total pixel width of rendered content + padding
+static int       s_tickerSegX[32] = {};  // x-pixel offset of each segment in the ticker buffer
+static int       s_tickerSegCount = 0;   // number of segments
+static int       s_tickerDailyCount = 0; // number of daily segments (first N segments)
 static int       s_tickerScrollPx = 0;   // current scroll offset
 
 #if INDEPENDENT_TICKER
@@ -3915,53 +3919,7 @@ static int renderForecastTicker() {
   TickerSegment segs[32];
   int segCount = 0;
 
-  // Nowcast if rain approaching
-  if (s_forecast.rainEtaMinutes == 0) {
-    segs[segCount++] = {'R', "Rain now"};
-  } else if (s_forecast.rainEtaMinutes > 0) {
-    char tb[12];
-    time_t arrival = nowUtcFc + (time_t)s_forecast.rainEtaMinutes * 60;
-    fmtLocalTime(arrival, tb, sizeof(tb));
-    TickerSegment seg; seg.type = 'R';
-    int um = s_forecast.rainUncertaintyMin;
-    if (um >= 60)
-      snprintf(seg.text, sizeof(seg.text), "Rain ~%s +/-%dh", tb, um / 60);
-    else
-      snprintf(seg.text, sizeof(seg.text), "Rain ~%s +/-%dm", tb, um);
-    segs[segCount++] = seg;
-  }
-
-  // Hourly entries for today (first precip blocks + wind)
-  {
-    char lastPtype = 0;
-    for (int i = 0; i < (int)s_forecast.hourlyCount && segCount < 10; i++) {
-      int hoursOut = (int)((s_forecast.hourly[i].startTime - nowUtcFc) / 3600);
-      if (hoursOut < 0) continue;
-      if (hoursOut > 24) break;
-      if (s_forecast.hourly[i].precipProbability < 20) { lastPtype = 0; continue; }
-      char pType = isPrecipKeyword(s_forecast.hourly[i].shortForecast);
-      if (!pType) { lastPtype = 0; continue; }
-      if (pType == lastPtype) continue;
-      lastPtype = pType;
-      TickerSegment seg; seg.type = pType;
-      char tb[12];
-      fmtLocalTime(s_forecast.hourly[i].startTime, tb, sizeof(tb));
-      snprintf(seg.text, sizeof(seg.text), "%s", tb);
-      segs[segCount++] = seg;
-    }
-  }
-
-  // Wind from hourly[0]
-  if (s_forecast.hourlyCount > 0 && segCount < 30) {
-    int kmh = s_forecast.hourly[0].windSpeedKmh;
-    int deg = s_forecast.hourly[0].windDirDeg16 * 16;
-    int kts = (kmh * 10) / 19;
-    TickerSegment seg; seg.type = 0;
-    snprintf(seg.text, sizeof(seg.text), "Wind %dkts %s", kts, degToCompass(deg));
-    segs[segCount++] = seg;
-  }
-
-  // Daily entries — each day with conditions + temp + precip if any
+  // 1. Daily entries first — icon + day + temp + conditions
   for (int i = 0; i < (int)s_forecast.dailyCount && segCount < 28; i++) {
     int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
     if (hoursOut < -12) continue;
@@ -3969,9 +3927,8 @@ static int renderForecastTicker() {
     fmtDayName(s_forecast.daily[i].date, dayName, sizeof(dayName));
     char pType = isPrecipKeyword(s_forecast.daily[i].shortForecast);
 
-    // Day name + temp + icon
     TickerSegment seg;
-    seg.type = pType ? pType : 'C';  // sun icon for clear/cloudy days
+    seg.type = pType ? pType : 'C';
     int hi = s_forecastUseFahrenheit ? s_forecast.daily[i].highC * 9 / 5 + 32 : s_forecast.daily[i].highC;
     int lo = s_forecastUseFahrenheit ? s_forecast.daily[i].lowC * 9 / 5 + 32 : s_forecast.daily[i].lowC;
     const char* unit = s_forecastUseFahrenheit ? "F" : "C";
@@ -3988,7 +3945,55 @@ static int renderForecastTicker() {
     segs[segCount++] = seg;
   }
 
-  // No precip fallback
+  s_tickerDailyCount = segCount;  // daily entries are all segments so far
+
+  // 2. Nowcast if rain approaching
+  if (s_forecast.rainEtaMinutes == 0) {
+    segs[segCount++] = {'R', "Rain now"};
+  } else if (s_forecast.rainEtaMinutes > 0) {
+    char tb[12];
+    time_t arrival = nowUtcFc + (time_t)s_forecast.rainEtaMinutes * 60;
+    fmtLocalTime(arrival, tb, sizeof(tb));
+    TickerSegment seg; seg.type = 'R';
+    int um = s_forecast.rainUncertaintyMin;
+    if (um >= 60)
+      snprintf(seg.text, sizeof(seg.text), "Rain ~%s +/-%dh", tb, um / 60);
+    else
+      snprintf(seg.text, sizeof(seg.text), "Rain ~%s +/-%dm", tb, um);
+    segs[segCount++] = seg;
+  }
+
+  // 3. Hourly precip entries
+  {
+    char lastPtype = 0;
+    for (int i = 0; i < (int)s_forecast.hourlyCount && segCount < 20; i++) {
+      int hoursOut = (int)((s_forecast.hourly[i].startTime - nowUtcFc) / 3600);
+      if (hoursOut < 0) continue;
+      if (hoursOut > 24) break;
+      if (s_forecast.hourly[i].precipProbability < 20) { lastPtype = 0; continue; }
+      char pType = isPrecipKeyword(s_forecast.hourly[i].shortForecast);
+      if (!pType) { lastPtype = 0; continue; }
+      if (pType == lastPtype) continue;
+      lastPtype = pType;
+      TickerSegment seg; seg.type = pType;
+      char tb[12];
+      fmtLocalTime(s_forecast.hourly[i].startTime, tb, sizeof(tb));
+      snprintf(seg.text, sizeof(seg.text), "%s", tb);
+      segs[segCount++] = seg;
+    }
+  }
+
+  // 4. Wind from hourly[0]
+  if (s_forecast.hourlyCount > 0 && segCount < 30) {
+    int kmh = s_forecast.hourly[0].windSpeedKmh;
+    int deg = s_forecast.hourly[0].windDirDeg16 * 16;
+    int kts = (kmh * 10) / 19;
+    TickerSegment seg; seg.type = 0;
+    snprintf(seg.text, sizeof(seg.text), "Wind %dkts %s", kts, degToCompass(deg));
+    segs[segCount++] = seg;
+  }
+
+  // 5. No data fallback
   if (segCount == 0) {
     segs[segCount++] = {0, "No rain 48h"};
   }
@@ -4019,8 +4024,10 @@ static int renderForecastTicker() {
   RenderItem items[32];
   int itemCount = 0;
   int cx = 0;  // content starts at pixel 0
+  s_tickerSegCount = 0;
   for (int i = 0; i < segCount && itemCount < 32; i++) {
     if (i > 0) cx += entryGap;
+    if (s_tickerSegCount < 32) s_tickerSegX[s_tickerSegCount++] = cx;
     items[itemCount].x = cx;
     items[itemCount].type = segs[i].type;
     strlcpy(items[itemCount].text, segs[i].text, sizeof(items[0].text));
@@ -4093,31 +4100,131 @@ static void tickerCopyWindow(int scrollX) {
   }
 }
 
+// ── Decode mode ───────────────────────────────────────────────────────
+static uint16_t* s_decodedBarBuf = nullptr;
+static uint16_t* s_scrambledBarBuf = nullptr;
+static int s_decodeCharXPos[128];
+static int s_decodeCharCount = 0;
+static int s_decodeSegWidth = 0;  // pixel width of current decoded segment
+
+// Render one decode frame: revealed chars from decoded buf, unrevealed get fresh random glyphs
+static void renderDecodeFrame(int revealIdx) {
+  if (!s_decodedBarBuf || !s_botBarBuf || s_decodeCharCount <= 0) return;
+  int segW = s_decodeSegWidth > 0 ? s_decodeSegWidth : SCALED_W;
+  int rx = (revealIdx >= s_decodeCharCount) ? segW
+    : s_decodeCharXPos[min(revealIdx, s_decodeCharCount - 1)];
+
+  // Start with black
+  memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
+
+  // Copy revealed portion from decoded bar
+  if (rx > 0) {
+    int copyW = min(rx, segW);
+    for (int row = 0; row < SCALED_BAR_H; row++)
+      memcpy(s_botBarBuf + row * SCALED_W, s_decodedBarBuf + row * SCALED_W, copyW * 2);
+  }
+
+  // Blit fresh random scramble glyphs only within the segment width
+  if (rx < segW) {
+    int cx = rx;
+    while (cx < segW - 2) {
+      const ScrambleGlyph& g = kScrambleGlyphs[esp_random() % kScrambleGlyphCount];
+      int gy = (SCALED_BAR_H - g.h) / 2;
+      if (gy < 0) gy = 0;
+      for (int row = 0; row < g.h && (gy + row) < SCALED_BAR_H; row++) {
+        const uint16_t* src = g.data + row * g.w;
+        uint16_t* dst = s_botBarBuf + (gy + row) * SCALED_W + cx;
+        for (int col = 0; col < g.w && (cx + col) < segW; col++) {
+          uint16_t px = pgm_read_word(&src[col]);
+          if (px) dst[col] = px;
+        }
+      }
+      cx += g.w + 2;
+    }
+  }
+}
+
+static bool renderDecodeBarImages() {
+  if (!s_tickerBuf || s_tickerWidth <= 0) return false;
+  size_t barBytes = (size_t)SCALED_W * SCALED_BAR_H * 2;
+  if (!s_decodedBarBuf) s_decodedBarBuf = (uint16_t*)heap_caps_malloc(barBytes, MALLOC_CAP_SPIRAM);
+  if (!s_decodedBarBuf) return false;
+
+  // Decoded: copy first daily segment only
+  int segStart = 0;
+  int segEnd = (s_tickerDailyCount > 1 || s_tickerSegCount > 1) ? s_tickerSegX[1] : s_tickerWidth;
+  int segW = min(segEnd - segStart, SCALED_W);
+  s_decodeSegWidth = segW;
+  memset(s_decodedBarBuf, 0, barBytes);
+  if (segW > 0) {
+    for (int row = 0; row < SCALED_BAR_H; row++)
+      memcpy(s_decodedBarBuf + row * SCALED_W, s_tickerBuf + row * s_tickerWidth + segStart, segW * 2);
+  }
+
+  // Character positions for reveal pacing (one position per ~10px)
+  s_decodeCharCount = 0;
+  for (int cx = 0; cx < segW && s_decodeCharCount < 127; cx += 10)
+    s_decodeCharXPos[s_decodeCharCount++] = cx;
+  return s_decodeCharCount > 0;
+}
 
 #if INDEPENDENT_TICKER
-// Independent ticker task — pushes bottom bar strip to AMOLED at ~30fps.
-// Runs on Core 1 at priority 2 (above main loop). Serialized via s_amoledMutex.
 static void tickerTask(void*) {
+  int dReveal = 0;
+  bool dHold = false;
+  uint32_t dHoldMs = 0;
+
   for (;;) {
-    // Safe shutdown check BEFORE taking mutex
     if (!s_tickerShouldRun) {
       s_tickerTaskHandle = nullptr;
       vTaskDelete(nullptr);
       return;
     }
 
-    if (s_tickerWidth > 0 && s_tickerBuf && s_botBarBuf && s_amoledOut &&
-        !isCleanMode() && !s_fullscreenMode) {
-      // Advance scroll (safe outside mutex — only this task writes it)
-      s_tickerScrollPx += 3;
-      if (s_tickerScrollPx >= s_tickerWidth) s_tickerScrollPx -= s_tickerWidth;
+    if (s_botBarBuf && s_amoledOut && !isCleanMode() && !s_fullscreenMode && s_tickerMode != TICKER_NONE) {
+      bool needsPush = false;
 
-      if (s_amoledMutex && xSemaphoreTake(s_amoledMutex, portMAX_DELAY)) {
-        // Buffer write + AMOLED push inside mutex to prevent race
-        tickerCopyWindow(s_tickerScrollPx);
-        // TE sync insertion point: if tearing at row 399/400 boundary, add
-        // GPIO13 (CO5300 TE pin) interrupt wait here. Implementation:
-        // attachInterrupt(13, teISR, RISING) → wait for flag → clear flag.
+      if (s_tickerMode == TICKER_SCROLL && s_tickerWidth > 0 && s_tickerBuf) {
+        s_tickerScrollPx += 3;
+        if (s_tickerScrollPx >= s_tickerWidth) s_tickerScrollPx -= s_tickerWidth;
+        needsPush = true;
+      } else if (s_tickerMode == TICKER_DECODE && s_decodeCharCount > 0) {
+        if (dHold) {
+          if (millis() - dHoldMs > 4000) {
+            dHold = false;
+            dReveal = 0;
+            // Advance to next segment
+            if (s_tickerBuf && s_tickerSegCount > 0 && s_decodedBarBuf) {
+              static int dSegIdx = 0;
+              int cycleCount = (s_tickerDailyCount > 0) ? s_tickerDailyCount : s_tickerSegCount;
+              dSegIdx = (dSegIdx + 1) % cycleCount;
+              int segStart = s_tickerSegX[dSegIdx];
+              int segEnd = (dSegIdx + 1 < s_tickerSegCount) ? s_tickerSegX[dSegIdx + 1] : s_tickerWidth;
+              int segW = min(segEnd - segStart, SCALED_W);
+              s_decodeSegWidth = segW;
+              // Re-compute char positions for new segment width
+              s_decodeCharCount = 0;
+              for (int pcx = 0; pcx < segW && s_decodeCharCount < 127; pcx += 10)
+                s_decodeCharXPos[s_decodeCharCount++] = pcx;
+              memset(s_decodedBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
+              if (segW > 0) {
+                for (int row = 0; row < SCALED_BAR_H; row++)
+                  memcpy(s_decodedBarBuf + row * SCALED_W,
+                         s_tickerBuf + row * s_tickerWidth + segStart, segW * 2);
+              }
+            }
+          }
+        } else {
+          dReveal++;
+          if (dReveal > s_decodeCharCount) { dHold = true; dHoldMs = millis(); }
+        }
+        renderDecodeFrame(dReveal);
+        needsPush = true;
+      }
+
+      if (needsPush && s_amoledMutex && xSemaphoreTake(s_amoledMutex, portMAX_DELAY)) {
+        if (s_tickerMode == TICKER_SCROLL && s_tickerWidth > 0)
+          tickerCopyWindow(s_tickerScrollPx);
         const int amoledY = (AMOLED_HEIGHT - SCALED_H) / 2 + (SCALED_H - SCALED_BAR_H);
         s_amoledOut->draw16bitRGBBitmap(0, amoledY, s_botBarBuf, SCALED_W, SCALED_BAR_H);
         xSemaphoreGive(s_amoledMutex);
@@ -4129,11 +4236,11 @@ static void tickerTask(void*) {
               ? (float)s_tickerSkipCount * 100.0f / (float)(s_tickerPushCount + s_tickerSkipCount)
               : 0.0f);
         }
-      } else {
+      } else if (needsPush) {
         s_tickerSkipCount++;
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(32 + (esp_random() & 3)));
+    vTaskDelay(pdMS_TO_TICKS(s_tickerMode == TICKER_DECODE ? 35 : (32 + (esp_random() & 3))));
   }
 }
 #endif
@@ -13258,17 +13365,26 @@ void loop() {
       s_tickerScrollPx = 0;
     }
   }
+  bool tickerReady = false;
   if (s_tickerWidth > 0) {
-    tickerCopyWindow(s_tickerScrollPx);
+    if (s_tickerMode == TICKER_DECODE) {
+      tickerReady = renderDecodeBarImages();
+      if (tickerReady) renderDecodeFrame(0);
+    } else if (s_tickerMode != TICKER_NONE) {
+      tickerCopyWindow(s_tickerScrollPx);
+      tickerReady = true;
+    }
+  }
+  if (tickerReady) {
 #if INDEPENDENT_TICKER
     if (!s_tickerTaskHandle) {
       s_tickerShouldRun = true;
       xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
-      appendDiagLog("[INIT] ticker task started handle=%p\n", s_tickerTaskHandle);
+      appendDiagLog("[INIT] ticker task started handle=%p mode=%d\n", s_tickerTaskHandle, s_tickerMode);
     }
 #endif
   } else {
-    updateBarBufs(newestIdx);  // fallback: static bottom bar
+    updateBarBufs(newestIdx);
   }
 
   uint32_t loopStartMs = millis();
