@@ -645,16 +645,6 @@ struct ForecastData {
 RTC_DATA_ATTR static ForecastData s_forecast = {};
 static bool s_forecastEnabled       = true;
 static bool s_forecastUseFahrenheit = true;
-
-// Ticker animation modes
-enum TickerMode : uint8_t {
-  TICKER_SCROLL = 0,
-  TICKER_DECODE = 1,
-  TICKER_FADE   = 2,
-  TICKER_RADAR  = 3,
-  TICKER_NONE   = 4,
-};
-static uint8_t s_tickerMode = TICKER_SCROLL;
 static char s_nwsGridUrl[128]       = {};
 static bool s_nwsGridUrlValid       = false;
 static char s_geoCountryCode[4]     = {};   // "CA", "US", "GB", "VG"
@@ -911,8 +901,6 @@ static void loadWifiPortalConfig() {
       // Forecast config
       s_forecastEnabled       = prefs.getBool("fcen", true);
       s_forecastUseFahrenheit = prefs.getBool("fcuf", true);
-      s_tickerMode            = prefs.getUChar("tmod", TICKER_SCROLL);
-      if (s_tickerMode > TICKER_NONE) s_tickerMode = TICKER_SCROLL;
       prefs.getString("nwsgu", s_nwsGridUrl, sizeof(s_nwsGridUrl));
       s_nwsGridUrlValid = (s_nwsGridUrl[0] != '\0');
     }
@@ -1456,18 +1444,6 @@ static void sendWifiPortalPage() {
   html += F(">Fahrenheit</option><option value='c'");
   if (!s_forecastUseFahrenheit) html += " selected";
   html += F(">Celsius</option></select></label></div>"
-            "<div style='margin-bottom:8px;'><label>Ticker animation: "
-            "<select name='tmod'><option value='0'");
-  if (s_tickerMode == TICKER_SCROLL) html += F(" selected");
-  html += F(">Scroll</option><option value='1'");
-  if (s_tickerMode == TICKER_DECODE) html += F(" selected");
-  html += F(">Decode</option><option value='2'");
-  if (s_tickerMode == TICKER_FADE) html += F(" selected");
-  html += F(">Fade</option><option value='3'");
-  if (s_tickerMode == TICKER_RADAR) html += F(" selected");
-  html += F(">Radar</option><option value='4'");
-  if (s_tickerMode == TICKER_NONE) html += F(" selected");
-  html += F(">None</option></select></label></div>"
             "<p style='font-size:0.85em;color:#aaa;margin:0;'>"
             "Rain approach + hourly + 48hr forecast. NOAA radar + NWS (US/territories) or ECMWF (worldwide).</p>"
             "</div>");
@@ -1659,17 +1635,10 @@ static void handleWifiPortalSave() {
   s_forecastEnabled = s_wifiPortalServer.hasArg("fcen");
   s_forecastUseFahrenheit = (s_wifiPortalServer.arg("fcunit") != "c");
   {
-    uint8_t tmod = (uint8_t)s_wifiPortalServer.arg("tmod").toInt();
-    if (tmod > TICKER_NONE) tmod = TICKER_SCROLL;
-    s_tickerMode = tmod;
-    s_tickerWidth = 0;  // force ticker re-render with new mode on next loop
-  }
-  {
     Preferences fPrefs;
     if (fPrefs.begin("satwatch", false)) {
       fPrefs.putBool("fcen", s_forecastEnabled);
       fPrefs.putBool("fcuf", s_forecastUseFahrenheit);
-      fPrefs.putUChar("tmod", s_tickerMode);
       fPrefs.end();
     }
   }
@@ -4011,7 +3980,7 @@ static int renderForecastTicker() {
     if (segs[i].type) totalW += iconDrawW + iconGap;
     totalW += s_barSprite.textWidth(segs[i].text);
   }
-  totalW += SCALED_W / 2;  // blank space before ticker wraps
+  totalW += entryGap;  // gap between last and first entry on wrap
 
   // -- Allocate wide buffer --
   size_t tickerBytes = (size_t)totalW * SCALED_BAR_H * 2;
@@ -11302,7 +11271,7 @@ void setup() {
   }
   printMemDiag("POST-ALLOC");
 
-  // Ticker task created later in animation setup (after progress bar task stops)
+  // Ticker task created in animation setup (after progress bar stops)
 
   // ── Determine boot type ───────────────────────────────────
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -12802,25 +12771,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
   // then push the full frame. Restoring s_dlBuf after each push keeps the
   // background clean for the next tick without re-reading from SD.
   copyClockFxSpriteToMainSprite(l);    // blit into s_frameDisplayBuf (SCALED coords)
-#if INDEPENDENT_TICKER
-  // Partial push: only clock region rows (~11ms vs ~36ms full frame).
-  if (s_amoledOut && s_frameDisplayBuf && l.bgH > 0) {
-    const int outY = (AMOLED_HEIGHT - SCALED_H) / 2;
-    int r0 = l.bgY;
-    int r1 = l.bgY + l.bgH;
-    if (r0 < 0) r0 = 0;
-    if (r1 > SCALED_H - SCALED_BAR_H) r1 = SCALED_H - SCALED_BAR_H;
-    int rows = r1 - r0;
-    if (rows > 0) {
-      if (s_amoledMutex) xSemaphoreTake(s_amoledMutex, portMAX_DELAY);
-      s_amoledOut->draw16bitRGBBitmap(0, outY + r0,
-        s_frameDisplayBuf + (size_t)r0 * SCALED_W, SCALED_W, rows);
-      if (s_amoledMutex) xSemaphoreGive(s_amoledMutex);
-    }
-  }
-#else
-  presentScaledBuf(s_frameDisplayBuf);
-#endif
+  presentScaledBuf(s_frameDisplayBuf); // full-frame push at display resolution
   restoreSpriteRegionFromDlBuf(l);     // restore clean bg in s_frameDisplayBuf
 }
 
@@ -13290,9 +13241,6 @@ void loop() {
   if (s_tickerWidth > 0) {
     tickerCopyWindow(s_tickerScrollPx);
 #if INDEPENDENT_TICKER
-    // Create ticker task here (not in setup) — after progress bar task is stopped.
-    // Progress bar writes AMOLED without mutex; ticker writes with mutex.
-    // Creating during sync causes SPI bus corruption from preemption.
     if (!s_tickerTaskHandle) {
       s_tickerShouldRun = true;
       xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
