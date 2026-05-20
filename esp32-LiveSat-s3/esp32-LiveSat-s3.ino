@@ -649,7 +649,7 @@ struct ForecastData {
 RTC_DATA_ATTR static ForecastData s_forecast = {};
 static bool s_forecastEnabled       = true;
 static bool s_forecastUseFahrenheit = true;
-enum TickerMode : uint8_t { TICKER_SCROLL=0, TICKER_DECODE=1, TICKER_FADE=2, TICKER_RADAR=3, TICKER_NONE=4 };
+enum TickerMode : uint8_t { TICKER_SCROLL=0, TICKER_DECODE=1, TICKER_FADE=2, TICKER_NOWCAST=3, TICKER_NONE=4 };
 static uint8_t s_tickerMode = TICKER_SCROLL;
 static char s_nwsGridUrl[128]       = {};
 static bool s_nwsGridUrlValid       = false;
@@ -1461,7 +1461,7 @@ static void sendWifiPortalPage() {
   if (s_tickerMode == 2) html += F(" selected");
   html += F(">Fade</option><option value='3'");
   if (s_tickerMode == 3) html += F(" selected");
-  html += F(">Radar</option><option value='4'");
+  html += F(">Nowcast</option><option value='4'");
   if (s_tickerMode == 4) html += F(" selected");
   html += F(">None</option></select></label></div>"
             "<p style='font-size:0.85em;color:#aaa;margin:0;'>"
@@ -3923,8 +3923,18 @@ static int renderForecastTicker() {
   for (int i = 0; i < (int)s_forecast.dailyCount && segCount < 28; i++) {
     int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
     if (hoursOut < -12) continue;
-    char dayName[8];
-    fmtDayName(s_forecast.daily[i].date, dayName, sizeof(dayName));
+    char dayLabel[16];
+    fmtDayName(s_forecast.daily[i].date, dayLabel, sizeof(dayLabel));
+    // Check if this entry is today
+    int32_t off = s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0;
+    struct tm entryLt, nowLt;
+    time_t entryLocal = s_forecast.daily[i].date + (time_t)off;
+    time_t nowLocal = nowUtcFc + (time_t)off;
+    gmtime_r(&entryLocal, &entryLt);
+    gmtime_r(&nowLocal, &nowLt);
+    if (entryLt.tm_mday == nowLt.tm_mday && entryLt.tm_mon == nowLt.tm_mon)
+      strlcat(dayLabel, "(Today)", sizeof(dayLabel));
+
     char pType = isPrecipKeyword(s_forecast.daily[i].shortForecast);
 
     TickerSegment seg;
@@ -3937,10 +3947,10 @@ static int renderForecastTicker() {
       char tb[12] = "";
       fmtLocalTime(s_forecast.daily[i].date, tb, sizeof(tb));
       snprintf(seg.text, sizeof(seg.text), "%s %d/%d%s %d%% ~%s",
-               dayName, hi, lo, unit, s_forecast.daily[i].precipProbability, tb);
+               dayLabel, hi, lo, unit, s_forecast.daily[i].precipProbability, tb);
     } else {
       snprintf(seg.text, sizeof(seg.text), "%s %d/%d%s %s",
-               dayName, hi, lo, unit, s_forecast.daily[i].shortForecast);
+               dayLabel, hi, lo, unit, s_forecast.daily[i].shortForecast);
     }
     segs[segCount++] = seg;
   }
@@ -4168,6 +4178,103 @@ static bool renderDecodeBarImages() {
   return s_decodeCharCount > 0;
 }
 
+// Render static nowcast bar: today's conditions + upcoming hours
+static bool renderNowcastBar() {
+  ensureBarSpriteReady();
+  if (!s_barSpriteReady || !s_botBarBuf || !s_forecast.valid) return false;
+
+  s_barSprite.fillScreen(0);
+  s_barSprite.setFont(&fonts::FreeSans12pt7b);
+  float ts = 0.75f;
+  s_barSprite.setTextSize(ts);
+  int fh = s_barSprite.fontHeight();
+  int ty = (SCALED_BAR_H - fh) / 2;
+  if (ty < 0) ty = 0;
+
+  time_t now = time(nullptr);
+  int cx = 4;
+  s_barSprite.setTextColor(TFT_WHITE);
+
+  // Current temp + conditions from hourly[0]
+  if (s_forecast.hourlyCount > 0) {
+    int temp = s_forecastUseFahrenheit
+      ? s_forecast.hourly[0].tempC * 9 / 5 + 32
+      : s_forecast.hourly[0].tempC;
+    const char* unit = s_forecastUseFahrenheit ? "F" : "C";
+    int kts = (s_forecast.hourly[0].windSpeedKmh * 10) / 19;
+    int deg = s_forecast.hourly[0].windDirDeg16 * 16;
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%d%s %s %dkts",
+             temp, unit, s_forecast.hourly[0].shortForecast, kts);
+    s_barSprite.setCursor(cx, ty);
+    s_barSprite.print(buf);
+    cx += s_barSprite.textWidth(buf) + 12;
+  }
+
+  // Precipitation at key intervals: now, +1h, +3h, +6h, +12h
+  s_barSprite.setTextSize(0.65f);
+  fh = s_barSprite.fontHeight();
+  ty = (SCALED_BAR_H - fh) / 2;
+  static const int intervals[] = {0, 1, 3, 6, 12};
+  for (int k = 0; k < 5 && cx < SCALED_W - 20; k++) {
+    int target = intervals[k];
+    // Find the hourly entry closest to this interval
+    for (int i = 0; i < (int)s_forecast.hourlyCount; i++) {
+      int hoursOut = (int)((s_forecast.hourly[i].startTime - now) / 3600);
+      if (hoursOut < target) continue;
+      if (hoursOut > target + 1) break;
+      char lbl[24];
+      uint16_t color = TFT_WHITE;
+      int pp = s_forecast.hourly[i].precipProbability;
+      if (pp >= 70) color = s_barSprite.color565(100, 180, 255); // blue
+      else if (pp >= 40) color = s_barSprite.color565(255, 220, 50); // yellow
+      if (target == 0) snprintf(lbl, sizeof(lbl), "Now:%d%%", pp);
+      else snprintf(lbl, sizeof(lbl), "+%dh:%d%%", target, pp);
+      s_barSprite.setTextColor(color);
+      s_barSprite.setCursor(cx, ty);
+      s_barSprite.print(lbl);
+      cx += s_barSprite.textWidth(lbl) + 8;
+      break;
+    }
+  }
+
+  // Rain ETA if approaching
+  if (s_forecast.rainEtaMinutes >= 0 && cx < SCALED_W - 30) {
+    char eta[24];
+    if (s_forecast.rainEtaMinutes == 0) snprintf(eta, sizeof(eta), "RAIN NOW");
+    else snprintf(eta, sizeof(eta), "Rain ~%dm", s_forecast.rainEtaMinutes);
+    s_barSprite.setTextColor(s_barSprite.color565(255, 80, 80));
+    s_barSprite.setCursor(cx, ty);
+    s_barSprite.print(eta);
+  }
+
+  copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
+  return true;
+}
+
+// Render one fade frame: apply alpha to decoded bar segment
+static void renderFadeFrame(uint8_t alpha) {
+  if (!s_decodedBarBuf || !s_botBarBuf) return;
+  int segW = s_decodeSegWidth > 0 ? s_decodeSegWidth : SCALED_W;
+  if (alpha == 0) {
+    memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
+    return;
+  }
+  for (int row = 0; row < SCALED_BAR_H; row++) {
+    const uint16_t* src = s_decodedBarBuf + row * SCALED_W;
+    uint16_t* dst = s_botBarBuf + row * SCALED_W;
+    for (int x = 0; x < SCALED_W; x++) {
+      if (x >= segW) { dst[x] = 0; continue; }
+      uint16_t px = src[x];
+      if (px == 0 || alpha == 255) { dst[x] = (x < segW) ? px : 0; continue; }
+      uint8_t r = ((px >> 11) & 0x1F) * alpha / 255;
+      uint8_t g = ((px >> 5) & 0x3F) * alpha / 255;
+      uint8_t b = (px & 0x1F) * alpha / 255;
+      dst[x] = (r << 11) | (g << 5) | b;
+    }
+  }
+}
+
 #if INDEPENDENT_TICKER
 static void tickerTask(void*) {
   int dReveal = 0;
@@ -4181,7 +4288,22 @@ static void tickerTask(void*) {
       return;
     }
 
-    if (s_botBarBuf && s_amoledOut && !isCleanMode() && !s_fullscreenMode && s_tickerMode != TICKER_NONE) {
+    bool tickerHidden = isCleanMode() || s_fullscreenMode || s_tickerMode == TICKER_NONE;
+    // When transitioning to hidden, push one black bar to clear the AMOLED rows
+    {
+      static bool wasHidden = false;
+      if (tickerHidden && !wasHidden && s_botBarBuf && s_amoledOut && s_amoledMutex) {
+        memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
+        if (xSemaphoreTake(s_amoledMutex, portMAX_DELAY)) {
+          const int amoledY = (AMOLED_HEIGHT - SCALED_H) / 2 + (SCALED_H - SCALED_BAR_H);
+          s_amoledOut->draw16bitRGBBitmap(0, amoledY, s_botBarBuf, SCALED_W, SCALED_BAR_H);
+          xSemaphoreGive(s_amoledMutex);
+        }
+      }
+      wasHidden = tickerHidden;
+    }
+
+    if (s_botBarBuf && s_amoledOut && !tickerHidden) {
       bool needsPush = false;
 
       if (s_tickerMode == TICKER_SCROLL && s_tickerWidth > 0 && s_tickerBuf) {
@@ -4219,6 +4341,46 @@ static void tickerTask(void*) {
           if (dReveal > s_decodeCharCount) { dHold = true; dHoldMs = millis(); }
         }
         renderDecodeFrame(dReveal);
+        needsPush = true;
+      } else if (s_tickerMode == TICKER_FADE && s_decodedBarBuf) {
+        // Fade: black → full → black, 1s fade in, 3s hold, 1s fade out = 5s per segment
+        static uint32_t fadeStartMs = 0;
+        static int fadeSegIdx = 0;
+        static bool fadeInitialized = false;
+        if (!fadeInitialized) { fadeStartMs = millis(); fadeInitialized = true; }
+        uint32_t elapsed = millis() - fadeStartMs;
+        const uint32_t fadeInMs = 1000, holdMs = 3000, fadeOutMs = 1000;
+        const uint32_t totalMs = fadeInMs + holdMs + fadeOutMs;
+        uint8_t alpha;
+        if (elapsed < fadeInMs) {
+          alpha = (uint8_t)(elapsed * 255 / fadeInMs);
+        } else if (elapsed < fadeInMs + holdMs) {
+          alpha = 255;
+        } else if (elapsed < totalMs) {
+          alpha = (uint8_t)((totalMs - elapsed) * 255 / fadeOutMs);
+        } else {
+          alpha = 0;
+          // Advance to next daily segment
+          if (s_tickerBuf && s_tickerSegCount > 0 && s_decodedBarBuf) {
+            int cycleCount = (s_tickerDailyCount > 0) ? s_tickerDailyCount : s_tickerSegCount;
+            fadeSegIdx = (fadeSegIdx + 1) % cycleCount;
+            int segStart = s_tickerSegX[fadeSegIdx];
+            int segEnd = (fadeSegIdx + 1 < s_tickerSegCount) ? s_tickerSegX[fadeSegIdx + 1] : s_tickerWidth;
+            int segW = min(segEnd - segStart, SCALED_W);
+            s_decodeSegWidth = segW;
+            memset(s_decodedBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
+            if (segW > 0) {
+              for (int row = 0; row < SCALED_BAR_H; row++)
+                memcpy(s_decodedBarBuf + row * SCALED_W,
+                       s_tickerBuf + row * s_tickerWidth + segStart, segW * 2);
+            }
+          }
+          fadeStartMs = millis();
+        }
+        renderFadeFrame(alpha);
+        needsPush = true;
+      } else if (s_tickerMode == TICKER_NOWCAST) {
+        // Static display — just re-push existing s_botBarBuf (rendered once at setup)
         needsPush = true;
       }
 
@@ -5888,6 +6050,10 @@ static void drawMoonComplication() {
 // On other boards: draws into sprite bar rows then scales.
 static void updateBarBufs(int frameIdx, bool skipBottomBar) {
   if (!s_topBarBuf || !s_botBarBuf) return;
+#if INDEPENDENT_TICKER
+  // Ticker task owns the bottom bar — never overwrite it from the main thread
+  if (s_tickerTaskHandle) skipBottomBar = true;
+#endif
 #if BOARD_IS_AMOLED_206
   if (s_hurricaneMode) renderHurricaneStormBars(frameIdx, skipBottomBar);
   else renderBarsAtScaledRes(frameIdx, skipBottomBar);
@@ -13366,10 +13532,15 @@ void loop() {
     }
   }
   bool tickerReady = false;
-  if (s_tickerWidth > 0) {
-    if (s_tickerMode == TICKER_DECODE) {
+  if (s_tickerMode == TICKER_NOWCAST && s_forecast.valid) {
+    tickerReady = renderNowcastBar();
+  } else if (s_tickerWidth > 0) {
+    if (s_tickerMode == TICKER_DECODE || s_tickerMode == TICKER_FADE) {
       tickerReady = renderDecodeBarImages();
-      if (tickerReady) renderDecodeFrame(0);
+      if (tickerReady) {
+        if (s_tickerMode == TICKER_DECODE) renderDecodeFrame(0);
+        else renderFadeFrame(0);
+      }
     } else if (s_tickerMode != TICKER_NONE) {
       tickerCopyWindow(s_tickerScrollPx);
       tickerReady = true;
