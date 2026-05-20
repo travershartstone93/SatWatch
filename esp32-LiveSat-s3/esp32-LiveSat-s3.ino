@@ -11271,13 +11271,7 @@ void setup() {
   }
   printMemDiag("POST-ALLOC");
 
-#if INDEPENDENT_TICKER
-  if (!s_tickerTaskHandle) {
-    s_tickerShouldRun = true;
-    xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
-    appendDiagLog("[INIT] ticker task started handle=%p\n", s_tickerTaskHandle);
-  }
-#endif
+  // Ticker task created later in animation setup (after progress bar task stops)
 
   // ── Determine boot type ───────────────────────────────────
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -12777,7 +12771,25 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
   // then push the full frame. Restoring s_dlBuf after each push keeps the
   // background clean for the next tick without re-reading from SD.
   copyClockFxSpriteToMainSprite(l);    // blit into s_frameDisplayBuf (SCALED coords)
-  presentScaledBuf(s_frameDisplayBuf); // full-frame push at display resolution
+#if INDEPENDENT_TICKER
+  // Partial push: only clock region rows (~11ms vs ~36ms full frame).
+  if (s_amoledOut && s_frameDisplayBuf && l.bgH > 0) {
+    const int outY = (AMOLED_HEIGHT - SCALED_H) / 2;
+    int r0 = l.bgY;
+    int r1 = l.bgY + l.bgH;
+    if (r0 < 0) r0 = 0;
+    if (r1 > SCALED_H - SCALED_BAR_H) r1 = SCALED_H - SCALED_BAR_H;
+    int rows = r1 - r0;
+    if (rows > 0) {
+      if (s_amoledMutex) xSemaphoreTake(s_amoledMutex, portMAX_DELAY);
+      s_amoledOut->draw16bitRGBBitmap(0, outY + r0,
+        s_frameDisplayBuf + (size_t)r0 * SCALED_W, SCALED_W, rows);
+      if (s_amoledMutex) xSemaphoreGive(s_amoledMutex);
+    }
+  }
+#else
+  presentScaledBuf(s_frameDisplayBuf);
+#endif
   restoreSpriteRegionFromDlBuf(l);     // restore clean bg in s_frameDisplayBuf
 }
 
@@ -13246,6 +13258,16 @@ void loop() {
   }
   if (s_tickerWidth > 0) {
     tickerCopyWindow(s_tickerScrollPx);
+#if INDEPENDENT_TICKER
+    // Create ticker task here (not in setup) — after progress bar task is stopped.
+    // Progress bar writes AMOLED without mutex; ticker writes with mutex.
+    // Creating during sync causes SPI bus corruption from preemption.
+    if (!s_tickerTaskHandle) {
+      s_tickerShouldRun = true;
+      xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
+      appendDiagLog("[INIT] ticker task started handle=%p\n", s_tickerTaskHandle);
+    }
+#endif
   } else {
     updateBarBufs(newestIdx);  // fallback: static bottom bar
   }
