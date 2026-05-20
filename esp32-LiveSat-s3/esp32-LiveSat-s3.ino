@@ -5896,9 +5896,22 @@ static void cycleDisplayMode() {
   s_hurricaneHintDrawn = false;
 }
 
+static uint16_t* s_moonFlashSaved = nullptr;
+static uint16_t* s_moonFlashTarget = nullptr;  // which moon buffer was flashed
+static uint32_t  s_moonFlashRestoreMs = 0;
+
 static void pollCleanModeToggle() {
   if (!s_cleanModeFeatureEnabled) return;
   if (!s_touchInitialized) initCleanModeTouch();
+
+  // Restore moon after flash timeout
+  if (s_moonFlashRestoreMs > 0 && millis() >= s_moonFlashRestoreMs && s_moonFlashSaved && s_moonFlashTarget) {
+    const int mp = MOON_DECODED_PX;
+    memcpy(s_moonFlashTarget, s_moonFlashSaved, (size_t)mp * mp * 2);
+    s_moonDrawn = false;
+    s_moonFlashRestoreMs = 0;
+    s_moonFlashTarget = nullptr;
+  }
 
   // --- Fullscreen mode: triple-tap anywhere to exit ---
   if (s_fullscreenMode) {
@@ -5947,22 +5960,28 @@ static void pollCleanModeToggle() {
   int16_t tx = 0, ty = 0;
   uint8_t touching = s_ftPresent ? readFtTouchPoint(&tx, &ty) : 0;
 
-  bool onMoon = false;
+  // Detect which moon was tapped: -1=none, 0=left, 1=center, 2=right
+  static int8_t s_tappedMoon = -1;
+  int8_t whichMoon = -1;
   if (touching > 0) {
     lastTouchMs = millis();
-    const int moonX1 = 178, moonY1 = 439;
-    const int moonX2 = moonX1 + 54, moonY2 = moonY1 + 54;
-    onMoon = (tx >= moonX1 && tx <= moonX2 && ty >= moonY1 && ty <= moonY2);
+    const int mp = MOON_DECODED_PX;  // 54
+    const int gap = mp / 2;          // 27
+    const int totalW = mp * 3 + gap * 2;
+    const int baseX = (SCALED_W - totalW) / 2;  // 97
+    const int moonY1 = 439, moonY2 = moonY1 + mp;
+    if (ty >= moonY1 && ty <= moonY2) {
+      if (tx >= baseX && tx < baseX + mp) whichMoon = 0;                           // left
+      else if (tx >= baseX + mp + gap && tx < baseX + mp + gap + mp) whichMoon = 1; // center
+      else if (tx >= baseX + mp * 2 + gap * 2 && tx < baseX + mp * 3 + gap * 2) whichMoon = 2; // right
+    }
   }
 
-  // New touch down on moon: start tracking
+  // New touch down on any moon: start tracking
   if (irqFired && pressStartMs == 0) {
-    if (touching == 0) {
-      // Fast tap: finger lifted before I2C poll — no coords available.
-      // Can't verify it was on the moon zone, so discard.
-      return;
-    }
-    if (!s_ftPresent || !onMoon) return;  // no touch IC or not on moon
+    if (touching == 0) return;
+    if (!s_ftPresent || whichMoon < 0) return;
+    s_tappedMoon = whichMoon;
     pressStartMs = millis();
     longHandled = false;
     return;
@@ -5984,7 +6003,87 @@ static void pollCleanModeToggle() {
       static uint32_t lastToggleMs = 0;
       uint32_t now = millis();
       if (now - lastToggleMs >= 300) {
-        cycleDisplayMode();
+        // Determine which moon buffer to flash
+        uint16_t* flashBuf = nullptr;
+        if (s_tappedMoon == 0 && s_moonPrevBuf) flashBuf = s_moonPrevBuf;
+        else if (s_tappedMoon == 1 && s_moonBuf) flashBuf = s_moonBuf;
+        else if (s_tappedMoon == 2 && s_moonNextBuf) flashBuf = s_moonNextBuf;
+
+        // Flash the tapped moon to bright circle
+        if (flashBuf && s_amoledOut) {
+          const int mp = MOON_DECODED_PX;
+          size_t moonBytes = (size_t)mp * mp * 2;
+          if (!s_moonFlashSaved)
+            s_moonFlashSaved = (uint16_t*)heap_caps_malloc(moonBytes, MALLOC_CAP_SPIRAM);
+          if (s_moonFlashSaved) {
+            s_moonFlashTarget = flashBuf;
+            memcpy(s_moonFlashSaved, flashBuf, moonBytes);
+            int hx = mp / 2, hy = mp / 2, r = mp / 2 - 1;
+            for (int y = 0; y < mp; y++)
+              for (int x = 0; x < mp; x++) {
+                int d2 = (x - hx) * (x - hx) + (y - hy) * (y - hy);
+                if (d2 <= r * r) {
+                  uint8_t b = (d2 < r * r * 3 / 4) ? 255
+                    : (uint8_t)(255 - (d2 - r * r * 3 / 4) * 200 / (r * r / 4));
+                  flashBuf[y * mp + x] = ((b >> 3) << 11) | ((b >> 2) << 5) | (b >> 3);
+                } else {
+                  flashBuf[y * mp + x] = 0;
+                }
+              }
+            s_moonDrawn = false;
+            s_moonFlashRestoreMs = millis() + 300;
+          }
+        }
+
+        // Action depends on which moon was tapped
+        if (s_tappedMoon == 1) {
+          cycleDisplayMode();  // center = cycle clean/time modes
+        } else if (s_tappedMoon == 0 || s_tappedMoon == 2) {
+          // Left = previous, Right = next ticker mode
+          if (s_tappedMoon == 0)
+            s_tickerMode = (s_tickerMode == 0) ? TICKER_NONE : s_tickerMode - 1;
+          else
+            s_tickerMode = (s_tickerMode >= TICKER_NONE) ? 0 : s_tickerMode + 1;
+          s_decodeCharCount = 0;
+          Preferences p; if (p.begin("satwatch", false)) { p.putUChar("tmod", s_tickerMode); p.end(); }
+#if INDEPENDENT_TICKER
+          // Stop ticker task
+          if (s_tickerTaskHandle) {
+            s_tickerShouldRun = false;
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (s_tickerTaskHandle) { vTaskDelete(s_tickerTaskHandle); s_tickerTaskHandle = nullptr; }
+          }
+          // Re-setup ticker with new mode immediately (scroll buffer still valid)
+          if (s_tickerWidth > 0 && s_tickerMode != TICKER_NONE) {
+            bool ready = false;
+            if (s_tickerMode == TICKER_DECODE || s_tickerMode == TICKER_FADE) {
+              ready = renderDecodeBarImages();
+              if (ready) {
+                if (s_tickerMode == TICKER_DECODE) renderDecodeFrame(0);
+                else renderFadeFrame(0);
+              }
+            } else if (s_tickerMode == TICKER_NOWCAST && s_forecast.valid) {
+              ready = renderNowcastBar();
+            } else if (s_tickerMode == TICKER_SCROLL) {
+              s_tickerScrollPx = 0;
+              tickerCopyWindow(0);
+              ready = true;
+            }
+            if (ready && !s_tickerTaskHandle) {
+              s_tickerShouldRun = true;
+              xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
+            }
+          } else if (s_tickerMode == TICKER_NONE && s_botBarBuf) {
+            // Clear bar
+            memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
+            if (s_amoledMutex && xSemaphoreTake(s_amoledMutex, pdMS_TO_TICKS(50))) {
+              const int amoledY = (AMOLED_HEIGHT - SCALED_H) / 2 + (SCALED_H - SCALED_BAR_H);
+              s_amoledOut->draw16bitRGBBitmap(0, amoledY, s_botBarBuf, SCALED_W, SCALED_BAR_H);
+              xSemaphoreGive(s_amoledMutex);
+            }
+          }
+#endif
+        }
         lastToggleMs = now;
       }
     }
