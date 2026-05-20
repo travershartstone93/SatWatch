@@ -645,6 +645,8 @@ struct ForecastData {
 RTC_DATA_ATTR static ForecastData s_forecast = {};
 static bool s_forecastEnabled       = true;
 static bool s_forecastUseFahrenheit = true;
+enum TickerMode : uint8_t { TICKER_SCROLL=0, TICKER_DECODE=1, TICKER_FADE=2, TICKER_RADAR=3, TICKER_NONE=4 };
+static uint8_t s_tickerMode = TICKER_SCROLL;
 static char s_nwsGridUrl[128]       = {};
 static bool s_nwsGridUrlValid       = false;
 static char s_geoCountryCode[4]     = {};   // "CA", "US", "GB", "VG"
@@ -901,6 +903,8 @@ static void loadWifiPortalConfig() {
       // Forecast config
       s_forecastEnabled       = prefs.getBool("fcen", true);
       s_forecastUseFahrenheit = prefs.getBool("fcuf", true);
+      s_tickerMode = prefs.getUChar("tmod", TICKER_SCROLL);
+      if (s_tickerMode > TICKER_NONE) s_tickerMode = TICKER_SCROLL;
       prefs.getString("nwsgu", s_nwsGridUrl, sizeof(s_nwsGridUrl));
       s_nwsGridUrlValid = (s_nwsGridUrl[0] != '\0');
     }
@@ -1444,6 +1448,18 @@ static void sendWifiPortalPage() {
   html += F(">Fahrenheit</option><option value='c'");
   if (!s_forecastUseFahrenheit) html += " selected";
   html += F(">Celsius</option></select></label></div>"
+            "<div style='margin-bottom:8px;'><label>Ticker animation: "
+            "<select name='tmod'><option value='0'");
+  if (s_tickerMode == 0) html += F(" selected");
+  html += F(">Scroll</option><option value='1'");
+  if (s_tickerMode == 1) html += F(" selected");
+  html += F(">Decode</option><option value='2'");
+  if (s_tickerMode == 2) html += F(" selected");
+  html += F(">Fade</option><option value='3'");
+  if (s_tickerMode == 3) html += F(" selected");
+  html += F(">Radar</option><option value='4'");
+  if (s_tickerMode == 4) html += F(" selected");
+  html += F(">None</option></select></label></div>"
             "<p style='font-size:0.85em;color:#aaa;margin:0;'>"
             "Rain approach + hourly + 48hr forecast. NOAA radar + NWS (US/territories) or ECMWF (worldwide).</p>"
             "</div>");
@@ -1634,11 +1650,15 @@ static void handleWifiPortalSave() {
   // Forecast settings
   s_forecastEnabled = s_wifiPortalServer.hasArg("fcen");
   s_forecastUseFahrenheit = (s_wifiPortalServer.arg("fcunit") != "c");
+  { uint8_t tm = (uint8_t)s_wifiPortalServer.arg("tmod").toInt();
+    s_tickerMode = (tm <= TICKER_NONE) ? tm : TICKER_SCROLL;
+    s_tickerWidth = 0; }
   {
     Preferences fPrefs;
     if (fPrefs.begin("satwatch", false)) {
       fPrefs.putBool("fcen", s_forecastEnabled);
       fPrefs.putBool("fcuf", s_forecastUseFahrenheit);
+      fPrefs.putUChar("tmod", s_tickerMode);
       fPrefs.end();
     }
   }
