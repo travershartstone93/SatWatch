@@ -47,8 +47,12 @@
 #include "SensorQMI8658.hpp"
 // FT3168 touch IC accessed via direct I2C (addr 0x38)
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
+#define ESP32QSPI_MAX_PIXELS_AT_ONCE 4096  // reduce SPI transaction overhead (default 1024)
 #include <Arduino_GFX_Library.h>
 #endif
+
+// Toggle independent ticker task (1 = ticker on its own 30fps RTOS task, 0 = embedded in frame push)
+#define INDEPENDENT_TICKER 1
 
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
@@ -372,7 +376,15 @@ static uint16_t* s_botBarBuf = nullptr;
 // Scrolling forecast ticker — wide pre-rendered strip, memcpy window into s_botBarBuf each frame.
 static uint16_t* s_tickerBuf = nullptr;  // wide strip: s_tickerWidth × SCALED_BAR_H
 static int       s_tickerWidth = 0;      // total pixel width of rendered content + padding
-static int       s_tickerScrollPx = 0;   // current scroll offset (advanced by background task)
+static int       s_tickerScrollPx = 0;   // current scroll offset
+
+#if INDEPENDENT_TICKER
+static SemaphoreHandle_t s_amoledMutex = nullptr;
+static TaskHandle_t      s_tickerTaskHandle = nullptr;
+static volatile bool     s_tickerShouldRun = true;
+static uint32_t          s_tickerSkipCount = 0;
+static uint32_t          s_tickerPushCount = 0;
+#endif
 
 
 // Dirty-rect state for clock overlay partial scale.
@@ -4062,6 +4074,50 @@ static void tickerCopyWindow(int scrollX) {
 }
 
 
+#if INDEPENDENT_TICKER
+// Independent ticker task — pushes bottom bar strip to AMOLED at ~30fps.
+// Runs on Core 1 at priority 2 (above main loop). Serialized via s_amoledMutex.
+static void tickerTask(void*) {
+  for (;;) {
+    // Safe shutdown check BEFORE taking mutex
+    if (!s_tickerShouldRun) {
+      s_tickerTaskHandle = nullptr;
+      vTaskDelete(nullptr);
+      return;
+    }
+
+    if (s_tickerWidth > 0 && s_tickerBuf && s_botBarBuf && s_amoledOut &&
+        !isCleanMode() && !s_fullscreenMode) {
+      // Advance scroll (safe outside mutex — only this task writes it)
+      s_tickerScrollPx += 3;
+      if (s_tickerScrollPx >= s_tickerWidth) s_tickerScrollPx -= s_tickerWidth;
+
+      if (s_amoledMutex && xSemaphoreTake(s_amoledMutex, portMAX_DELAY)) {
+        // Buffer write + AMOLED push inside mutex to prevent race
+        tickerCopyWindow(s_tickerScrollPx);
+        // TE sync insertion point: if tearing at row 399/400 boundary, add
+        // GPIO13 (CO5300 TE pin) interrupt wait here. Implementation:
+        // attachInterrupt(13, teISR, RISING) → wait for flag → clear flag.
+        const int amoledY = (AMOLED_HEIGHT - SCALED_H) / 2 + (SCALED_H - SCALED_BAR_H);
+        s_amoledOut->draw16bitRGBBitmap(0, amoledY, s_botBarBuf, SCALED_W, SCALED_BAR_H);
+        xSemaphoreGive(s_amoledMutex);
+        s_tickerPushCount++;
+        if (s_tickerPushCount % 100 == 0) {
+          appendDiagLog("[TICKER] push=%u skip=%u contention=%.1f%%\n",
+            (unsigned)s_tickerPushCount, (unsigned)s_tickerSkipCount,
+            (s_tickerPushCount + s_tickerSkipCount) > 0
+              ? (float)s_tickerSkipCount * 100.0f / (float)(s_tickerPushCount + s_tickerSkipCount)
+              : 0.0f);
+        }
+      } else {
+        s_tickerSkipCount++;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(32 + (esp_random() & 3)));
+  }
+}
+#endif
+
 // Render timestamp bar text directly at display resolution.
 // Top rows use SCALED_TOP_ROW_H; bottom row uses SCALED_BAR_H.
 // into s_topBarBuf / s_botBarBuf. Avoids the 2× vertical upscale that makes bitmap
@@ -5653,18 +5709,22 @@ static void pollCleanModeToggle() {
 // even during long hold/zoom/terrain stages.
 static void delayWithInputPoll(uint32_t ms) {
   uint32_t start = millis();
+#if !INDEPENDENT_TICKER
   uint32_t lastPush = millis();
+#endif
   while (millis() - start < ms) {
     serviceUserButtons();
     pollCleanModeToggle();
+#if !INDEPENDENT_TICKER
     uint32_t now = millis();
     if (s_tickerWidth > 0 && s_frameDisplayBuf && now - lastPush >= 85) {
       lastPush = now;
       presentScaledBuf(s_frameDisplayBuf);
     }
+#endif
     uint32_t elapsed = millis() - start;
     uint32_t remain = (elapsed < ms) ? (ms - elapsed) : 0;
-    if (remain > 0) delay(min(remain, (uint32_t)10));
+    if (remain > 0) delay(min(remain, (uint32_t)50));
   }
 }
 
@@ -5725,6 +5785,10 @@ static void applyBarsToBuf(uint16_t* buf) {
   size_t botBarBytes = (size_t)SCALED_W * (size_t)SCALED_BAR_H * 2U;
   if (isCleanMode()) {
     memset(buf + (size_t)botY * SCALED_W, 0, botBarBytes);
+#if INDEPENDENT_TICKER
+  } else if (s_tickerTaskHandle) {
+    // Ticker task owns bottom bar — don't stamp into frame buffer
+#endif
   } else {
     memcpy(buf + (size_t)botY * SCALED_W, s_botBarBuf, botBarBytes);
   }
@@ -5739,7 +5803,8 @@ static void presentScaledBuf(uint16_t* src) {
   if (!s_amoledOut || !src) return;
 
   // Shared chunk buffer (used by both normal and fullscreen paths)
-  static const int CHUNK_ROWS = 8;
+  // 60 rows divides evenly into 360 (6 chunks). Fewer chunks = less address window overhead.
+  static const int CHUNK_ROWS = 60;
   static uint16_t* s_chunkBuf = nullptr;
   if (!s_chunkBuf) s_chunkBuf = (uint16_t*)heap_caps_malloc((size_t)CHUNK_ROWS * SCALED_W * 2U, MALLOC_CAP_SPIRAM);
   if (!s_chunkBuf) return;
@@ -5774,7 +5839,8 @@ static void presentScaledBuf(uint16_t* src) {
   }
 
   // --- Normal path ---
-  // Advance ticker scroll at ~12fps with small steps for smooth motion.
+#if !INDEPENDENT_TICKER
+  // Inline ticker advancement (fallback when independent task is disabled)
   {
     static uint32_t s_lastTickerAdvance = 0;
     uint32_t now = millis();
@@ -5785,6 +5851,7 @@ static void presentScaledBuf(uint16_t* src) {
       tickerCopyWindow(s_tickerScrollPx);
     }
   }
+#endif
   applyBarsToBuf(src);
 
   // Time-always-on: stamp clock into src, push to AMOLED, then restore src
@@ -5853,11 +5920,33 @@ static void presentScaledBuf(uint16_t* src) {
   const int outH = SCALED_H;   // 360
   const int outX = 0;
   const int outY = (AMOLED_HEIGHT - outH) / 2;  // (502-360)/2 = 71
+  static uint32_t s_presentCount = 0;
+  static uint64_t s_presentUsTotal = 0;
+  int64_t presentStart = esp_timer_get_time();
+#if INDEPENDENT_TICKER
+  // Ticker task owns bottom bar rows (329-359) — push only 0-328.
+  // Row 399 on panel is last main-loop row; row 400 is first ticker row.
+  const int pushH = s_tickerTaskHandle ? (outH - SCALED_BAR_H) : outH;
+  if (s_amoledMutex) xSemaphoreTake(s_amoledMutex, portMAX_DELAY);
+  for (int cy = 0; cy < pushH; cy += CHUNK_ROWS) {
+    int rows = CHUNK_ROWS;
+    if (cy + rows > pushH) rows = pushH - cy;
+    s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, src + cy * outW, outW, rows);
+  }
+  if (s_amoledMutex) xSemaphoreGive(s_amoledMutex);
+#else
   for (int cy = 0; cy < outH; cy += CHUNK_ROWS) {
     int rows = CHUNK_ROWS;
     if (cy + rows > outH) rows = outH - cy;
-    memcpy(s_chunkBuf, src + cy * outW, (size_t)rows * outW * 2U);
-    s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, s_chunkBuf, outW, rows);
+    s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, src + cy * outW, outW, rows);
+  }
+#endif
+  int64_t presentEnd = esp_timer_get_time();
+  s_presentCount++;
+  s_presentUsTotal += (uint64_t)(presentEnd - presentStart);
+  if (s_presentCount % 100 == 0) {
+    appendDiagLog("[PERF] present x%u: avg=%lluus\n",
+      (unsigned)s_presentCount, s_presentUsTotal / s_presentCount);
   }
 
   // Restore clean buffer so terrain crossfade / subsequent reads see no clock residue
@@ -7601,14 +7690,22 @@ static bool decodeJpegFrameToSprite(int idx, bool rejectBlank) {
 // Fast path: read frame from stream file directly into sprite and push to LCD.
 // Runtime guards still reject black/partial/corrupted reads before display.
 // Returns false if frame is invalid/missing (caller should hold previous frame).
+static uint32_t s_showFrameCount = 0;
+static uint64_t s_showFrameSdUsTotal = 0;
+static uint64_t s_showFramePresentUsTotal = 0;
+
 static bool showFrame(int idx, bool skipBottomBar = false) {
   if (!s_streamReady || !s_streamFile || idx >= frameCount || !s_streamValid[idx]) return false;
   if (!s_frameDisplayBuf) return false;
 
   int phys = ((int)s_idx.head + idx) % MAX_FRAMES;
   uint32_t offset = (uint32_t)phys * (uint32_t)SCALED_FRAME_BYTES;
+
+  int64_t t0 = esp_timer_get_time();
   bool seekOk = s_streamFile.seek(offset);
   size_t got = s_streamFile.read((uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+  int64_t t1 = esp_timer_get_time();
+
   if (!seekOk || got != SCALED_FRAME_BYTES) {
     invalidateStreamSlot(idx, "short-read");
     appendDiagLog("showFrame: read-fail idx=%d got=%u seek=%d\n",
@@ -7617,6 +7714,17 @@ static bool showFrame(int idx, bool skipBottomBar = false) {
   }
   updateBarBufs(idx, skipBottomBar);
   presentScaledBuf(s_frameDisplayBuf);
+  int64_t t2 = esp_timer_get_time();
+
+  s_showFrameCount++;
+  s_showFrameSdUsTotal += (uint64_t)(t1 - t0);
+  s_showFramePresentUsTotal += (uint64_t)(t2 - t1);
+  if (s_showFrameCount % 50 == 0) {
+    appendDiagLog("[PERF] showFrame x%u: sdRead avg=%lluus  present avg=%lluus\n",
+      (unsigned)s_showFrameCount,
+      s_showFrameSdUsTotal / s_showFrameCount,
+      s_showFramePresentUsTotal / s_showFrameCount);
+  }
   return true;
 }
 
@@ -10523,6 +10631,16 @@ static void rebuildRawFromStored() {
 // ─────────────────────────────────────────────────────────────
 static void goToSleep(bool buttonOnly = false) {
   Serial.printf("Sleeping %d h...\n", SLEEP_HOURS);
+#if INDEPENDENT_TICKER
+  // Safe ticker teardown: signal stop, wait for task to exit, then force-delete as safety net.
+  // Task checks s_tickerShouldRun BEFORE taking mutex, so it won't hold mutex when deleted.
+  s_tickerShouldRun = false;
+  vTaskDelay(pdMS_TO_TICKS(50));
+  if (s_tickerTaskHandle) {
+    vTaskDelete(s_tickerTaskHandle);
+    s_tickerTaskHandle = nullptr;
+  }
+#endif
   s_buttonSleepTransition = true;
   closeStream();
 
@@ -10987,10 +11105,26 @@ size_t getArduinoLoopTaskStackSize() { return 32768; }
 // ─────────────────────────────────────────────────────────────
 //  setup()
 // ─────────────────────────────────────────────────────────────
+static void printMemDiag(const char* label) {
+  Serial.printf("[MEM %s] PSRAM: %u/%u  Heap: %u/%u  MaxAlloc: %u\n",
+    label,
+    (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
+    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
+    (unsigned)ESP.getMaxAllocHeap());
+  appendDiagLog("[MEM %s] PSRAM: %u/%u  Heap: %u/%u  MaxAlloc: %u\n",
+    label,
+    (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
+    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
+    (unsigned)ESP.getMaxAllocHeap());
+}
+
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 5000) delay(10);  // wait for USB host to open port
   delay(500);
+
+  Serial.printf("\n\n=== BOOT resetReason=%d millis=%lu ===\n", (int)esp_reset_reason(), millis());
+  printMemDiag("BOOT");
 
   // Generate per-device AP password from chip MAC (unique, not guessable)
   {
@@ -10999,7 +11133,9 @@ void setup() {
              (unsigned long)(mac % 1000000000ULL));
   }
 
+  Serial.println("[INIT] Wire.begin");
   Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
+  Serial.println("[INIT] loadWifiPortalConfig");
   loadWifiPortalConfig();  // needed before QMI decision below
   if (s_shakeToWakeEnabled && s_sleepModeEnabled) {
     initQmiShakeToWake();
@@ -11009,6 +11145,8 @@ void setup() {
   Serial.printf("free heap: %u\n", (unsigned)ESP.getFreeHeap());
   Serial.println("\n== Geo Weather Loop ==");
 
+  Serial.println("[INIT] display");
+  printMemDiag("PRE-DISPLAY");
   // ── Display ───────────────────────────────────────────────
   // Display bus setup is handled by LovyanGFX above.
 #if !BOARD_IS_AMOLED_206
@@ -11036,7 +11174,16 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
 #endif
 
+  Serial.println("[INIT] display done");
+  printMemDiag("POST-DISPLAY");
+
+#if INDEPENDENT_TICKER
+  s_amoledMutex = xSemaphoreCreateMutex();
+  appendDiagLog("[INIT] ticker mutex created\n");
+#endif
+
 #if BOARD_IS_AMOLED_206 || BOARD_HAS_PHYSICAL_BOOT_WAKE
+  Serial.println("[INIT] button task");
   pinMode(BOOT_BTN_GPIO, INPUT_PULLUP);  // keep BOOT ready for wake-from-sleep
   syncTopButtonStateNow();
   if (!s_topBtnPollTaskHandle) {
@@ -11058,6 +11205,8 @@ void setup() {
   Serial.printf("Free heap: %u\n", (unsigned)ESP.getFreeHeap());
 
   // ── SD card (try 40MHz first, fall back to 20MHz) ──────────
+  Serial.println("[INIT] SD mount");
+  printMemDiag("PRE-SD");
   showMessage("Mounting SD...", nullptr);
   bool sdOk = false;
 #if BOARD_IS_AMOLED_206
@@ -11106,6 +11255,9 @@ void setup() {
 #endif
 
   // ── Allocate pre-scaled display PSRAM buffers ─────────────────────────────
+  Serial.println("[INIT] PSRAM alloc");
+  appendDiagLog("[INIT] PSRAM alloc ms=%lu\n", millis());
+  printMemDiag("PRE-ALLOC");
   if (!s_frameDisplayBuf) {
     s_frameDisplayBuf  = (uint16_t*)heap_caps_malloc(SCALED_FRAME_BYTES, MALLOC_CAP_SPIRAM);
     s_terrainDisplayBuf = (uint16_t*)heap_caps_malloc(SCALED_FRAME_BYTES, MALLOC_CAP_SPIRAM);
@@ -11113,9 +11265,19 @@ void setup() {
     size_t botBarBytes = (size_t)SCALED_W * (size_t)SCALED_BAR_H * 2U;
     s_topBarBuf = (uint16_t*)heap_caps_calloc(1, topBarBytes, MALLOC_CAP_SPIRAM);
     s_botBarBuf = (uint16_t*)heap_caps_calloc(1, botBarBytes, MALLOC_CAP_SPIRAM);
-    Serial.printf("PSRAM bufs: %s\n",
+    Serial.printf("PSRAM bufs: frame=%p terrain=%p top=%p bot=%p %s\n",
+      s_frameDisplayBuf, s_terrainDisplayBuf, s_topBarBuf, s_botBarBuf,
       (s_frameDisplayBuf && s_terrainDisplayBuf && s_topBarBuf && s_botBarBuf) ? "OK" : "FAIL");
   }
+  printMemDiag("POST-ALLOC");
+
+#if INDEPENDENT_TICKER
+  if (!s_tickerTaskHandle) {
+    s_tickerShouldRun = true;
+    xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
+    appendDiagLog("[INIT] ticker task started handle=%p\n", s_tickerTaskHandle);
+  }
+#endif
 
   // ── Determine boot type ───────────────────────────────────
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
@@ -11376,6 +11538,8 @@ void setup() {
 #else
   tft.setBrightness(s_displayBrightness);
 #endif
+  printMemDiag("SETUP-END");
+  Serial.printf("=== setup() complete millis=%lu ===\n", millis());
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -12422,6 +12586,9 @@ static bool runTerrainCrossfadeSegment(int newestIdx, bool baseAlreadyShown) {
     prevTargetRows = targetRows;
     prevFullRows = fullRows;
     presentScaledBuf(s_frameDisplayBuf);
+#if INDEPENDENT_TICKER
+    taskYIELD();  // let ticker task grab mutex in the gap after push
+#endif
 
     uint32_t stepDeadline = startMs + (uint32_t)(((uint64_t)step * totalMs) / (uint64_t)steps);
     int32_t waitMs = (int32_t)(stepDeadline - millis());
@@ -13225,7 +13392,16 @@ void loop() {
           if (s_hurricaneMode) {
             // Skip terrain crossfade in hurricane mode — not relevant
             baseForClockOverlay = true;
-          } else if (runTerrainCrossfadeSegment(newestIdx, true)) {
+          } else if (({
+#if INDEPENDENT_TICKER
+            uint32_t _wPush0 = s_tickerPushCount, _wSkip0 = s_tickerSkipCount;
+#endif
+            bool _wOk = runTerrainCrossfadeSegment(newestIdx, true);
+#if INDEPENDENT_TICKER
+            appendDiagLog("[TICKER-DURING-WIPE] push=%u skip=%u\n",
+              (unsigned)(s_tickerPushCount - _wPush0), (unsigned)(s_tickerSkipCount - _wSkip0));
+#endif
+            _wOk; })) {
             terrainShownForClock = true;
             baseForClockOverlay = terrainShownForClock;
           } else {
