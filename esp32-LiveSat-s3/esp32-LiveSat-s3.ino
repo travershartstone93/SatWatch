@@ -4160,6 +4160,12 @@ static void renderDecodeFrame(int revealIdx) {
       cx += g.w + 2;
     }
   }
+
+  // Ensure nothing leaks past the segment boundary
+  if (segW < SCALED_W) {
+    for (int row = 0; row < SCALED_BAR_H; row++)
+      memset(s_botBarBuf + row * SCALED_W + segW, 0, (SCALED_W - segW) * 2);
+  }
 }
 
 static bool renderDecodeBarImages() {
@@ -9628,7 +9634,7 @@ static bool tryShowCleanFreezeFrameByIdx(int idx) {
   return false;
 }
 
-static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
+static void runFreezeZoom3LocatorCue(uint32_t holdMs, int freezeFrameIdx = -1) {
   if (holdMs == 0) return;
 
   const uint32_t initialDelayMs = (holdMs >= 1000U) ? 1000U : holdMs;
@@ -9675,7 +9681,8 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
   }
 
   // Helper: restore clean frame from SD (the SD read time is part of the visual rhythm)
-  int holdIdx = (s_newestCachedIdx >= 0) ? s_newestCachedIdx : 0;
+  int holdIdx = (freezeFrameIdx >= 0) ? freezeFrameIdx
+              : (s_newestCachedIdx >= 0) ? s_newestCachedIdx : 0;
   auto restoreFrame = [&]() {
     showFrame(holdIdx);
   };
@@ -13798,7 +13805,7 @@ void loop() {
     // and the locator-cue redraws are guaranteed to use the same image.
     presentScaledBuf(s_frameDisplayBuf);
   }
-  runFreezeZoom3LocatorCue(latestFrameHoldMs);
+  runFreezeZoom3LocatorCue(latestFrameHoldMs, holdFrameIdx);
 
   // Zoom + terrain stages — each step is wall-clock governed so decode time is
   // included in the step budget, keeping the total loop time predictable.
