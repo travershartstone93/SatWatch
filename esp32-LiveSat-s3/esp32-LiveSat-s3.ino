@@ -645,6 +645,16 @@ struct ForecastData {
 RTC_DATA_ATTR static ForecastData s_forecast = {};
 static bool s_forecastEnabled       = true;
 static bool s_forecastUseFahrenheit = true;
+
+// Ticker animation modes
+enum TickerMode : uint8_t {
+  TICKER_SCROLL = 0,
+  TICKER_DECODE = 1,
+  TICKER_FADE   = 2,
+  TICKER_RADAR  = 3,
+  TICKER_NONE   = 4,
+};
+static uint8_t s_tickerMode = TICKER_SCROLL;
 static char s_nwsGridUrl[128]       = {};
 static bool s_nwsGridUrlValid       = false;
 static char s_geoCountryCode[4]     = {};   // "CA", "US", "GB", "VG"
@@ -901,6 +911,8 @@ static void loadWifiPortalConfig() {
       // Forecast config
       s_forecastEnabled       = prefs.getBool("fcen", true);
       s_forecastUseFahrenheit = prefs.getBool("fcuf", true);
+      s_tickerMode            = prefs.getUChar("tmod", TICKER_SCROLL);
+      if (s_tickerMode > TICKER_NONE) s_tickerMode = TICKER_SCROLL;
       prefs.getString("nwsgu", s_nwsGridUrl, sizeof(s_nwsGridUrl));
       s_nwsGridUrlValid = (s_nwsGridUrl[0] != '\0');
     }
@@ -1444,6 +1456,18 @@ static void sendWifiPortalPage() {
   html += F(">Fahrenheit</option><option value='c'");
   if (!s_forecastUseFahrenheit) html += " selected";
   html += F(">Celsius</option></select></label></div>"
+            "<div style='margin-bottom:8px;'><label>Ticker animation: "
+            "<select name='tmod'><option value='0'");
+  if (s_tickerMode == TICKER_SCROLL) html += F(" selected");
+  html += F(">Scroll</option><option value='1'");
+  if (s_tickerMode == TICKER_DECODE) html += F(" selected");
+  html += F(">Decode</option><option value='2'");
+  if (s_tickerMode == TICKER_FADE) html += F(" selected");
+  html += F(">Fade</option><option value='3'");
+  if (s_tickerMode == TICKER_RADAR) html += F(" selected");
+  html += F(">Radar</option><option value='4'");
+  if (s_tickerMode == TICKER_NONE) html += F(" selected");
+  html += F(">None</option></select></label></div>"
             "<p style='font-size:0.85em;color:#aaa;margin:0;'>"
             "Rain approach + hourly + 48hr forecast. NOAA radar + NWS (US/territories) or ECMWF (worldwide).</p>"
             "</div>");
@@ -1635,10 +1659,17 @@ static void handleWifiPortalSave() {
   s_forecastEnabled = s_wifiPortalServer.hasArg("fcen");
   s_forecastUseFahrenheit = (s_wifiPortalServer.arg("fcunit") != "c");
   {
+    uint8_t tmod = (uint8_t)s_wifiPortalServer.arg("tmod").toInt();
+    if (tmod > TICKER_NONE) tmod = TICKER_SCROLL;
+    s_tickerMode = tmod;
+    s_tickerWidth = 0;  // force ticker re-render with new mode on next loop
+  }
+  {
     Preferences fPrefs;
     if (fPrefs.begin("satwatch", false)) {
       fPrefs.putBool("fcen", s_forecastEnabled);
       fPrefs.putBool("fcuf", s_forecastUseFahrenheit);
+      fPrefs.putUChar("tmod", s_tickerMode);
       fPrefs.end();
     }
   }
@@ -3980,7 +4011,7 @@ static int renderForecastTicker() {
     if (segs[i].type) totalW += iconDrawW + iconGap;
     totalW += s_barSprite.textWidth(segs[i].text);
   }
-  totalW += entryGap;  // gap between last and first entry on wrap
+  totalW += SCALED_W / 2;  // blank space before ticker wraps
 
   // -- Allocate wide buffer --
   size_t tickerBytes = (size_t)totalW * SCALED_BAR_H * 2;
