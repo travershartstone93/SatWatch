@@ -3923,17 +3923,25 @@ static int renderForecastTicker() {
   for (int i = 0; i < (int)s_forecast.dailyCount && segCount < 28; i++) {
     int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
     if (hoursOut < -12) continue;
-    char dayLabel[16];
-    fmtDayName(s_forecast.daily[i].date, dayLabel, sizeof(dayLabel));
-    // Check if this entry is today
+    char dayLabel[32];
     int32_t off = s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0;
     struct tm entryLt, nowLt;
     time_t entryLocal = s_forecast.daily[i].date + (time_t)off;
     time_t nowLocal = nowUtcFc + (time_t)off;
     gmtime_r(&entryLocal, &entryLt);
     gmtime_r(&nowLocal, &nowLt);
+    // Ordinal suffix for day of month
+    int dom = entryLt.tm_mday;
+    const char* suf = "th";
+    if (dom == 1 || dom == 21 || dom == 31) suf = "st";
+    else if (dom == 2 || dom == 22) suf = "nd";
+    else if (dom == 3 || dom == 23) suf = "rd";
+    char dayName[8];
+    fmtDayName(s_forecast.daily[i].date, dayName, sizeof(dayName));
     if (entryLt.tm_mday == nowLt.tm_mday && entryLt.tm_mon == nowLt.tm_mon)
-      strlcat(dayLabel, "(Today)", sizeof(dayLabel));
+      snprintf(dayLabel, sizeof(dayLabel), "%d%s %s(Today)", dom, suf, dayName);
+    else
+      snprintf(dayLabel, sizeof(dayLabel), "%d%s %s", dom, suf, dayName);
 
     char pType = isPrecipKeyword(s_forecast.daily[i].shortForecast);
 
@@ -4288,7 +4296,7 @@ static void tickerTask(void*) {
       return;
     }
 
-    bool tickerHidden = isCleanMode() || s_fullscreenMode || s_tickerMode == TICKER_NONE;
+    bool tickerHidden = isCleanMode() || s_fullscreenMode;
     // When transitioning to hidden, push one black bar to clear the AMOLED rows
     {
       static bool wasHidden = false;
@@ -4381,6 +4389,33 @@ static void tickerTask(void*) {
         needsPush = true;
       } else if (s_tickerMode == TICKER_NOWCAST) {
         // Static display — just re-push existing s_botBarBuf (rendered once at setup)
+        needsPush = true;
+      } else if (s_tickerMode == TICKER_NONE && s_decodedBarBuf) {
+        // Hard cut: show segment at full opacity, hold, then switch
+        static uint32_t noneStartMs = 0;
+        static int noneSegIdx = 0;
+        static bool noneInitialized = false;
+        if (!noneInitialized) { noneStartMs = millis(); noneInitialized = true; }
+        uint32_t elapsed = millis() - noneStartMs;
+        if (elapsed > 5000) {
+          // Advance to next daily segment
+          if (s_tickerBuf && s_tickerSegCount > 0) {
+            int cycleCount = (s_tickerDailyCount > 0) ? s_tickerDailyCount : s_tickerSegCount;
+            noneSegIdx = (noneSegIdx + 1) % cycleCount;
+            int segStart = s_tickerSegX[noneSegIdx];
+            int segEnd = (noneSegIdx + 1 < s_tickerSegCount) ? s_tickerSegX[noneSegIdx + 1] : s_tickerWidth;
+            int segW = min(segEnd - segStart, SCALED_W);
+            s_decodeSegWidth = segW;
+            memset(s_decodedBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
+            if (segW > 0) {
+              for (int row = 0; row < SCALED_BAR_H; row++)
+                memcpy(s_decodedBarBuf + row * SCALED_W,
+                       s_tickerBuf + row * s_tickerWidth + segStart, segW * 2);
+            }
+          }
+          noneStartMs = millis();
+        }
+        renderFadeFrame(255);  // always full opacity
         needsPush = true;
       }
 
@@ -6054,13 +6089,13 @@ static void pollCleanModeToggle() {
             if (s_tickerTaskHandle) { vTaskDelete(s_tickerTaskHandle); s_tickerTaskHandle = nullptr; }
           }
           // Re-setup ticker with new mode immediately (scroll buffer still valid)
-          if (s_tickerWidth > 0 && s_tickerMode != TICKER_NONE) {
+          if (s_tickerWidth > 0) {
             bool ready = false;
-            if (s_tickerMode == TICKER_DECODE || s_tickerMode == TICKER_FADE) {
+            if (s_tickerMode == TICKER_DECODE || s_tickerMode == TICKER_FADE || s_tickerMode == TICKER_NONE) {
               ready = renderDecodeBarImages();
               if (ready) {
                 if (s_tickerMode == TICKER_DECODE) renderDecodeFrame(0);
-                else renderFadeFrame(0);
+                else renderFadeFrame(s_tickerMode == TICKER_NONE ? 255 : 0);
               }
             } else if (s_tickerMode == TICKER_NOWCAST && s_forecast.valid) {
               ready = renderNowcastBar();
@@ -6072,14 +6107,6 @@ static void pollCleanModeToggle() {
             if (ready && !s_tickerTaskHandle) {
               s_tickerShouldRun = true;
               xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
-            }
-          } else if (s_tickerMode == TICKER_NONE && s_botBarBuf) {
-            // Clear bar
-            memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
-            if (s_amoledMutex && xSemaphoreTake(s_amoledMutex, pdMS_TO_TICKS(50))) {
-              const int amoledY = (AMOLED_HEIGHT - SCALED_H) / 2 + (SCALED_H - SCALED_BAR_H);
-              s_amoledOut->draw16bitRGBBitmap(0, amoledY, s_botBarBuf, SCALED_W, SCALED_BAR_H);
-              xSemaphoreGive(s_amoledMutex);
             }
           }
 #endif
@@ -13634,13 +13661,13 @@ void loop() {
   if (s_tickerMode == TICKER_NOWCAST && s_forecast.valid) {
     tickerReady = renderNowcastBar();
   } else if (s_tickerWidth > 0) {
-    if (s_tickerMode == TICKER_DECODE || s_tickerMode == TICKER_FADE) {
+    if (s_tickerMode == TICKER_DECODE || s_tickerMode == TICKER_FADE || s_tickerMode == TICKER_NONE) {
       tickerReady = renderDecodeBarImages();
       if (tickerReady) {
         if (s_tickerMode == TICKER_DECODE) renderDecodeFrame(0);
-        else renderFadeFrame(0);
+        else renderFadeFrame(s_tickerMode == TICKER_NONE ? 255 : 0);
       }
-    } else if (s_tickerMode != TICKER_NONE) {
+    } else if (s_tickerMode == TICKER_SCROLL) {
       tickerCopyWindow(s_tickerScrollPx);
       tickerReady = true;
     }
