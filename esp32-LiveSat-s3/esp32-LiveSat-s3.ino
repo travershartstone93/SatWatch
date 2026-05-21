@@ -384,6 +384,9 @@ static int       s_tickerScrollPx = 0;   // current scroll offset
 
 #if INDEPENDENT_TICKER
 static SemaphoreHandle_t s_amoledMutex = nullptr;
+// Lock/unlock helpers — safe to call when mutex is nullptr (during early boot)
+#define amoledLock()   do { if (s_amoledMutex) xSemaphoreTake(s_amoledMutex, portMAX_DELAY); } while(0)
+#define amoledUnlock() do { if (s_amoledMutex) xSemaphoreGive(s_amoledMutex); } while(0)
 static TaskHandle_t      s_tickerTaskHandle = nullptr;
 static volatile bool     s_tickerShouldRun = true;
 static uint32_t          s_tickerSkipCount = 0;
@@ -3259,6 +3262,7 @@ static void showMessage(const char* line1, const char* line2 = nullptr) {
   int screenW = s_amoledOut ? s_amoledOut->width()  : AMOLED_WIDTH;
   int screenH = s_amoledOut ? s_amoledOut->height() : AMOLED_HEIGHT;
   uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;  // visible dark red or black
+  amoledLock();
   if (s_amoledOut) s_amoledOut->fillScreen(bg);
   if (s_amoledOut) {
     LGFX_Sprite ts;
@@ -3280,6 +3284,7 @@ static void showMessage(const char* line1, const char* line2 = nullptr) {
     s_amoledOut->draw16bitRGBBitmap(0, msgY, (uint16_t*)ts.getBuffer(), screenW, msgH);
     ts.deleteSprite();
   }
+  amoledUnlock();
   s_amoledClearBeforeNextPresent = true;
 #else
   int screenH = tft.height();
@@ -3393,6 +3398,7 @@ static void drawProgressBarRaw(uint32_t percent, const char* label) {
   uint16_t bg = s_hurricaneMode ? 0xA800 : 0x0000;
   uint16_t trackBg = s_hurricaneMode ? 0xC000 : 0x2104;
 
+  amoledLock();
   if (s_hurricaneMode) {
     s_amoledOut->fillRect(0, 0, screenW, progressTextY - 2, bg);
     int barBottom = barY + barH;
@@ -3418,6 +3424,7 @@ static void drawProgressBarRaw(uint32_t percent, const char* label) {
     s_amoledOut->draw16bitRGBBitmap(0, progressTextY - 2, (uint16_t*)ts.getBuffer(), screenW, txtH);
     ts.deleteSprite();
   }
+  amoledUnlock();
 #else
   int screenW = tft.width();
   int screenH = tft.height();
@@ -5091,17 +5098,17 @@ static void drawHurricaneRebootHint(uint16_t* buf) {
   int borderH = AMOLED_HEIGHT - frameBottom;  // 71px
 
   // Clear the bottom border
+  amoledLock();
   s_amoledOut->fillRect(0, frameBottom, screenW, borderH, 0x0000);
-
-  // Draw text directly to AMOLED
   const char* hint = "Reboot for local weather";
   s_amoledOut->setTextColor(0xFFFF);
   s_amoledOut->setTextSize(2);
-  int cx = screenW / 2 - (int)(strlen(hint) * 6 * 2) / 2;  // 6px per char at size 1, *2 for size 2
-  int cy = frameBottom + (borderH - 16) / 2;  // 16px tall at size 2
+  int cx = screenW / 2 - (int)(strlen(hint) * 6 * 2) / 2;
+  int cy = frameBottom + (borderH - 16) / 2;
   if (cx < 2) cx = 2;
   s_amoledOut->setCursor(cx, cy);
   s_amoledOut->print(hint);
+  amoledUnlock();
 
   s_hurricaneHintDrawn = true;
 }
@@ -5914,12 +5921,16 @@ static void updateBarBufs(int frameIdx, bool skipBottomBar = false);  // forward
 
 static void enterFullscreen() {
   s_fullscreenMode = true;
+  amoledLock();
   if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
+  amoledUnlock();
 }
 
 static void exitFullscreen() {
   s_fullscreenMode = false;
+  amoledLock();
   if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
+  amoledUnlock();
   s_moonDrawn = false;
   s_hurricaneHintDrawn = false;
   updateBarBufs(s_newestCachedIdx);
@@ -6163,11 +6174,13 @@ static void drawMoonComplication() {
   const int baseX = (SCALED_W - totalW) / 2;
   const int moonY = borderY + (borderH - mp) / 2;
 
+  amoledLock();
   if (s_moonPrevBuf)
     s_amoledOut->draw16bitRGBBitmap(baseX, moonY, s_moonPrevBuf, mp, mp);
   s_amoledOut->draw16bitRGBBitmap(baseX + mp + gap, moonY, s_moonBuf, mp, mp);
   if (s_moonNextBuf)
     s_amoledOut->draw16bitRGBBitmap(baseX + mp * 2 + gap * 2, moonY, s_moonNextBuf, mp, mp);
+  amoledUnlock();
   s_moonDrawn = true;
 }
 
@@ -6245,6 +6258,7 @@ static void presentScaledBuf(uint16_t* src) {
     int cropW = (int)((int64_t)dstW * srcH / dstH);  // 294
     int cropX = (srcW - cropW) / 2;                   // 58
 
+    amoledLock();
     for (int cy = 0; cy < dstH; cy += CHUNK_ROWS) {
       int rows = (cy + CHUNK_ROWS <= dstH) ? CHUNK_ROWS : (dstH - cy);
       for (int r = 0; r < rows; r++) {
@@ -6260,6 +6274,7 @@ static void presentScaledBuf(uint16_t* src) {
       }
       s_amoledOut->draw16bitRGBBitmap(0, cy, s_chunkBuf, dstW, rows);
     }
+    amoledUnlock();
     return;
   }
 
@@ -6335,11 +6350,11 @@ static void presentScaledBuf(uint16_t* src) {
     s_pinOverlayRequested = false;
   }
 
-  if (s_amoledClearBeforeNextPresent) {
-    s_amoledOut->fillScreen(0x0000);
+  bool needsClear = s_amoledClearBeforeNextPresent;
+  if (needsClear) {
     s_amoledClearBeforeNextPresent = false;
-    s_hurricaneHintDrawn = false;  // redraw hint after screen clear
-    s_moonDrawn = false;           // redraw moon after screen clear
+    s_hurricaneHintDrawn = false;
+    s_moonDrawn = false;
   }
   const int outW = SCALED_W;   // 410
   const int outH = SCALED_H;   // 360
@@ -6352,13 +6367,14 @@ static void presentScaledBuf(uint16_t* src) {
   // Ticker task owns bottom bar rows (329-359) — push only 0-328.
   // Row 399 on panel is last main-loop row; row 400 is first ticker row.
   const int pushH = s_tickerTaskHandle ? (outH - SCALED_BAR_H) : outH;
-  if (s_amoledMutex) xSemaphoreTake(s_amoledMutex, portMAX_DELAY);
+  amoledLock();
+  if (needsClear) s_amoledOut->fillScreen(0x0000);
   for (int cy = 0; cy < pushH; cy += CHUNK_ROWS) {
     int rows = CHUNK_ROWS;
     if (cy + rows > pushH) rows = pushH - cy;
     s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, src + cy * outW, outW, rows);
   }
-  if (s_amoledMutex) xSemaphoreGive(s_amoledMutex);
+  amoledUnlock();
 #else
   for (int cy = 0; cy < outH; cy += CHUNK_ROWS) {
     int rows = CHUNK_ROWS;
