@@ -574,7 +574,7 @@ static volatile bool s_bgPhase1WifiOk = false;
 static TaskHandle_t  s_bgSyncTaskHandle = nullptr;
 
 // Per-device AP password derived from chip MAC (generated once at boot)
-static char s_portalApPass[12] = "000000000";
+static char s_portalApPass[12] = "123456789";
 
 // Display preferences (portal "Display" card)
 static uint8_t  s_clockFontIdx      = 1;        // 0=Small(40), 1=Medium(56), 2=Large(72)
@@ -821,6 +821,8 @@ static void loadWifiPortalConfig() {
   memset(s_wifiConfig, 0, sizeof(s_wifiConfig));
   snprintf(s_wifiConfig[0].ssid, sizeof(s_wifiConfig[0].ssid), "%s", WIFI_SSID);
   snprintf(s_wifiConfig[0].pass, sizeof(s_wifiConfig[0].pass), "%s", WIFI_PASS);
+  snprintf(s_wifiConfig[1].ssid, sizeof(s_wifiConfig[1].ssid), "%s", "iPhone");
+  snprintf(s_wifiConfig[1].pass, sizeof(s_wifiConfig[1].pass), "%s", "123456789");
   s_clockUse12Hour = true;
   s_updateMode = UPDATE_MODE_MANUAL;
   s_autoUpdateIntervalMin = 60;
@@ -2275,10 +2277,15 @@ static void audioCueWorkerTask(void* arg) {
     if (xQueueReceive(s_audioCueQueue, &req, portMAX_DELAY) != pdTRUE) continue;
     s_audioCueBusy = true;
     if (s_audioCueReady && s_audioCueBuf && s_audioCueLen > 0) {
+      bool played = false;
       for (int attempt = 0; attempt < 3; attempt++) {
-        if (playRawCueFromBuffer(s_audioCueBuf, s_audioCueLen, req.volume)) break;
+        if (playRawCueFromBuffer(s_audioCueBuf, s_audioCueLen, req.volume)) { played = true; break; }
         vTaskDelay(pdMS_TO_TICKS(200));
       }
+      appendDiagLog("[CUE] played=%d len=%u vol=%d\n", (int)played, (unsigned)s_audioCueLen, (int)req.volume);
+    } else {
+      appendDiagLog("[CUE] worker skip ready=%d buf=%d len=%u\n",
+                    (int)s_audioCueReady, (s_audioCueBuf != nullptr), (unsigned)s_audioCueLen);
     }
     s_audioCueBusy = false;
   }
@@ -2292,7 +2299,7 @@ static void ensureAudioCueWorker() {
     BaseType_t ok = xTaskCreatePinnedToCore(
       audioCueWorkerTask,
       "audio_cue",
-      4096,
+      8192,
       nullptr,
       2,
       &s_audioCueTaskHandle,
@@ -2309,19 +2316,30 @@ static bool playStartCueIfEnabled() {
 #if BOARD_IS_AMOLED_206
   char cuePath[START_CUE_PATH_MAX] = {};
   uint8_t cueVol = 0;
-  if (!resolveSelectedCuePathAndVolume(cuePath, sizeof(cuePath), &cueVol)) return true;
+  if (!resolveSelectedCuePathAndVolume(cuePath, sizeof(cuePath), &cueVol)) {
+    appendDiagLog("[CUE] off (mode=%d)\n", (int)s_startCueMode);
+    return true;
+  }
   if (!s_audioCueReady || strcmp(s_audioCueLoadedPath, cuePath) != 0) {
     if (!preloadSelectedCueToPsram(false)) {
-      Serial.println("audio: cue not ready");
+      appendDiagLog("[CUE] preload fail path=%s\n", cuePath);
       return false;
     }
   }
   ensureAudioCueWorker();
-  if (!s_audioCueQueue || s_audioCueBusy) return false;
+  if (!s_audioCueQueue || s_audioCueBusy) {
+    appendDiagLog("[CUE] queue/busy q=%d b=%d\n", (int)(s_audioCueQueue != nullptr), (int)s_audioCueBusy);
+    return false;
+  }
   AudioCueRequest req{};
   req.volume = cueVol;
-  if (uxQueueSpacesAvailable(s_audioCueQueue) == 0) return false;
-  return (xQueueSend(s_audioCueQueue, &req, 0) == pdTRUE);
+  if (uxQueueSpacesAvailable(s_audioCueQueue) == 0) {
+    appendDiagLog("[CUE] queue full\n");
+    return false;
+  }
+  bool sent = (xQueueSend(s_audioCueQueue, &req, 0) == pdTRUE);
+  appendDiagLog("[CUE] queued=%d vol=%d path=%s\n", (int)sent, (int)cueVol, cuePath);
+  return sent;
 #else
   (void)0;
   return false;
@@ -4026,6 +4044,7 @@ static int renderForecastTicker() {
     int lo = s_forecastUseFahrenheit ? s_forecast.daily[i].lowC * 9 / 5 + 32 : s_forecast.daily[i].lowC;
     const char* unit = s_forecastUseFahrenheit ? "F" : "C";
 
+    bool isToday = (entryTm.tm_mday == nowTm.tm_mday && entryTm.tm_mon == nowTm.tm_mon);
     if (pType && s_forecast.daily[i].precipProbability >= 30) {
       char tb[12] = "";
       fmtLocalTime(s_forecast.daily[i].date, tb, sizeof(tb));
@@ -4034,6 +4053,14 @@ static int renderForecastTicker() {
     } else {
       snprintf(seg.text, sizeof(seg.text), "%s %d/%d%s %s",
                dayLabel, hi, lo, unit, s_forecast.daily[i].shortForecast);
+    }
+    // Append current wind to today's entry
+    if (isToday && s_forecast.hourlyCount > 0) {
+      int kmh = s_forecast.hourly[0].windSpeedKmh;
+      int deg = s_forecast.hourly[0].windDirDeg16 * 16;
+      int kts = (kmh * 10) / 19;
+      int len = strlen(seg.text);
+      snprintf(seg.text + len, sizeof(seg.text) - len, " %dkts %s", kts, degToCompass(deg));
     }
     segs[segCount++] = seg;
   }
@@ -4056,37 +4083,11 @@ static int renderForecastTicker() {
     segs[segCount++] = seg;
   }
 
-  // 3. Hourly precip entries
-  {
-    char lastPtype = 0;
-    for (int i = 0; i < (int)s_forecast.hourlyCount && segCount < 20; i++) {
-      int hoursOut = (int)((s_forecast.hourly[i].startTime - nowUtcFc) / 3600);
-      if (hoursOut < 0) continue;
-      if (hoursOut > 24) break;
-      if (s_forecast.hourly[i].precipProbability < 20) { lastPtype = 0; continue; }
-      char pType = isPrecipKeyword(s_forecast.hourly[i].shortForecast);
-      if (!pType) { lastPtype = 0; continue; }
-      if (pType == lastPtype) continue;
-      lastPtype = pType;
-      TickerSegment seg; seg.type = pType;
-      char tb[12];
-      fmtLocalTime(s_forecast.hourly[i].startTime, tb, sizeof(tb));
-      snprintf(seg.text, sizeof(seg.text), "%s", tb);
-      segs[segCount++] = seg;
-    }
-  }
+  // Hourly precip times folded into today's daily entry — no standalone segments
 
-  // 4. Wind from hourly[0]
-  if (s_forecast.hourlyCount > 0 && segCount < 30) {
-    int kmh = s_forecast.hourly[0].windSpeedKmh;
-    int deg = s_forecast.hourly[0].windDirDeg16 * 16;
-    int kts = (kmh * 10) / 19;
-    TickerSegment seg; seg.type = 0;
-    snprintf(seg.text, sizeof(seg.text), "Wind %dkts %s", kts, degToCompass(deg));
-    segs[segCount++] = seg;
-  }
+  // Wind is appended to today's daily entry (no standalone segment)
 
-  // 5. No data fallback
+  // 4. No data fallback
   if (segCount == 0) {
     segs[segCount++] = {0, "No rain 48h"};
   }
@@ -9594,34 +9595,25 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
       return decodeTerrainCompositeToSprite();  // base terrain + base radar
     }
     if (isTerrainStage && tzRadarPath) {
-      // Deep zoom terrain: decode tz JPEG, then overlay tz radar
+      // Deep zoom terrain: decode tz JPEG, then overlay per-zoom radar
       if (!decodeJpegPathToSprite(path)) return false;
-      // Overlay radar if available (same composite logic as base terrain)
       if (fileExistsNonEmpty(tzRadarPath) && ensureSprite()) {
-        // Save terrain pixels, decode radar, composite, done
-        // Use lightweight overlay: decode radar to temp, blend onto terrain sprite
         size_t spriteSz = RAW_FRAME_BYTES;
         uint16_t* terrainPx = (uint16_t*)heap_caps_malloc(spriteSz, MALLOC_CAP_SPIRAM);
         if (terrainPx) {
           memcpy(terrainPx, sprite.getBuffer(), spriteSz);
           if (decodeJpegPathToSprite(tzRadarPath, true)) {
-            // Composite: overlay radar signal pixels onto terrain
             uint16_t* radarPx = (uint16_t*)sprite.getBuffer();
             for (int i = 0; i < DISP_W * DISP_H; i++) {
-              uint16_t rp = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(radarPx[i]) : radarPx[i];
-              int r = (rp >> 11) & 0x1F, g = ((rp >> 5) & 0x3F) >> 1, b = rp & 0x1F;
+              uint16_t rv = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(radarPx[i]) : radarPx[i];
+              int r = (rv >> 11) & 0x1F, g = ((rv >> 5) & 0x3F) >> 1, b = rv & 0x1F;
               int sat = max(r, max(g, b)) - min(r, min(g, b));
               if (sat >= 5 && (r + g + b) >= 8) {
-                // Radar signal pixel — keep it
-              } else {
-                // Background — restore terrain
-                radarPx[i] = terrainPx[i];
+                terrainPx[i] = radarPx[i];
               }
             }
-          } else {
-            // Radar decode failed — restore terrain
-            memcpy(sprite.getBuffer(), terrainPx, spriteSz);
           }
+          memcpy(sprite.getBuffer(), terrainPx, spriteSz);
           heap_caps_free(terrainPx);
         }
       }
@@ -11883,11 +11875,8 @@ void setup() {
   printMemDiag("BOOT");
 
   // Generate per-device AP password from chip MAC (unique, not guessable)
-  {
-    uint64_t mac = ESP.getEfuseMac();
-    snprintf(s_portalApPass, sizeof(s_portalApPass), "%09lu",
-             (unsigned long)(mac % 1000000000ULL));
-  }
+  // AP password fixed (was MAC-derived)
+  // s_portalApPass already initialized to "123456789"
 
   Serial.println("[INIT] Wire.begin");
   Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
@@ -13537,8 +13526,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
     }
   }
 
-  // Re-draw location pin on top so clock text never occludes it.
-  drawApproxLocationPinOnClockFxSprite(l, nullptr, nullptr, nullptr, nullptr);
+
 
   // Copy blended clock region into s_frameDisplayBuf at display resolution,
   // then push the full frame. Restoring s_dlBuf after each push keeps the
@@ -13622,7 +13610,7 @@ static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadySho
     copyClockFxSpriteToMainSprite(layout);
     presentScaledBuf(s_frameDisplayBuf);
     if (pinLeadMs > 0) delayWithInputPoll(pinLeadMs);
-    // Re-save so pin is part of the animation background (no text-fade flicker).
+    // Re-save WITH pin so it blends behind text inside the clock region.
     saveSpriteRegionToDlBuf(layout);
   }
 
