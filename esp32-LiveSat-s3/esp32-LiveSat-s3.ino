@@ -206,6 +206,16 @@ static NullSerialSink s_nullSerial;
 #define ZOOM_TERRAIN_NIGHT_RAW  SD_ROOT "/frames/terrain_night.raw"
 #define ZOOM_TERRAIN_RADAR_FILE SD_ROOT "/frames/terrain_radar_z3.jpg"
 #define ZOOM_TERRAIN_RADAR_RAW_TMP_FILE SD_ROOT "/frames/.terrain_radar.raw"
+// Deep terrain zoom stages (S2 cloudless): geometric-mean from 250km base to 30km final
+#define TERRAIN_ZOOM_LEVELS 3
+#define TERRAIN_ZOOM_FINAL_W_KM 30.0f
+#define TERRAIN_ZOOM_FINAL_H_KM 16.0f
+#define TERRAIN_Z1_FILE SD_ROOT "/frames/tz1.jpg"
+#define TERRAIN_Z2_FILE SD_ROOT "/frames/tz2.jpg"
+#define TERRAIN_Z3_FILE SD_ROOT "/frames/tz3.jpg"
+#define TERRAIN_Z1_RADAR SD_ROOT "/frames/tz1_radar.jpg"
+#define TERRAIN_Z2_RADAR SD_ROOT "/frames/tz2_radar.jpg"
+#define TERRAIN_Z3_RADAR SD_ROOT "/frames/tz3_radar.jpg"
 #define CACHE_VALIDATE_VERSION 2
 #define ZOOM_META_VERSION 6
 #define WIFI_CONFIG_SLOTS 5
@@ -572,6 +582,8 @@ static uint32_t s_clockColorRGB     = 0xFFFFFF;  // 24-bit RGB for clock text
 static uint8_t  s_displayBrightness = 255;       // AMOLED brightness 0-255
 static uint8_t  s_animSpeedIdx      = 1;         // 0=Fast(7s), 1=Normal(10s), 2=Slow(15s)
 static uint8_t  s_clockDurIdx       = 1;         // 0=Short(4s), 1=Normal(7s), 2=Long(10s)
+static bool     s_deepTerrainZoomEnabled = false;
+static uint8_t  s_deepTerrainZoomLevel   = 2;    // 0=1 stage, 1=2 stages, 2=all 3 stages
 
 // Unified sync progress tracker (single progress bar across full sync pipeline).
 static bool     s_syncProgActive = false;
@@ -914,6 +926,9 @@ static void loadWifiPortalConfig() {
       if (s_animSpeedIdx > 2) s_animSpeedIdx = 1;
       s_clockDurIdx       = prefs.getUChar("clkdur", 1);
       if (s_clockDurIdx > 2) s_clockDurIdx = 1;
+      s_deepTerrainZoomEnabled = prefs.getBool("dtzm", false);
+      s_deepTerrainZoomLevel   = prefs.getUChar("dtzl", 3);
+      if (s_deepTerrainZoomLevel >= TERRAIN_ZOOM_LEVELS) s_deepTerrainZoomLevel = 3;
       // Forecast config
       s_forecastEnabled       = prefs.getBool("fcen", true);
       s_forecastUseFahrenheit = prefs.getBool("fcuf", true);
@@ -948,6 +963,8 @@ static void saveDisplayPrefs() {
   prefs.putUChar("dbrght", s_displayBrightness);
   prefs.putUChar("anispd", s_animSpeedIdx);
   prefs.putUChar("clkdur", s_clockDurIdx);
+  prefs.putBool("dtzm", s_deepTerrainZoomEnabled);
+  prefs.putUChar("dtzl", s_deepTerrainZoomLevel);
   prefs.end();
 }
 
@@ -1469,7 +1486,19 @@ static void sendWifiPortalPage() {
   if (s_clockDurIdx == 1) html += F(" selected");
   html += F(">Normal (7s)</option><option value='2'");
   if (s_clockDurIdx == 2) html += F(" selected");
-  html += F(">Long (10s)</option></select></div>");
+  html += F(">Long (10s)</option></select>"
+            "<div style='margin-top:8px'><label class='flex items-center gap-2 text-sm text-gray-200'>"
+            "<input type='checkbox' name='dtzm' value='1'");
+  if (s_deepTerrainZoomEnabled) html += F(" checked");
+  html += F(">Deep terrain zoom</label>"
+            "<select name='dtzl' style='margin-left:8px'>"
+            "<option value='0'");
+  if (s_deepTerrainZoomLevel == 0) html += F(" selected");
+  html += F(">1 stage</option><option value='1'");
+  if (s_deepTerrainZoomLevel == 1) html += F(" selected");
+  html += F(">2 stages</option><option value='2'");
+  if (s_deepTerrainZoomLevel == 2) html += F(" selected");
+  html += F(">3 stages</option></select></div></div>");
 
   // ── Forecast card ──
   html += F("<div class='card' style='margin-top:14px;'>"
@@ -1682,6 +1711,9 @@ static void handleWifiPortalSave() {
   if (s_animSpeedIdx > 2) s_animSpeedIdx = 1;
   s_clockDurIdx = (uint8_t)s_wifiPortalServer.arg("clkdur").toInt();
   if (s_clockDurIdx > 2) s_clockDurIdx = 1;
+  s_deepTerrainZoomEnabled = s_wifiPortalServer.hasArg("dtzm");
+  { uint8_t dtzl = (uint8_t)s_wifiPortalServer.arg("dtzl").toInt();
+    s_deepTerrainZoomLevel = (dtzl < TERRAIN_ZOOM_LEVELS) ? dtzl : 3; }
   saveDisplayPrefs();
 
   // Forecast settings
@@ -9337,6 +9369,43 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
     appendDiagLog("terrain: ok d=%d n=%d\n", (int)dayAvailable, (int)nightAvailable);
   }
 
+  // Deep terrain zoom stages (S2 cloudless at tighter bboxes)
+  // Always download all 4 terrain zoom levels (portal checkbox only controls display)
+  {
+    static const char* tzPaths[TERRAIN_ZOOM_LEVELS] = {
+      TERRAIN_Z1_FILE, TERRAIN_Z2_FILE, TERRAIN_Z3_FILE
+    };
+    // Geometric-mean zoom: same pattern as weather zooms
+    float tbW = bboxEast - bboxWest;
+    float tbH = bboxNorth - bboxSouth;
+    float cosLat = cosf(s_weatherCenterLat * 0.01745329252f);
+    if (cosLat < 0.2f) cosLat = 0.2f;
+    float baseWKm = tbW * 111.32f * cosLat;
+    float baseHKm = tbH * 111.32f;
+    float tz2w = sqrtf(baseWKm * TERRAIN_ZOOM_FINAL_W_KM);
+    float tz2h = sqrtf(baseHKm * TERRAIN_ZOOM_FINAL_H_KM);
+    float tz1w = sqrtf(baseWKm * tz2w);
+    float tz1h = sqrtf(baseHKm * tz2h);
+    float tzW[3] = { tz1w, tz2w, TERRAIN_ZOOM_FINAL_W_KM };
+    float tzH[3] = { tz1h, tz2h, TERRAIN_ZOOM_FINAL_H_KM };
+    float centerLat = s_weatherCenterLat, centerLon = s_weatherCenterLon;
+    for (int tz = 0; tz < TERRAIN_ZOOM_LEVELS; tz++) {
+      float tw, ts2, te, tn;
+      computeBboxFromCenterKm(centerLat, centerLon, tzW[tz], tzH[tz], &tw, &ts2, &te, &tn);
+      snprintf(terrainUrl, sizeof(terrainUrl),
+        "https://tiles.maps.eox.at/wms"
+        "?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+        "&LAYERS=s2cloudless-2024"
+        "&STYLES=&SRS=EPSG:4326"
+        "&BBOX=%.6f,%.6f,%.6f,%.6f&WIDTH=%d&HEIGHT=%d"
+        "&FORMAT=image%%2Fjpeg",
+        (double)tw, (double)ts2, (double)te, (double)tn,
+        TERRAIN_FETCH_W, TERRAIN_FETCH_H);
+      downloadJpegUrlToPath(terrainUrl, tzPaths[tz], "Terrain zoom", nullptr);
+      appendDiagLog("terrain-zoom[%d]: %.0fx%.0f km\n", tz, (double)tzW[tz], (double)tzH[tz]);
+    }
+  }
+
   char radarUrl[640];
   const char* radarTryPath = SD_ROOT "/frames/.radar_try.jpg";
   const char* radarBestPath = SD_ROOT "/frames/.radar_best.jpg";
@@ -9464,6 +9533,36 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
     }
     Serial.printf("radar ok %u\n", (unsigned)bestSignal);
   }
+
+  // Download radar at each terrain zoom bbox (reuse radarLatestMs from base radar)
+  if (radarLatestMs > 0ULL) {
+    static const char* tzRadarPaths[TERRAIN_ZOOM_LEVELS] = {
+      TERRAIN_Z1_RADAR, TERRAIN_Z2_RADAR, TERRAIN_Z3_RADAR
+    };
+    float cosLatR = cosf(s_weatherCenterLat * 0.01745329252f);
+    if (cosLatR < 0.2f) cosLatR = 0.2f;
+    float bboxWKmR = fabsf(bboxEast - bboxWest) * 111.32f * cosLatR;
+    float bboxHKmR = fabsf(bboxNorth - bboxSouth) * 111.32f;
+    float rTz2w = sqrtf(bboxWKmR * TERRAIN_ZOOM_FINAL_W_KM);
+    float rTz2h = sqrtf(bboxHKmR * TERRAIN_ZOOM_FINAL_H_KM);
+    float rTz1w = sqrtf(bboxWKmR * rTz2w);
+    float rTz1h = sqrtf(bboxHKmR * rTz2h);
+    float rTzW[3] = { rTz1w, rTz2w, TERRAIN_ZOOM_FINAL_W_KM };
+    float rTzH[3] = { rTz1h, rTz2h, TERRAIN_ZOOM_FINAL_H_KM };
+    for (int tz = 0; tz < TERRAIN_ZOOM_LEVELS; tz++) {
+      float tw2, ts2, te2, tn2;
+      computeBboxFromCenterKm(s_weatherCenterLat, s_weatherCenterLon,
+                              rTzW[tz], rTzH[tz], &tw2, &ts2, &te2, &tn2);
+      snprintf(radarUrl, sizeof(radarUrl),
+        "https://mapservices.weather.noaa.gov/eventdriven/rest/services/radar/"
+        "radar_base_reflectivity_time/ImageServer/exportImage"
+        "?bbox=%.6f,%.6f,%.6f,%.6f&bboxSR=4326&size=%d,%d&format=jpg&f=image&time=%llu&_cb=%llu",
+        (double)tw2, (double)ts2, (double)te2, (double)tn2,
+        TERRAIN_FETCH_W, TERRAIN_FETCH_H, radarLatestMs, radarReqBust + 10ULL + tz);
+      downloadJpegUrlToPath(radarUrl, tzRadarPaths[tz], "TZ radar", nullptr);
+    }
+  }
+
   return true;
 }
 
@@ -9472,6 +9571,11 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
   if (!path) return false;
   bool isTerrainStage = (strcmp(path, ZOOM_TERRAIN_DAY_FILE) == 0 ||
                          strcmp(path, ZOOM_TERRAIN_NIGHT_FILE) == 0);
+  // Deep terrain zoom files are also terrain stages (need radar composite)
+  const char* tzRadarPath = nullptr;
+  if (strcmp(path, TERRAIN_Z1_FILE) == 0) { isTerrainStage = true; tzRadarPath = TERRAIN_Z1_RADAR; }
+  else if (strcmp(path, TERRAIN_Z2_FILE) == 0) { isTerrainStage = true; tzRadarPath = TERRAIN_Z2_RADAR; }
+  else if (strcmp(path, TERRAIN_Z3_FILE) == 0) { isTerrainStage = true; tzRadarPath = TERRAIN_Z3_RADAR; }
   const char* rawPath = zoomRawPathForJpeg(path);
   auto loadRawStage = [&](const char* rp) -> bool {
     if (!rp || !ensureSprite()) return false;
@@ -9486,8 +9590,42 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
     return (got == RAW_FRAME_BYTES);
   };
   auto decodeStage = [&]() -> bool {
-    if (isTerrainStage) {
-      return decodeTerrainCompositeToSprite();
+    if (isTerrainStage && !tzRadarPath) {
+      return decodeTerrainCompositeToSprite();  // base terrain + base radar
+    }
+    if (isTerrainStage && tzRadarPath) {
+      // Deep zoom terrain: decode tz JPEG, then overlay tz radar
+      if (!decodeJpegPathToSprite(path)) return false;
+      // Overlay radar if available (same composite logic as base terrain)
+      if (fileExistsNonEmpty(tzRadarPath) && ensureSprite()) {
+        // Save terrain pixels, decode radar, composite, done
+        // Use lightweight overlay: decode radar to temp, blend onto terrain sprite
+        size_t spriteSz = RAW_FRAME_BYTES;
+        uint16_t* terrainPx = (uint16_t*)heap_caps_malloc(spriteSz, MALLOC_CAP_SPIRAM);
+        if (terrainPx) {
+          memcpy(terrainPx, sprite.getBuffer(), spriteSz);
+          if (decodeJpegPathToSprite(tzRadarPath, true)) {
+            // Composite: overlay radar signal pixels onto terrain
+            uint16_t* radarPx = (uint16_t*)sprite.getBuffer();
+            for (int i = 0; i < DISP_W * DISP_H; i++) {
+              uint16_t rp = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(radarPx[i]) : radarPx[i];
+              int r = (rp >> 11) & 0x1F, g = ((rp >> 5) & 0x3F) >> 1, b = rp & 0x1F;
+              int sat = max(r, max(g, b)) - min(r, min(g, b));
+              if (sat >= 5 && (r + g + b) >= 8) {
+                // Radar signal pixel — keep it
+              } else {
+                // Background — restore terrain
+                radarPx[i] = terrainPx[i];
+              }
+            }
+          } else {
+            // Radar decode failed — restore terrain
+            memcpy(sprite.getBuffer(), terrainPx, spriteSz);
+          }
+          heap_caps_free(terrainPx);
+        }
+      }
+      return true;
     }
     if (loadRawStage(rawPath)) return true;
     if (ensureFilteredZoomRaw(path, true) && loadRawStage(rawPath)) return true;
@@ -9832,6 +9970,70 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs, int freezeFrameIdx = -1) {
   if (remainingMs > consumedMs) {
     delayWithInputPoll(remainingMs - consumedMs);
   }
+}
+
+// Terrain zoom locator cue — dit-dit-dah-dah on three nested rects,
+// same pattern as runFreezeZoom3LocatorCue but for terrain zoom levels.
+static void runTerrainZoomLocatorCue(float baseWKm, float baseHKm,
+                                     const float* tzW, const float* tzH,
+                                     int nLevels, int newestIdx) {
+  if (!s_frameDisplayBuf || nLevels <= 0) return;
+
+  struct TzRect { int x, y, w, h; bool valid; };
+  TzRect rects[3] = {};
+  for (int i = 0; i < nLevels && i < 3; i++) {
+    float fx = (1.0f - tzW[i] / baseWKm) / 2.0f;
+    float fy = (1.0f - tzH[i] / baseHKm) / 2.0f;
+    int x0 = (int)(fx * SCALED_W);
+    int y0 = (int)(fy * SCALED_H);
+    int rw = SCALED_W - 2 * x0;
+    int rh = SCALED_H - 2 * y0;
+    if (y0 < SCALED_TOP_BAR_H) { rh -= (SCALED_TOP_BAR_H - y0); y0 = SCALED_TOP_BAR_H; }
+    int maxY = SCALED_H - SCALED_BAR_H - 1;
+    if (y0 + rh - 1 > maxY) rh = maxY - y0 + 1;
+    rects[i] = { x0, y0, rw, rh, (rw >= 6 && rh >= 6) };
+  }
+
+  int lastValid = -1;
+  for (int i = nLevels - 1; i >= 0; i--) { if (rects[i].valid) { lastValid = i; break; } }
+  if (lastValid < 0) return;
+
+  // Keep terrain raw file open for fast restore (avoid open/close overhead per frame)
+  const char* terrainRawPath = terrainUsesNightLayerForUtc(time(nullptr))
+    ? ZOOM_TERRAIN_NIGHT_RAW : ZOOM_TERRAIN_DAY_RAW;
+  File terrainRawFile = SD.open(terrainRawPath, FILE_READ);
+  bool rawOk = terrainRawFile && (size_t)terrainRawFile.size() == SCALED_FRAME_BYTES;
+  auto restoreTerrain = [&]() {
+    if (rawOk) {
+      terrainRawFile.seek(0);
+      terrainRawFile.read((uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+      presentScaledBuf(s_frameDisplayBuf);
+    } else {
+      showZoomSnapshotFrame(activeTerrainJpegPath(), newestIdx);
+    }
+  };
+
+  // dit: quick flash for each level except the last
+  for (int i = 0; i < lastValid; i++) {
+    if (!rects[i].valid) continue;
+    drawScaledOutlineRect(s_frameDisplayBuf, rects[i].x, rects[i].y, rects[i].w, rects[i].h, 0xF800);
+    presentScaledBuf(s_frameDisplayBuf);
+    delayWithInputPoll(25);
+    restoreTerrain();
+    delayWithInputPoll(12);
+  }
+
+  // dah-dah: two longer flashes on the final level
+  for (int i = 0; i < 4; i++) {
+    restoreTerrain();
+    if ((i & 1) == 0)
+      drawScaledOutlineRect(s_frameDisplayBuf, rects[lastValid].x, rects[lastValid].y,
+                            rects[lastValid].w, rects[lastValid].h, 0xF800);
+    presentScaledBuf(s_frameDisplayBuf);
+    delayWithInputPoll(125);
+  }
+  restoreTerrain();
+  if (terrainRawFile) terrainRawFile.close();
 }
 
 static void refreshZoomSnapshotsForLatestFrame() {
@@ -14027,6 +14229,32 @@ void loop() {
             _wOk; })) {
             terrainShownForClock = true;
             baseForClockOverlay = terrainShownForClock;
+            // Deep terrain zoom stages (S2 cloudless, daytime only)
+            if (s_deepTerrainZoomEnabled && !terrainUsesNightLayerForUtc(time(nullptr))) {
+              delayWithInputPoll(1000);
+              // Compute geometric-mean zoom levels (same formula as download)
+              float baseWKm = ZOOM3_FINAL_W_KM, baseHKm = ZOOM3_FINAL_H_KM;
+              float tz2w = sqrtf(baseWKm * TERRAIN_ZOOM_FINAL_W_KM);
+              float tz2h = sqrtf(baseHKm * TERRAIN_ZOOM_FINAL_H_KM);
+              float tz1w = sqrtf(baseWKm * tz2w);
+              float tz1h = sqrtf(baseHKm * tz2h);
+              float tzW[3] = { tz1w, tz2w, TERRAIN_ZOOM_FINAL_W_KM };
+              float tzH[3] = { tz1h, tz2h, TERRAIN_ZOOM_FINAL_H_KM };
+              int finalTzLevel = min((int)s_deepTerrainZoomLevel, TERRAIN_ZOOM_LEVELS - 1);
+              // dit-dit-dah-dah bbox cue (same pattern as weather zoom)
+              runTerrainZoomLocatorCue(baseWKm, baseHKm, tzW, tzH,
+                                      finalTzLevel + 1, newestIdx);
+              // Step through zoom stages
+              static const char* tzPaths[TERRAIN_ZOOM_LEVELS] = {
+                TERRAIN_Z1_FILE, TERRAIN_Z2_FILE, TERRAIN_Z3_FILE
+              };
+              for (int tz = 0; tz <= finalTzLevel; tz++) {
+                uint32_t tzStart = millis();
+                if (!showZoomSnapshotFrame(tzPaths[tz], newestIdx)) break;
+                int32_t tzRemain = 1000 - (int32_t)(millis() - tzStart);
+                if (tzRemain > 0) delayWithInputPoll((uint32_t)tzRemain);
+              }
+            }
           } else {
             if (showZoomSnapshotFrame(activeTerrainJpegPath(), newestIdx)) {
               terrainShownForClock = true;
