@@ -557,6 +557,12 @@ static bool s_wifiPortalApActive = false;
 static bool s_wifiPortalMdnsRunning = false;
 static bool s_startCuePending = false;
 
+// Hot boot (fast reboot with cached frames)
+static bool          s_fastBootEnabled = true;
+static volatile bool s_bgPhase1Done = false;
+static volatile bool s_bgPhase1WifiOk = false;
+static TaskHandle_t  s_bgSyncTaskHandle = nullptr;
+
 // Per-device AP password derived from chip MAC (generated once at boot)
 static char s_portalApPass[12] = "000000000";
 
@@ -883,6 +889,7 @@ static void loadWifiPortalConfig() {
         s_shakeConfirmMs = (uint16_t)dbms;
       }
       s_lastSuccessfulSyncUtc = (time_t)prefs.getULong64("lsyn", 0ULL);
+      s_fastBootEnabled = prefs.getBool("fben", true);
       // Hurricane watch config
       s_hurricaneWatchEnabled = prefs.getBool("hwen", false);
 #ifdef HURRICANE_TEST_MODE
@@ -994,7 +1001,8 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
                                  uint8_t schedCount, const uint16_t* schedMinutes,
                                  int loopsBeforeSleep, bool shakeToWake,
                                  int shakeEntryIgnoreMs, int shakeConfirmMs,
-                                 bool cleanModeEnabled) {
+                                 bool cleanModeEnabled,
+                                 bool fastBootEnabled = true) {
   if (!entries) return;
   Preferences prefs;
   if (!prefs.begin("satwatch", false)) return;
@@ -1022,6 +1030,7 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   prefs.putInt("stwksetms", shakeEntryIgnoreMs);
   prefs.putInt("stwkdbms", shakeConfirmMs);
   prefs.putBool("clnmd", cleanModeEnabled);
+  prefs.putBool("fben", fastBootEnabled);
   // build and save scheduled times string
   {
     char schedStr[64] = {};
@@ -1046,6 +1055,7 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   s_shakeEntryIgnoreMs = (uint16_t)shakeEntryIgnoreMs;
   s_shakeConfirmMs = (uint16_t)shakeConfirmMs;
   s_cleanModeFeatureEnabled = cleanModeEnabled;
+  s_fastBootEnabled = fastBootEnabled;
   if (shakeToWake && !s_qmiInitialized && s_sleepModeEnabled) initQmiShakeToWake();
   s_scheduledUpdateCount = schedCount;
   for (int i = 0; i < schedCount; i++) s_scheduledUpdateMinutes[i] = schedMinutes[i];
@@ -1085,6 +1095,21 @@ static void noteSuccessfulScanNow() {
   if (!prefs.begin("satwatch", false)) return;
   prefs.putULong64("lsyn", (uint64_t)nowUtc);
   prefs.end();
+}
+
+// Hot-boot freshness: cache is "fresh" if age < auto-update interval.
+// BUILD_EPOCH catches dead-RTC returning plausible-looking but stale times.
+static constexpr time_t BUILD_EPOCH = 1747000000LL;  // ~May 2025; bump with major releases
+static bool cacheIsFreshEnough() {
+  time_t rtcNow = 0;
+  if (!readPcf85063(&rtcNow)) return false;
+  if (rtcNow < 1700000000 || rtcNow < BUILD_EPOCH) return false;
+  if (s_lastSuccessfulSyncUtc <= 0) return false;
+  time_t maxAge = (s_updateMode == UPDATE_MODE_AUTO)
+    ? (time_t)s_autoUpdateIntervalMin * 60
+    : (time_t)(2 * 3600);
+  time_t age = rtcNow - s_lastSuccessfulSyncUtc;
+  return (age >= 0 && age < maxAge);
 }
 
 // Seconds until the next clock-aligned auto-update boundary.
@@ -1317,6 +1342,10 @@ static void sendWifiPortalPage() {
   html += F("<input type='checkbox' name='clnmd' value='1'");
   if (s_cleanModeFeatureEnabled) html += F(" checked");
   html += F(">Display modes (tap moon: normal / clean / time+clean / time+bars)</label></div>");
+  html += F("<div style='margin-top:8px'><label class='flex items-center gap-2 text-sm text-gray-200'>");
+  html += F("<input type='checkbox' name='fben' value='1'");
+  if (s_fastBootEnabled) html += F(" checked");
+  html += F(">Fast boot (skip sync when cache is fresh)</label></div>");
   html += F("</div>");
   html += F("<div class='hint'>Portal AP: Sat Watch / 123456789</div>");
   html += F("<div class='hint'>Portal URL: http://satwatch.local/</div>");
@@ -1616,6 +1645,7 @@ static void handleWifiPortalSave() {
   if (shakeConfirmMs < 0) shakeConfirmMs = 0;
   if (shakeConfirmMs > 2000) shakeConfirmMs = 2000;
   bool cleanModeEnabled = s_wifiPortalServer.hasArg("clnmd");
+  bool fastBootEnabled = s_wifiPortalServer.hasArg("fben");
   // Hurricane watch config
   s_hurricaneWatchEnabled = s_wifiPortalServer.hasArg("hwen");
   s_hurricaneIncludeTS = s_wifiPortalServer.hasArg("hwts");
@@ -1673,7 +1703,8 @@ static void handleWifiPortalSave() {
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
                        (StartCueMode)mode, (uint8_t)chimeVol,
                        schedCount, schedMins, loopsBeforeSleep, shakeToWake,
-                       shakeEntryIgnoreMs, shakeConfirmMs, cleanModeEnabled);
+                       shakeEntryIgnoreMs, shakeConfirmMs, cleanModeEnabled,
+                       fastBootEnabled);
   s_wifiPortalServer.send(200, "text/html",
                           "<!doctype html><html><body style='font-family:Arial;background:#111827;color:#f9fafb;padding:24px;'>"
                           "<h2>Saved</h2><p>Settings stored. Rebooting now.</p></body></html>");
@@ -2212,7 +2243,10 @@ static void audioCueWorkerTask(void* arg) {
     if (xQueueReceive(s_audioCueQueue, &req, portMAX_DELAY) != pdTRUE) continue;
     s_audioCueBusy = true;
     if (s_audioCueReady && s_audioCueBuf && s_audioCueLen > 0) {
-      playRawCueFromBuffer(s_audioCueBuf, s_audioCueLen, req.volume);
+      for (int attempt = 0; attempt < 3; attempt++) {
+        if (playRawCueFromBuffer(s_audioCueBuf, s_audioCueLen, req.volume)) break;
+        vTaskDelay(pdMS_TO_TICKS(200));
+      }
     }
     s_audioCueBusy = false;
   }
@@ -3928,24 +3962,26 @@ static int renderForecastTicker() {
 
   // 1. Daily entries first — icon + day + temp + conditions
   for (int i = 0; i < (int)s_forecast.dailyCount && segCount < 28; i++) {
-    int hoursOut = (int)((s_forecast.daily[i].date - nowUtcFc) / 3600);
-    if (hoursOut < -12) continue;
-    char dayLabel[32];
+    // Compare by local calendar date — a day's forecast is valid all day
     int32_t off = s_displayUtcOffsetValid ? s_displayUtcOffsetSec : 0;
-    struct tm entryLt, nowLt;
+    struct tm entryTm, nowTm;
     time_t entryLocal = s_forecast.daily[i].date + (time_t)off;
     time_t nowLocal = nowUtcFc + (time_t)off;
-    gmtime_r(&entryLocal, &entryLt);
-    gmtime_r(&nowLocal, &nowLt);
+    gmtime_r(&entryLocal, &entryTm);
+    gmtime_r(&nowLocal, &nowTm);
+    // Skip entries from yesterday or earlier (different calendar day AND in the past)
+    if (entryTm.tm_yday < nowTm.tm_yday && entryTm.tm_year == nowTm.tm_year) continue;
+    if (entryTm.tm_year < nowTm.tm_year) continue;
+    char dayLabel[32];
     // Ordinal suffix for day of month
-    int dom = entryLt.tm_mday;
+    int dom = entryTm.tm_mday;
     const char* suf = "th";
     if (dom == 1 || dom == 21 || dom == 31) suf = "st";
     else if (dom == 2 || dom == 22) suf = "nd";
     else if (dom == 3 || dom == 23) suf = "rd";
     char dayName[8];
     fmtDayName(s_forecast.daily[i].date, dayName, sizeof(dayName));
-    if (entryLt.tm_mday == nowLt.tm_mday && entryLt.tm_mon == nowLt.tm_mon)
+    if (entryTm.tm_mday == nowTm.tm_mday && entryTm.tm_mon == nowTm.tm_mon)
       snprintf(dayLabel, sizeof(dayLabel), "%d%s %s(Today)", dom, suf, dayName);
     else
       snprintf(dayLabel, sizeof(dayLabel), "%d%s %s", dom, suf, dayName);
@@ -4131,35 +4167,48 @@ static uint16_t* s_scrambledBarBuf = nullptr;
 static int s_decodeCharXPos[128];
 static int s_decodeCharCount = 0;
 static int s_decodeSegWidth = 0;  // pixel width of current decoded segment
+static int s_decodeTextEndX = 0; // rightmost non-zero column in s_decodedBarBuf
 
 // Render one decode frame: revealed chars from decoded buf, unrevealed get fresh random glyphs
+static void computeDecodeTextEndX(int segW) {
+  s_decodeTextEndX = 0;
+  if (!s_decodedBarBuf) return;
+  for (int col = segW - 1; col >= 0; col--) {
+    for (int row = 0; row < SCALED_BAR_H; row++) {
+      if (s_decodedBarBuf[row * SCALED_W + col]) { s_decodeTextEndX = col + 1; return; }
+    }
+  }
+}
+
 static void renderDecodeFrame(int revealIdx) {
   if (!s_decodedBarBuf || !s_botBarBuf || s_decodeCharCount <= 0) return;
   int segW = s_decodeSegWidth > 0 ? s_decodeSegWidth : SCALED_W;
   int rx = (revealIdx >= s_decodeCharCount) ? segW
     : s_decodeCharXPos[min(revealIdx, s_decodeCharCount - 1)];
 
+  int textEnd = s_decodeTextEndX > 0 ? s_decodeTextEndX : segW;
+
   // Start with black
   memset(s_botBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
 
-  // Copy revealed portion from decoded bar
+  // Copy revealed text (0..rx)
   if (rx > 0) {
-    int copyW = min(rx, segW);
+    int copyW = min(rx, textEnd);
     for (int row = 0; row < SCALED_BAR_H; row++)
       memcpy(s_botBarBuf + row * SCALED_W, s_decodedBarBuf + row * SCALED_W, copyW * 2);
   }
 
-  // Blit fresh random scramble glyphs only within the segment width
-  if (rx < segW) {
+  // Draw scramble glyphs only where text exists (rx..textEnd), not in trailing black
+  if (rx < textEnd) {
     int cx = rx;
-    while (cx < segW - 2) {
+    while (cx < textEnd - 2) {
       const ScrambleGlyph& g = kScrambleGlyphs[esp_random() % kScrambleGlyphCount];
       int gy = (SCALED_BAR_H - g.h) / 2;
       if (gy < 0) gy = 0;
       for (int row = 0; row < g.h && (gy + row) < SCALED_BAR_H; row++) {
         const uint16_t* src = g.data + row * g.w;
         uint16_t* dst = s_botBarBuf + (gy + row) * SCALED_W + cx;
-        for (int col = 0; col < g.w && (cx + col) < segW; col++) {
+        for (int col = 0; col < g.w && (cx + col) < textEnd; col++) {
           uint16_t px = pgm_read_word(&src[col]);
           if (px) dst[col] = px;
         }
@@ -4191,11 +4240,15 @@ static bool renderDecodeBarImages() {
     for (int row = 0; row < SCALED_BAR_H; row++)
       memcpy(s_decodedBarBuf + row * SCALED_W, s_tickerBuf + row * s_tickerWidth + segStart, segW * 2);
   }
+  computeDecodeTextEndX(segW);
+  int paceW = s_decodeTextEndX > 0 ? s_decodeTextEndX : segW;
 
   // Character positions for reveal pacing (one position per ~10px)
   s_decodeCharCount = 0;
-  for (int cx = 0; cx < segW && s_decodeCharCount < 127; cx += 10)
+  for (int cx = 0; cx < paceW && s_decodeCharCount < 126; cx += 10)
     s_decodeCharXPos[s_decodeCharCount++] = cx;
+  if (s_decodeCharCount > 0 && s_decodeCharXPos[s_decodeCharCount - 1] < paceW)
+    s_decodeCharXPos[s_decodeCharCount++] = paceW;
   return s_decodeCharCount > 0;
 }
 
@@ -4345,16 +4398,19 @@ static void tickerTask(void*) {
               int segEnd = (dSegIdx + 1 < s_tickerSegCount) ? s_tickerSegX[dSegIdx + 1] : s_tickerWidth;
               int segW = min(segEnd - segStart, SCALED_W);
               s_decodeSegWidth = segW;
-              // Re-compute char positions for new segment width
-              s_decodeCharCount = 0;
-              for (int pcx = 0; pcx < segW && s_decodeCharCount < 127; pcx += 10)
-                s_decodeCharXPos[s_decodeCharCount++] = pcx;
               memset(s_decodedBarBuf, 0, (size_t)SCALED_W * SCALED_BAR_H * 2);
               if (segW > 0) {
                 for (int row = 0; row < SCALED_BAR_H; row++)
                   memcpy(s_decodedBarBuf + row * SCALED_W,
                          s_tickerBuf + row * s_tickerWidth + segStart, segW * 2);
               }
+              computeDecodeTextEndX(segW);
+              int paceW = s_decodeTextEndX > 0 ? s_decodeTextEndX : segW;
+              s_decodeCharCount = 0;
+              for (int pcx = 0; pcx < paceW && s_decodeCharCount < 126; pcx += 10)
+                s_decodeCharXPos[s_decodeCharCount++] = pcx;
+              if (s_decodeCharCount > 0 && s_decodeCharXPos[s_decodeCharCount - 1] < paceW)
+                s_decodeCharXPos[s_decodeCharCount++] = paceW;
             }
           }
         } else {
@@ -7738,6 +7794,7 @@ static bool downloadFrameToPathAtBbox(HTTPClient& http,
 static bool connectWifiForSync(bool required, const char* statusLine = "Connecting WiFi...") {
   (void)required;
   loadWifiPortalConfig();
+  bool showStatus = (statusLine != nullptr);
   const char* title = statusLine ? statusLine : "Connecting WiFi...";
   s_wifiSyncInProgress = true;
 
@@ -7758,7 +7815,7 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
   for (int slot = 0; slot < WIFI_CONFIG_SLOTS; ++slot) {
     if (s_wifiConfig[slot].ssid[0] == '\0') continue;
 
-    showMessage(title, s_wifiConfig[slot].ssid);
+    if (showStatus) showMessage(title, s_wifiConfig[slot].ssid);
     WiFi.disconnect(true);
     WiFi.mode(WIFI_STA);
     WiFi.setHostname(WIFI_PORTAL_HOSTNAME);
@@ -8229,6 +8286,32 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
       return false;
     }
   }
+  // GIBS color-shift: wrong colormap produces solid yellow/orange frames.
+  // Normal frames have blue ocean. Reject if avg color is warm with no blue.
+  {
+    const uint16_t* px = (const uint16_t*)sprite.getBuffer();
+    if (px) {
+      uint32_t rSum = 0, gSum = 0, bSum = 0, count = 0;
+      bool swapped = s_mainSpritePixelsByteSwapped;
+      for (int i = 0; i < DISP_W * DISP_H; i += 8) {
+        uint16_t c = swapped ? __builtin_bswap16(px[i]) : px[i];
+        rSum += (c >> 11) & 0x1F;
+        gSum += (c >> 5) & 0x3F;
+        bSum += c & 0x1F;
+        count++;
+      }
+      if (count > 0) {
+        uint32_t rAvg = rSum * 255 / (count * 31);
+        uint32_t gAvg = gSum * 255 / (count * 63);
+        uint32_t bAvg = bSum * 255 / (count * 31);
+        if (bAvg > 0 && rAvg > 120 && (rAvg * 100 / bAvg) > 180) {
+          if (label) appendDiagLog("vld: %s COLOR-SHIFT r=%u g=%u b=%u\n", label,
+                                    (unsigned)rAvg, (unsigned)gAvg, (unsigned)bAvg);
+          return false;
+        }
+      }
+    }
+  }
   return true;
 }
 
@@ -8577,9 +8660,12 @@ static void applyDayTerrainGreenBoostOnSprite() {
     int g = (n >> 5) & 0x3F;
     int b = n & 0x1F;
 
-    // Mild green lift to counter blue-leaning panel tint without washing out.
-    g = g + (((63 - g) * 12 + 50) / 100) + 1;
-    if (g > 63) g = 63;
+    // Mild green lift on land/cloud pixels only (skip dark ocean).
+    int lum = r + (g >> 1) + b;
+    if (lum > 12) {
+      g = g + (((63 - g) * 10 + 50) / 100);
+      if (g > 63) g = 63;
+    }
 
     uint16_t out = (uint16_t)((r << 11) | (g << 5) | b);
     px[i] = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(out) : out;
@@ -8661,8 +8747,7 @@ static bool decodeTerrainCompositeToSprite() {
     return false;
   }
 
-  // Day-only green lift to counter panel tint.
-  if (!nightLayer) applyDayTerrainGreenBoostOnSprite();
+  // Green boost was for BlueMarble; S2 cloudless has accurate colors — skip.
 
   // No usable radar → return base terrain only.
   if (!radarRawReady) {
@@ -9185,11 +9270,18 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
     return downloadJpegUrlToPath(terrainUrl, outPath, label, nullptr);
   };
 
-  // Day: BlueMarble
-  bool dayOk = downloadTerrainLayer2x(
-    "BlueMarble_NextGeneration",
-    dayTmpPath,
-    "Terrain day");
+  // Day: Sentinel-2 cloudless (EOX, 10m/px — much sharper than BlueMarble 500m)
+  snprintf(terrainUrl, sizeof(terrainUrl),
+    "https://tiles.maps.eox.at/wms"
+    "?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+    "&LAYERS=s2cloudless-2024"
+    "&STYLES=&SRS=EPSG:4326"
+    "&BBOX=%.6f,%.6f,%.6f,%.6f&WIDTH=%d&HEIGHT=%d"
+    "&FORMAT=image%%2Fjpeg",
+    (double)bboxWest, (double)bboxSouth,
+    (double)bboxEast, (double)bboxNorth,
+    TERRAIN_FETCH_W, TERRAIN_FETCH_H);
+  bool dayOk = downloadJpegUrlToPath(terrainUrl, dayTmpPath, "Terrain day", nullptr);
 
   // Night: VIIRS Black Marble (static composite, fixed date)
   bool nightOk = downloadTerrainLayer2x(
@@ -11069,6 +11161,26 @@ static void rebuildRawFromStored() {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Hot-boot background sync task (phase 1: WiFi/NTP/geo/forecast)
+// ─────────────────────────────────────────────────────────────
+static void bgSyncPhase1Task(void* param) {
+  (void)param;
+  appendDiagLog("[BG-P1] start ms=%lu\n", millis());
+  bool wifiOk = connectWifiForSync(false, nullptr);  // nullptr = suppress showMessage
+  s_bgPhase1WifiOk = wifiOk;
+  if (wifiOk) {
+    (void)syncClockFromNtpBestEffort(8);
+    refreshDisplayLocationTimeFromIpInfo();
+    fetchForecastData();
+    s_tickerWidth = 0;  // force ticker re-render on next loop
+  }
+  s_bgPhase1Done = true;
+  appendDiagLog("[BG-P1] done wifi=%d ms=%lu\n", (int)wifiOk, millis());
+  s_bgSyncTaskHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Enter sleep (deep sleep if BOOT pin supports it; light sleep fallback on C6)
 // ─────────────────────────────────────────────────────────────
 static void goToSleep(bool buttonOnly = false) {
@@ -11817,25 +11929,42 @@ void setup() {
     }
   }
 
+  // Apply RTC time early so hot-boot freshness check has valid time(nullptr)
+  if (hardBoot) tryApplyPcf85063Time();
+
   // ── Refresh cache on hard boot / timer wake / empty cache ───────────────
   bool skipNextSyncOnce = consumeSkipNextSyncOnce();
   bool hardBootSyncDue = false;
+  bool hotBootEligible = false;
   if (hardBoot && !skipNextSyncOnce) {
-    // Always sync on a hard boot regardless of update mode.
-    // Manual mode means no timer-wake syncs, not "ignore stale frames on reboot".
-    hardBootSyncDue = true;
+    esp_reset_reason_t rst = esp_reset_reason();
+    bool cleanReset = (rst == ESP_RST_POWERON || rst == ESP_RST_SW || rst == ESP_RST_USB);
+    if (cleanReset && s_fastBootEnabled && framesReady && frameCount > 0 && cacheIsFreshEnough()) {
+      hotBootEligible = true;
+      appendDiagLog("[BOOT] hot-boot eligible rst=%d age=%llds\n",
+                    (int)rst, (long long)(time(nullptr) - s_lastSuccessfulSyncUtc));
+    } else {
+      hardBootSyncDue = true;
+    }
   }
   bool needSync = (hardBootSyncDue || timerWake || !framesReady || frameCount == 0);
   {
     File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
     if (diagF) {
-      diagF.printf("hardBoot=%d timerWake=%d framesReady=%d frameCount=%d skipOnce=%d needSync=%d\n",
+      diagF.printf("hardBoot=%d timerWake=%d framesReady=%d frameCount=%d skipOnce=%d needSync=%d hotBoot=%d\n",
                    (int)hardBoot, (int)timerWake, (int)framesReady, frameCount,
-                   (int)skipNextSyncOnce, (int)needSync);
+                   (int)skipNextSyncOnce, (int)needSync, (int)hotBootEligible);
       diagF.close();
     }
   }
-  if (skipNextSyncOnce && framesReady && frameCount > 0) {
+  if (hotBootEligible) {
+    appendDiagLog("[BOOT] hot-boot path ms=%lu\n", millis());
+    s_startCuePending = true;
+    s_bgPhase1Done = false;
+    s_bgPhase1WifiOk = false;
+    xTaskCreatePinnedToCore(bgSyncPhase1Task, "bgsync", 8192, nullptr, 1, &s_bgSyncTaskHandle, 0);
+    // Skip sync — fall through to stream open + animation
+  } else if (skipNextSyncOnce && framesReady && frameCount > 0) {
     bool wifiOk = connectWifiForSync(false);
     { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("skip-sync wifiOk=%d\n", (int)wifiOk); diagF.close(); } }
     if (!wifiOk) {
@@ -11917,7 +12046,7 @@ void setup() {
     }
   }
 
-  if (!needSync && hardBoot && framesReady && frameCount > 0) {
+  if (!needSync && !hotBootEligible && hardBoot && framesReady && frameCount > 0) {
     bool wifiOk = connectWifiForSync(false);
     {
       File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
@@ -13625,6 +13754,40 @@ void loop() {
     return;
   }
 
+  // ── Background sync phase 2 splice (hot-boot deferred sync) ─────────
+  if (s_bgPhase1Done) {
+    bool wifiOk = s_bgPhase1WifiOk;
+    s_bgPhase1Done = false;
+    s_bgPhase1WifiOk = false;
+    if (wifiOk) {
+      appendDiagLog("[BG-P2] splice start ms=%lu\n", millis());
+      if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
+        HurricaneInfo hStorms[4]; int hCount = 0;
+        if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
+          cleanupSuppressedStorms(hStorms, hCount);
+          for (int hi = 0; hi < hCount; hi++) {
+            if (!isStormSuppressed(hStorms[hi].id)) {
+              enterHurricaneMode(hStorms[hi]);
+              break;
+            }
+          }
+        }
+      }
+      syncWeatherFrames();
+      downloadMoonFramesIfMissing();
+      s_zoomSnapshotsRefreshPending = true;
+      maybeRefreshPendingZoomSnapshots();
+      noteSuccessfulScanNow();
+      disconnectWifiAfterSync();
+      ensureStreamOpen();
+      s_validCount = -1;  // force validIdx rebuild
+      decodeMoonPhase();
+      appendDiagLog("[BG-P2] splice done ms=%lu\n", millis());
+    } else {
+      appendDiagLog("[BG-P2] wifi failed, skipping\n");
+    }
+  }
+
   if (autoUpdateDueNow()) {
     showMessage("Auto update", "Rebooting to rescan");
     delayWithInputPoll(300);
@@ -13681,7 +13844,10 @@ void loop() {
     }
   }
   bool tickerReady = false;
-  if (s_tickerMode == TICKER_NOWCAST && s_forecast.valid) {
+  if (s_tickerTaskHandle) {
+    // Ticker task already running — don't reinitialize decode state mid-reveal
+    tickerReady = true;
+  } else if (s_tickerMode == TICKER_NOWCAST && s_forecast.valid) {
     tickerReady = renderNowcastBar();
   } else if (s_tickerWidth > 0) {
     if (s_tickerMode == TICKER_DECODE || s_tickerMode == TICKER_FADE || s_tickerMode == TICKER_NONE) {
