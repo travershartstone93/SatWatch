@@ -12173,8 +12173,8 @@ void setup() {
       uint32_t frameBudget = (uint32_t)targetFrameCount();
       if (frameBudget < 1U) frameBudget = 1U;
       if (frameBudget > MAX_FRAMES) frameBudget = MAX_FRAMES;
-      // Budget: wifi(20) + noaa(10) + ntp(5) + geo(10) + cache + raw + forecast(15) + zoom(12)
-      uint32_t totalBudget = 20U + 10U + 5U + 10U + frameBudget + (frameBudget + 8U) + 15U + 12U;
+      // Budget: wifi(20) + noaa(10) + ntp(5) + geo(10) + cache + raw + forecast(15) + zoom(12) + anim(144)
+      uint32_t totalBudget = 20U + 10U + 5U + 10U + frameBudget + (frameBudget + 8U) + 15U + 12U + 144U;
       syncProgressBegin(totalBudget, "Connecting...", "WiFi");
       syncProgressBeginPhase("wifi", 20U);
     }
@@ -12274,9 +12274,8 @@ void setup() {
     }
   }
 
-  if (syncProgressIsActive()) {
-    syncProgressEnd();
-  }
+  // Progress bar continues into loop() for PSRAM cache phase — don't end yet.
+  // But if progress bar isn't active (skip-sync / hot-boot paths), this is a no-op.
 
   if ((needSync || hardBoot) && framesReady && frameCount > 0) {
     s_startCuePending = true;
@@ -14063,17 +14062,104 @@ void loop() {
     updateBarBufs(newestIdx);
   }
 
+  // ── PSRAM frame cache: load half-res frames for smooth playback ──
+  // Cache exactly 60 frames sampled evenly from validCount → 6fps × 10s, no SD during anim
+  static const int CACHE_SCALE = 3;
+  static const int CACHE_W = SCALED_W / CACHE_SCALE;   // 136
+  static const int CACHE_H = SCALED_H / CACHE_SCALE;   // 120
+  static const size_t CACHE_FRAME_BYTES = (size_t)CACHE_W * CACHE_H * 2;
+  static const int CACHE_TARGET_FRAMES = 120;
+  static uint16_t* s_animCache = nullptr;
+  static int s_animCacheCount = 0;
+  static int s_animCacheMap[120] = {};  // validIdx index for each cache slot
+
+  bool useCache = false;
+  if (!s_animCache && validCount > 0 && s_streamReady && s_streamFile) {
+    int cacheCap = min(validCount, CACHE_TARGET_FRAMES);
+    size_t cacheNeeded = (size_t)cacheCap * CACHE_FRAME_BYTES;
+    s_animCache = (uint16_t*)heap_caps_malloc(cacheNeeded, MALLOC_CAP_SPIRAM);
+    if (s_animCache) {
+      if (syncProgressIsActive()) {
+        syncProgressBeginPhase("anim", (uint32_t)cacheCap);
+      }
+      uint16_t rowBuf[SCALED_W];
+      s_animCacheCount = 0;
+      for (int ci = 0; ci < cacheCap; ci++) {
+        int vi = (int)((uint32_t)ci * (uint32_t)validCount / (uint32_t)cacheCap);
+        if (vi >= validCount) vi = validCount - 1;
+        s_animCacheMap[ci] = vi;
+        int idx = validIdx[vi];
+        int phys = ((int)s_idx.head + idx) % MAX_FRAMES;
+        uint32_t offset = (uint32_t)phys * (uint32_t)SCALED_FRAME_BYTES;
+        if (!s_streamFile.seek(offset)) break;
+        uint16_t* dst = s_animCache + (size_t)ci * CACHE_W * CACHE_H;
+        bool readOk = true;
+        for (int y = 0; y < SCALED_H; y++) {
+          size_t got = s_streamFile.read((uint8_t*)rowBuf, SCALED_W * 2);
+          if (got != SCALED_W * 2) { readOk = false; break; }
+          if (y % CACHE_SCALE != 0) continue;
+          int dy = y / CACHE_SCALE;
+          for (int x = 0; x < CACHE_W; x++)
+            dst[dy * CACHE_W + x] = rowBuf[x * CACHE_SCALE];
+        }
+        if (!readOk) break;
+        s_animCacheCount++;
+        if (syncProgressIsActive()) syncProgressTick(1);
+      }
+      if (syncProgressIsActive()) syncProgressCompletePhase();
+      appendDiagLog("[ANIM] psram cache: %d/%d frames %uKB\n",
+                    s_animCacheCount, cacheCap, (unsigned)(cacheNeeded / 1024));
+    }
+  }
+  useCache = (s_animCache && s_animCacheCount > 0);
+  if (syncProgressIsActive()) syncProgressEnd();
+
+  // Helper: upscale cached frame into s_frameDisplayBuf (no present)
+  auto upscaleCachedFrame = [&](int cacheSlot) {
+    if (cacheSlot < 0 || cacheSlot >= s_animCacheCount || !s_frameDisplayBuf) return;
+    const uint16_t* src = s_animCache + (size_t)cacheSlot * CACHE_W * CACHE_H;
+    for (int y = 0; y < SCALED_H; y++) {
+      const uint16_t* srcRow = src + (y / CACHE_SCALE) * CACHE_W;
+      uint16_t* dstRow = s_frameDisplayBuf + y * SCALED_W;
+      for (int x = 0; x < SCALED_W; x++)
+        dstRow[x] = srcRow[x / CACHE_SCALE];
+    }
+  };
+
+  // Helper: show frame from PSRAM cache (upscale + present)
+  auto showCachedFrame = [&](int cacheSlot, bool skipBot) -> bool {
+    if (cacheSlot < 0 || cacheSlot >= s_animCacheCount || !s_frameDisplayBuf) return false;
+    upscaleCachedFrame(cacheSlot);
+    int vi = s_animCacheMap[cacheSlot];
+    updateBarBufs(validIdx[vi], skipBot);
+    presentScaledBuf(s_frameDisplayBuf);
+    return true;
+  };
+
   uint32_t loopStartMs = millis();
   int lastDisplayedFrameIdx = -1;
   int animFramesPushed = 0;
+  uint32_t frameMinMs = 9999, frameMaxMs = 0;
+  uint32_t lastFrameMs = loopStartMs;
+  uint32_t lastSrcPos = 0;
+  uint8_t shownMap[(MAX_FRAMES + 7) / 8] = {};
+  int preUpscaledSlot = -1;  // cache slot already upscaled into s_frameDisplayBuf
+  // Fixed-interval frame pacing for stable FPS when using PSRAM cache
+  const uint32_t framePaceMs = useCache ? (animationDurationMs / s_animCacheCount) : 0;
+  uint32_t nextFrameMs = loopStartMs;
   // Time-based frame selection over the valid-frame list.
-  // This keeps playback monotonic even when the raw validity map has holes.
   for (;;) {
-    serviceUserButtons();
-    pollCleanModeToggle();
-    serviceWifiPortalServer();
     uint32_t elapsed = millis() - loopStartMs;
     if (elapsed >= animationDurationMs) break;
+    // Pace: wait until the next frame tick
+    if (useCache) {
+      int32_t waitMs = (int32_t)(nextFrameMs - millis());
+      if (waitMs > 0) delay((uint32_t)waitMs);
+    } else {
+      serviceUserButtons();
+      pollCleanModeToggle();
+      serviceWifiPortalServer();
+    }
 
     uint32_t srcPos = (uint32_t)(((uint64_t)elapsed * (uint64_t)validCount) / animationDurationMs);
     if (srcPos >= (uint32_t)validCount) srcPos = (uint32_t)validCount - 1U;
@@ -14084,6 +14170,7 @@ void loop() {
     if (remaining <= targetFrameDelayMs * 2U + 50U) {
       int freezeFrameIdx = validIdx[srcPos];
       if (lastDisplayedFrameIdx != freezeFrameIdx) {
+        // Freeze frame always from SD (full res for zoom/hold)
         if (showFrame(freezeFrameIdx, true)) {
           if (startCueArmed) {
             if (playStartCueIfEnabled()) {
@@ -14142,9 +14229,26 @@ void loop() {
       break;
     }
 
-    int frameToShow = validIdx[srcPos];
+    int frameToShow;
+    int cacheSlot = -1;
+    if (useCache) {
+      // Map time position directly to cache slot
+      cacheSlot = (int)(((uint64_t)elapsed * (uint64_t)s_animCacheCount) / animationDurationMs);
+      if (cacheSlot >= s_animCacheCount) cacheSlot = s_animCacheCount - 1;
+      frameToShow = validIdx[s_animCacheMap[cacheSlot]];
+    } else {
+      frameToShow = validIdx[srcPos];
+    }
     if (frameToShow != lastDisplayedFrameIdx) {
-      bool ok = showFrame(frameToShow, true);
+      bool ok = false;
+      if (useCache && cacheSlot >= 0) {
+        if (preUpscaledSlot != cacheSlot)
+          upscaleCachedFrame(cacheSlot);
+        presentScaledBuf(s_frameDisplayBuf);
+        ok = true;
+      } else {
+        ok = showFrame(frameToShow, true);
+      }
       if (ok) {
         animFramesPushed++;
         if (startCueArmed) {
@@ -14154,6 +14258,24 @@ void loop() {
           }
         }
         lastDisplayedFrameIdx = frameToShow;
+        shownMap[srcPos / 8] |= (1 << (srcPos % 8));
+        lastSrcPos = srcPos;
+        // Pre-upscale next frame immediately after present
+        if (useCache && cacheSlot + 1 < s_animCacheCount) {
+          upscaleCachedFrame(cacheSlot + 1);
+          preUpscaledSlot = cacheSlot + 1;
+        } else {
+          preUpscaledSlot = -1;
+        }
+        uint32_t nowFm = millis();
+        uint32_t dt = nowFm - lastFrameMs;
+        lastFrameMs = nowFm;
+        if (animFramesPushed > 1) {
+          if (dt < frameMinMs) frameMinMs = dt;
+          if (dt > frameMaxMs) frameMaxMs = dt;
+        }
+        // Advance fixed-interval tick
+        if (useCache) nextFrameMs += framePaceMs;
       } else if (animFramesPushed < 3) {
         appendDiagLog("showFrame-fail: idx=%d srcPos=%lu\n", frameToShow, srcPos);
       }
@@ -14163,9 +14285,21 @@ void loop() {
   static int s_animLoopNum = 0;
   s_animLoopNum++;
   if (s_animLoopNum <= 3) {
-    appendDiagLog("anim-loop[%d]: pushed=%d last=%d vc=%d dur=%lu\n",
-                  s_animLoopNum, animFramesPushed, lastDisplayedFrameIdx,
+    uint32_t actualMs = millis() - loopStartMs;
+    float fps = actualMs > 0 ? (float)animFramesPushed * 1000.0f / (float)actualMs : 0;
+    appendDiagLog("anim-loop[%d]: pushed=%d fps=%.1f min=%lums max=%lums vc=%d dur=%lu\n",
+                  s_animLoopNum, animFramesPushed, (double)fps,
+                  (unsigned long)frameMinMs, (unsigned long)frameMaxMs,
                   validCount, animationDurationMs);
+    // Dump shown/skipped map: S=shown, .=skipped
+    for (int row = 0; row < validCount; row += 24) {
+      char map[32];
+      int end = min(row + 24, validCount);
+      for (int j = row; j < end; j++)
+        map[j - row] = (shownMap[j / 8] & (1 << (j % 8))) ? 'S' : '.';
+      map[end - row] = '\0';
+      appendDiagLog("fmap[%03d]: %s\n", row, map);
+    }
   }
 
   // Freeze on the already-displayed final animation frame.
