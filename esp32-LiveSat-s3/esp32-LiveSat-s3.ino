@@ -2138,6 +2138,7 @@ static bool initAudioStartCue() {
   es8311_voice_volume_set(s_audioCodec, (int)s_chimeVolume, &unused);
   s_audioPathPrimed = false;
   s_audioReady = true;
+  appendDiagLog("[AUDIO] init ok i2s=%d codec=%p\n", (int)s_i2sStarted, s_audioCodec);
   return true;
 }
 
@@ -2168,15 +2169,16 @@ static void primeAudioPathForCue() {
 static bool playRawCueFromBuffer(const uint8_t* data, size_t len, uint8_t volume) {
   if (!data || len == 0) return false;
   if (!initAudioStartCue()) return false;
-  primeAudioPathForCue();
 
+  // Simple approach matching Waveshare example — no fade/mute/prime sequence
   int unused = 0;
-  es8311_voice_fade(s_audioCodec, ES8311_FADE_4096LRCK);
-  es8311_voice_mute(s_audioCodec, true);
-  es8311_voice_volume_set(s_audioCodec, (int)volume, &unused);
-  writeAudioSilenceMs(8);
+  int mappedVol = 60 + ((int)volume * 40 / 100);
+  if (mappedVol > 100) mappedVol = 100;
+  if (volume == 0) mappedVol = 0;
+  es8311_voice_volume_set(s_audioCodec, mappedVol, &unused);
   es8311_voice_mute(s_audioCodec, false);
-  vTaskDelay(pdMS_TO_TICKS(3));
+  digitalWrite(46, HIGH);  // PA enable
+  vTaskDelay(pdMS_TO_TICKS(10));
 
   size_t off = 0;
   while (off < len) {
@@ -2187,8 +2189,8 @@ static bool playRawCueFromBuffer(const uint8_t* data, size_t len, uint8_t volume
     off += wrote;
     taskYIELD();
   }
-  writeAudioSilenceMs(6);
-  es8311_voice_mute(s_audioCodec, true);
+  vTaskDelay(pdMS_TO_TICKS(50));
+  digitalWrite(46, LOW);  // PA disable
   return off == len;
 }
 
@@ -2278,11 +2280,14 @@ static void audioCueWorkerTask(void* arg) {
     s_audioCueBusy = true;
     if (s_audioCueReady && s_audioCueBuf && s_audioCueLen > 0) {
       bool played = false;
+      uint32_t cueStart = millis();
       for (int attempt = 0; attempt < 3; attempt++) {
         if (playRawCueFromBuffer(s_audioCueBuf, s_audioCueLen, req.volume)) { played = true; break; }
         vTaskDelay(pdMS_TO_TICKS(200));
       }
-      appendDiagLog("[CUE] played=%d len=%u vol=%d\n", (int)played, (unsigned)s_audioCueLen, (int)req.volume);
+      uint32_t cueDur = millis() - cueStart;
+      appendDiagLog("[CUE] played=%d len=%u vol=%d dur=%lums\n",
+                    (int)played, (unsigned)s_audioCueLen, (int)req.volume, (unsigned long)cueDur);
     } else {
       appendDiagLog("[CUE] worker skip ready=%d buf=%d len=%u\n",
                     (int)s_audioCueReady, (s_audioCueBuf != nullptr), (unsigned)s_audioCueLen);
@@ -7857,8 +7862,9 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
       WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
     WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
 
-    // Power-on reset (after flash) needs longer for radio cold-start
-    int maxTries = (esp_reset_reason() == ESP_RST_POWERON) ? 40 : 20;
+    // Power-on/USB reset (after flash) needs longer for radio cold-start
+    esp_reset_reason_t rst = esp_reset_reason();
+    int maxTries = (rst == ESP_RST_POWERON || rst == ESP_RST_USB) ? 40 : 20;
     int wtries = 0;
     while (WiFi.status() != WL_CONNECTED && wtries++ < maxTries) {
       delay(500);
@@ -11009,7 +11015,7 @@ static void syncWeatherFrames() {
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  http.setReuse(false);
+  http.setReuse(true);
   fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
   appendDiagLog("[SYNC] fetchGibs done ms=%lu\n", millis());
 
@@ -14050,28 +14056,19 @@ void loop() {
       tickerReady = true;
     }
   }
-  if (tickerReady) {
-#if INDEPENDENT_TICKER
-    if (!s_tickerTaskHandle) {
-      s_tickerShouldRun = true;
-      xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
-      appendDiagLog("[INIT] ticker task started handle=%p mode=%d\n", s_tickerTaskHandle, s_tickerMode);
-    }
-#endif
-  } else {
+  if (!tickerReady) {
     updateBarBufs(newestIdx);
   }
 
   // ── PSRAM frame cache: load half-res frames for smooth playback ──
   // Cache exactly 60 frames sampled evenly from validCount → 6fps × 10s, no SD during anim
-  static const int CACHE_SCALE = 3;
-  static const int CACHE_W = SCALED_W / CACHE_SCALE;   // 136
-  static const int CACHE_H = SCALED_H / CACHE_SCALE;   // 120
+  static const int CACHE_W = 160;
+  static const int CACHE_H = 140;
   static const size_t CACHE_FRAME_BYTES = (size_t)CACHE_W * CACHE_H * 2;
-  static const int CACHE_TARGET_FRAMES = 120;
+  static const int CACHE_TARGET_FRAMES = 144;
   static uint16_t* s_animCache = nullptr;
   static int s_animCacheCount = 0;
-  static int s_animCacheMap[120] = {};  // validIdx index for each cache slot
+  static int s_animCacheMap[MAX_FRAMES] = {};  // validIdx index for each cache slot
 
   bool useCache = false;
   if (!s_animCache && validCount > 0 && s_streamReady && s_streamFile) {
@@ -14094,13 +14091,16 @@ void loop() {
         if (!s_streamFile.seek(offset)) break;
         uint16_t* dst = s_animCache + (size_t)ci * CACHE_W * CACHE_H;
         bool readOk = true;
+        int lastDy = -1;
         for (int y = 0; y < SCALED_H; y++) {
           size_t got = s_streamFile.read((uint8_t*)rowBuf, SCALED_W * 2);
           if (got != SCALED_W * 2) { readOk = false; break; }
-          if (y % CACHE_SCALE != 0) continue;
-          int dy = y / CACHE_SCALE;
-          for (int x = 0; x < CACHE_W; x++)
-            dst[dy * CACHE_W + x] = rowBuf[x * CACHE_SCALE];
+          int dy = y * CACHE_H / SCALED_H;
+          if (dy != lastDy) {
+            lastDy = dy;
+            for (int x = 0; x < CACHE_W; x++)
+              dst[dy * CACHE_W + x] = rowBuf[x * SCALED_W / CACHE_W];
+          }
         }
         if (!readOk) break;
         s_animCacheCount++;
@@ -14114,15 +14114,24 @@ void loop() {
   useCache = (s_animCache && s_animCacheCount > 0);
   if (syncProgressIsActive()) syncProgressEnd();
 
+  // Start ticker task AFTER progress bar ends (prevents ticker drawing over progress bar)
+#if INDEPENDENT_TICKER
+  if (tickerReady && !s_tickerTaskHandle) {
+    s_tickerShouldRun = true;
+    xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
+    appendDiagLog("[INIT] ticker task started handle=%p mode=%d\n", s_tickerTaskHandle, s_tickerMode);
+  }
+#endif
+
   // Helper: upscale cached frame into s_frameDisplayBuf (no present)
   auto upscaleCachedFrame = [&](int cacheSlot) {
     if (cacheSlot < 0 || cacheSlot >= s_animCacheCount || !s_frameDisplayBuf) return;
     const uint16_t* src = s_animCache + (size_t)cacheSlot * CACHE_W * CACHE_H;
     for (int y = 0; y < SCALED_H; y++) {
-      const uint16_t* srcRow = src + (y / CACHE_SCALE) * CACHE_W;
+      const uint16_t* srcRow = src + (y * CACHE_H / SCALED_H) * CACHE_W;
       uint16_t* dstRow = s_frameDisplayBuf + y * SCALED_W;
       for (int x = 0; x < SCALED_W; x++)
-        dstRow[x] = srcRow[x / CACHE_SCALE];
+        dstRow[x] = srcRow[x * CACHE_W / SCALED_W];
     }
   };
 
@@ -14135,6 +14144,12 @@ void loop() {
     presentScaledBuf(s_frameDisplayBuf);
     return true;
   };
+
+  // Lag frame tracker — record frames that exceed budget
+  struct LagFrame { uint8_t frameNum; uint16_t upUs; uint16_t presUs; uint16_t totalUs; };
+  LagFrame lagFrames[16] = {};
+  int lagCount = 0;
+  uint32_t compUpMax = 0, compPresMax = 0;
 
   uint32_t loopStartMs = millis();
   int lastDisplayedFrameIdx = -1;
@@ -14231,21 +14246,34 @@ void loop() {
 
     int frameToShow;
     int cacheSlot = -1;
+    static int lastCacheSlot = -1;
     if (useCache) {
-      // Map time position directly to cache slot
+      // Map time directly to cache slot — every slot shown exactly once
       cacheSlot = (int)(((uint64_t)elapsed * (uint64_t)s_animCacheCount) / animationDurationMs);
       if (cacheSlot >= s_animCacheCount) cacheSlot = s_animCacheCount - 1;
       frameToShow = validIdx[s_animCacheMap[cacheSlot]];
     } else {
       frameToShow = validIdx[srcPos];
     }
-    if (frameToShow != lastDisplayedFrameIdx) {
+    bool isNewFrame = useCache ? (cacheSlot != lastCacheSlot) : (frameToShow != lastDisplayedFrameIdx);
+    if (isNewFrame) {
       bool ok = false;
       if (useCache && cacheSlot >= 0) {
+        int64_t tA = esp_timer_get_time();
         if (preUpscaledSlot != cacheSlot)
           upscaleCachedFrame(cacheSlot);
+        int64_t tB = esp_timer_get_time();
         presentScaledBuf(s_frameDisplayBuf);
+        int64_t tC = esp_timer_get_time();
         ok = true;
+        uint32_t upUs = (uint32_t)(tB - tA), presUs = (uint32_t)(tC - tB);
+        uint32_t totalUs = upUs + presUs;
+        if (upUs > compUpMax) compUpMax = upUs;
+        if (presUs > compPresMax) compPresMax = presUs;
+        if (totalUs > framePaceMs * 1000 && lagCount < 16) {
+          lagFrames[lagCount++] = { (uint8_t)animFramesPushed,
+            (uint16_t)(upUs / 100), (uint16_t)(presUs / 100), (uint16_t)(totalUs / 100) };
+        }
       } else {
         ok = showFrame(frameToShow, true);
       }
@@ -14258,6 +14286,7 @@ void loop() {
           }
         }
         lastDisplayedFrameIdx = frameToShow;
+        lastCacheSlot = cacheSlot;
         shownMap[srcPos / 8] |= (1 << (srcPos % 8));
         lastSrcPos = srcPos;
         // Pre-upscale next frame immediately after present
@@ -14271,6 +14300,13 @@ void loop() {
         uint32_t dt = nowFm - lastFrameMs;
         lastFrameMs = nowFm;
         if (animFramesPushed > 1) {
+          // Log any frame gap > 100ms (visible stutter)
+          static int spikeLog = 0;
+          if (dt > 100 && spikeLog < 10) {
+            appendDiagLog("[SPIKE] f%d dt=%lums slot=%d elapsed=%lums\n",
+              animFramesPushed, (unsigned long)dt, cacheSlot, (unsigned long)elapsed);
+            spikeLog++;
+          }
           if (dt < frameMinMs) frameMinMs = dt;
           if (dt > frameMaxMs) frameMaxMs = dt;
         }
@@ -14291,6 +14327,20 @@ void loop() {
                   s_animLoopNum, animFramesPushed, (double)fps,
                   (unsigned long)frameMinMs, (unsigned long)frameMaxMs,
                   validCount, animationDurationMs);
+    // Component peaks
+    appendDiagLog("anim-comp: upMax=%luus presMax=%luus\n",
+                  (unsigned long)compUpMax, (unsigned long)compPresMax);
+    // Lag frames (exceeded budget)
+    if (lagCount > 0) {
+      for (int li = 0; li < lagCount; li++) {
+        appendDiagLog("anim-lag: f%d up=%.1fms pres=%.1fms total=%.1fms\n",
+          (int)lagFrames[li].frameNum,
+          lagFrames[li].upUs / 10.0, lagFrames[li].presUs / 10.0,
+          lagFrames[li].totalUs / 10.0);
+      }
+    } else {
+      appendDiagLog("anim-lag: none (all frames within budget)\n");
+    }
     // Dump shown/skipped map: S=shown, .=skipped
     for (int row = 0; row < validCount; row += 24) {
       char map[32];
