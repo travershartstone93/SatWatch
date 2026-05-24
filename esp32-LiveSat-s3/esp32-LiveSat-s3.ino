@@ -44,7 +44,6 @@
 #include <esp_timer.h>
 #include <driver/gpio.h>   // gpio_wakeup_enable()
 #include <esp_wifi.h>      // esp_wifi_set_protocol()
-#include "SensorQMI8658.hpp"
 // FT3168 touch IC accessed via direct I2C (addr 0x38)
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
 #define ESP32QSPI_MAX_PIXELS_AT_ONCE 4096  // reduce SPI transaction overhead (default 1024)
@@ -633,12 +632,6 @@ static int     s_hurricaneLoopsSinceCheck = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 
 static int s_loopsBeforeSleep = LOOPS_BEFORE_SLEEP;
-static bool s_shakeToWakeEnabled = false;
-static uint16_t s_shakeEntryIgnoreMs = 2000;  // ignore WoM for this long after entering sleep (settle window)
-static uint16_t s_shakeConfirmMs     = 600;   // after settle: require 2nd WoM event within this window (0=any single event wakes)
-static SensorQMI8658 s_qmi;
-static bool s_qmiInitialized = false;
-static bool s_qmiInitFailed = false;  // sticky — prevents infinite retry on hardware failure
 // ──── Forecast data structures ────────────────────────────────────────────────
 struct NowcastSample {
   time_t   timestamp;
@@ -840,7 +833,6 @@ static void loadWifiPortalConfig() {
   s_sleepModeEnabled = true;
   s_autoUpdateInSleep = true;
   s_loopsBeforeSleep = LOOPS_BEFORE_SLEEP;
-  s_shakeToWakeEnabled = false;
   s_lastSuccessfulSyncUtc = 0;
 
   Preferences prefs;
@@ -896,17 +888,6 @@ static void loadWifiPortalConfig() {
       if (lbsl < 1) lbsl = 1;
       if (lbsl > 99) lbsl = 99;
       s_loopsBeforeSleep = lbsl;
-      s_shakeToWakeEnabled = prefs.getBool("stwk", false);
-      {
-        int setms = prefs.getInt("stwksetms", 2000);
-        if (setms < 0) setms = 0;
-        if (setms > 5000) setms = 5000;
-        s_shakeEntryIgnoreMs = (uint16_t)setms;
-        int dbms = prefs.getInt("stwkdbms", 600);
-        if (dbms < 0) dbms = 0;
-        if (dbms > 2000) dbms = 2000;
-        s_shakeConfirmMs = (uint16_t)dbms;
-      }
       s_lastSuccessfulSyncUtc = (time_t)prefs.getULong64("lsyn", 0ULL);
       s_fastBootEnabled = prefs.getBool("fben", true);
       // Hurricane watch config
@@ -992,39 +973,13 @@ static const char* cuePathForMode(StartCueMode mode) {
   }
 }
 
-static void initQmiShakeToWake() {
-  if (s_qmiInitFailed) return;  // don't retry after hardware failure
-  s_qmiInitialized = false;
-  if (!s_qmi.begin(Wire, QMI8658_ADDRESS, SDA, SCL)) {
-    appendDiagLog("qmi: init fail\n");
-    s_qmiInitFailed = true;
-    return;
-  }
-  // WoM hardware path: resets sensor, arms dedicated threshold comparator.
-  // defaultPinValue=1: INT1 idles HIGH (push-pull), pulses LOW on motion.
-  // Pair with GPIO_INTR_LOW_LEVEL and gpio_pullup_en in goToSleep().
-  // 200mg threshold — sensitive enough for wrist flick, filters table vibration.
-  int ret = s_qmi.configWakeOnMotion(255,
-                                     SensorQMI8658::ACC_ODR_LOWPOWER_128Hz,
-                                     SensorQMI8658::INTERRUPT_PIN_1,
-                                     1,     // idle HIGH, goes LOW on motion
-                                     0x20); // 32-sample blanking (~250ms)
-  if (ret != 0) {
-    appendDiagLog("qmi: WoM init fail %d\n", ret);
-    s_qmiInitFailed = true;
-    return;
-  }
-  s_qmiInitialized = true;
-  appendDiagLog("qmi: shake-to-wake WoM init ok INT1=GPIO%d\n", QMI8658_INT1);
-}
 
 static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
                                  UpdateMode updateMode, uint16_t autoUpdateIntervalMin,
                                  bool autoUpdateTopOfHour,
                                  StartCueMode startCueMode, uint8_t chimeVolume,
                                  uint8_t schedCount, const uint16_t* schedMinutes,
-                                 int loopsBeforeSleep, bool shakeToWake,
-                                 int shakeEntryIgnoreMs, int shakeConfirmMs,
+                                 int loopsBeforeSleep,
                                  bool cleanModeEnabled,
                                  bool fastBootEnabled = true) {
   if (!entries) return;
@@ -1050,9 +1005,6 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   const char* derivedPath = cuePathForMode(startCueMode);
   prefs.putString("cuep", (derivedPath && derivedPath[0]) ? derivedPath : "/power_up.raw");
   prefs.putInt("lbsl", loopsBeforeSleep);
-  prefs.putBool("stwk", shakeToWake);
-  prefs.putInt("stwksetms", shakeEntryIgnoreMs);
-  prefs.putInt("stwkdbms", shakeConfirmMs);
   prefs.putBool("clnmd", cleanModeEnabled);
   prefs.putBool("fben", fastBootEnabled);
   // build and save scheduled times string
@@ -1075,12 +1027,8 @@ static void saveWifiPortalConfig(const WifiConfigEntry* entries, bool use12Hour,
   snprintf(s_startCuePath, sizeof(s_startCuePath), "%s",
            (derivedPath && derivedPath[0]) ? derivedPath : "/power_up.raw");
   s_loopsBeforeSleep = loopsBeforeSleep;
-  s_shakeToWakeEnabled = shakeToWake;
-  s_shakeEntryIgnoreMs = (uint16_t)shakeEntryIgnoreMs;
-  s_shakeConfirmMs = (uint16_t)shakeConfirmMs;
   s_cleanModeFeatureEnabled = cleanModeEnabled;
   s_fastBootEnabled = fastBootEnabled;
-  if (shakeToWake && !s_qmiInitialized && s_sleepModeEnabled) initQmiShakeToWake();
   s_scheduledUpdateCount = schedCount;
   for (int i = 0; i < schedCount; i++) s_scheduledUpdateMinutes[i] = schedMinutes[i];
 #if BOARD_IS_AMOLED_206
@@ -1350,16 +1298,6 @@ static void sendWifiPortalPage() {
   html += F("<input type='number' name='lbsl' min='1' max='99' style='width:4em' value='");
   html += String(s_loopsBeforeSleep);
   html += F("'></label></div>");
-  html += F("<div style='margin-top:8px'><label class='flex items-center gap-2 text-sm text-gray-200'>");
-  html += F("<input type='checkbox' name='stwk' value='1'");
-  if (s_shakeToWakeEnabled) html += F(" checked");
-  html += F(">Shake to wake (wrist flick wakes from sleep)</label></div>");
-  html += F("<div style='margin-top:8px'><label class='text-sm text-gray-200'>Shake settle delay (ms): <input type='number' name='stwksetms' min='0' max='5000' style='width:5em' value='");
-  html += String((unsigned)s_shakeEntryIgnoreMs);
-  html += F("'></label><div class='hint'>Ignore motion for this long after pressing sleep (filters arm-settling). Default 2000 ms.</div></div>");
-  html += F("<div style='margin-top:8px'><label class='text-sm text-gray-200'>Shake confirm window (ms): <input type='number' name='stwkdbms' min='0' max='2000' style='width:5em' value='");
-  html += String((unsigned)s_shakeConfirmMs);
-  html += F("'></label><div class='hint'>After the settle delay: require a 2nd motion event within this window. Filters single bumps/knocks. Default 600 ms. 0 = any single motion wakes.</div></div>");
   html += F("<div style='margin-top:8px'><label class='flex items-center gap-2 text-sm text-gray-200'>");
   html += F("<input type='checkbox' name='clnmd' value='1'");
   if (s_cleanModeFeatureEnabled) html += F(" checked");
@@ -1671,13 +1609,6 @@ static void handleWifiPortalSave() {
   int loopsBeforeSleep = s_wifiPortalServer.arg("lbsl").toInt();
   if (loopsBeforeSleep < 1) loopsBeforeSleep = 1;
   if (loopsBeforeSleep > 99) loopsBeforeSleep = 99;
-  bool shakeToWake = s_wifiPortalServer.hasArg("stwk");
-  int shakeEntryIgnoreMs = s_wifiPortalServer.arg("stwksetms").toInt();
-  if (shakeEntryIgnoreMs < 0) shakeEntryIgnoreMs = 0;
-  if (shakeEntryIgnoreMs > 5000) shakeEntryIgnoreMs = 5000;
-  int shakeConfirmMs = s_wifiPortalServer.arg("stwkdbms").toInt();
-  if (shakeConfirmMs < 0) shakeConfirmMs = 0;
-  if (shakeConfirmMs > 2000) shakeConfirmMs = 2000;
   bool cleanModeEnabled = s_wifiPortalServer.hasArg("clnmd");
   bool fastBootEnabled = s_wifiPortalServer.hasArg("fben");
   // Hurricane watch config
@@ -1739,9 +1670,8 @@ static void handleWifiPortalSave() {
 
   saveWifiPortalConfig(entries, use12, (UpdateMode)upMode, (uint16_t)upMins, upTopHour,
                        (StartCueMode)mode, (uint8_t)chimeVol,
-                       schedCount, schedMins, loopsBeforeSleep, shakeToWake,
-                       shakeEntryIgnoreMs, shakeConfirmMs, cleanModeEnabled,
-                       fastBootEnabled);
+                       schedCount, schedMins, loopsBeforeSleep,
+                       cleanModeEnabled, fastBootEnabled);
   s_wifiPortalServer.send(200, "text/html",
                           "<!doctype html><html><body style='font-family:Arial;background:#111827;color:#f9fafb;padding:24px;'>"
                           "<h2>Saved</h2><p>Settings stored. Rebooting now.</p></body></html>");
@@ -11595,25 +11525,6 @@ static void goToSleep(bool buttonOnly = false) {
   gpio_num_t bootPin = (gpio_num_t)BOOT_BTN_GPIO;
   gpio_pullup_en(bootPin);
   gpio_wakeup_enable(bootPin, GPIO_INTR_LOW_LEVEL);
-  if (s_shakeToWakeEnabled && s_qmiInitialized && s_sleepModeEnabled) {
-    // QMI8658 WoM interrupt TOGGLES on each event — it does not latch high or low.
-    // Level is arbitrary ("jump transition state" per the official example).
-    // Strategy: read current INT1 level, arm the OPPOSITE level.
-    // The next wrist flick toggles INT1 to the armed level → ESP32 wakes.
-    gpio_num_t imuPin = (gpio_num_t)QMI8658_INT1;
-    // GPIO21 is shared with AMOLED_PWR_EN. Firmware holds it OUTPUT HIGH for
-    // display power — QMI8658 push-pull output cannot toggle an actively-driven
-    // output pin, and digitalRead() on an output returns the ESP32's own register,
-    // not the physical level. Release the driver so QMI8658 can freely drive the
-    // pin and digitalRead() reflects the actual state.
-    gpio_reset_pin(imuPin);
-    pinMode(QMI8658_INT1, INPUT);  // no pullup — IMU push-pull drives actively; pullup would partially power AMOLED
-    int int1Level = digitalRead(QMI8658_INT1);
-    gpio_int_type_t wakeOn = (int1Level == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
-    gpio_wakeup_enable(imuPin, wakeOn);
-    appendDiagLog("qmi: shake-wake armed INT1=%d wakeOn=%s\n",
-                  int1Level, wakeOn == GPIO_INTR_HIGH_LEVEL ? "HIGH" : "LOW");
-  }
   esp_sleep_enable_gpio_wakeup();
 
   // Flush and unmount SD before the SDMMC clock stops during light sleep.
@@ -11621,7 +11532,7 @@ static void goToSleep(bool buttonOnly = false) {
   // dirty, causing large runs of files to return wrong sector data on wake.
   SD_MMC.end();
 
-  // Outer loop: timer wakes sync silently and re-sleep; button/shake wakes break out.
+  // Outer loop: timer wakes sync silently and re-sleep; button wakes break out.
   esp_sleep_wakeup_cause_t wake;
   do {
     // Reset settle window each sleep cycle (including after timer syncs).
@@ -11649,40 +11560,7 @@ static void goToSleep(bool buttonOnly = false) {
         }
       }
 
-      bool isShakeWake = (wake == ESP_SLEEP_WAKEUP_GPIO) && !topButtonPressed();
-      if (isShakeWake && s_shakeToWakeEnabled && s_qmiInitialized) {
-        int int1Now = digitalRead(QMI8658_INT1);
-        gpio_int_type_t reArmOn = (int1Now == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
-
-        // Settle window: ignore motion within s_shakeEntryIgnoreMs of entering sleep.
-        uint64_t elapsedMs = (esp_timer_get_time() - sleepEntryUs) / 1000ULL;
-        if (s_shakeEntryIgnoreMs > 0 && elapsedMs < (uint64_t)s_shakeEntryIgnoreMs) {
-          Serial.printf("qmi: shake ignored settle-window elapsed=%llums\n", elapsedMs);
-          gpio_wakeup_enable((gpio_num_t)QMI8658_INT1, reArmOn);
-          esp_sleep_enable_gpio_wakeup();
-          continue;
-        }
-
-        // Confirm window: require a 2nd WoM event within s_shakeConfirmMs.
-        if (s_shakeConfirmMs > 0) {
-          bool confirmed = false;
-          uint32_t deadline = (uint32_t)(esp_timer_get_time() / 1000ULL) + s_shakeConfirmMs;
-          while ((int32_t)(deadline - (uint32_t)(esp_timer_get_time() / 1000ULL)) > 0) {
-            if (digitalRead(QMI8658_INT1) != int1Now) {
-              confirmed = true;
-              break;
-            }
-            delay(5);
-          }
-          if (!confirmed) {
-            Serial.println("qmi: shake no-confirm re-arm");
-            gpio_wakeup_enable((gpio_num_t)QMI8658_INT1, reArmOn);
-            esp_sleep_enable_gpio_wakeup();
-            continue;
-          }
-        }
-      }
-      break;  // real wake — exit inner loop
+      break;  // button wake — exit inner loop
     } while (true);
 
     // ── Timer wake: silent background sync, then re-sleep ──
@@ -11740,7 +11618,7 @@ static void goToSleep(bool buttonOnly = false) {
       continue;  // re-enter outer loop → sleep again
     }
 
-    break;  // button/shake wake — exit outer loop for full wake
+    break;  // button wake — exit outer loop for full wake
   } while (true);
 
   // ── Full wake path (button/shake only) ──
@@ -11911,9 +11789,6 @@ static void serviceUserButtons() {
       (uint32_t)(now - pressStartMs) >= TOP_BTN_LONG_PRESS_MS) {
     s_sleepModeEnabled = !s_sleepModeEnabled;
     saveSleepModePreference(s_sleepModeEnabled);
-    if (s_sleepModeEnabled && s_shakeToWakeEnabled && !s_qmiInitialized) {
-      initQmiShakeToWake();
-    }
     updateBarBufs(s_newestCachedIdx);
     longHandled = true;
     lastLongPressMs = now;
@@ -12019,9 +11894,6 @@ void setup() {
   Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
   Serial.println("[INIT] loadWifiPortalConfig");
   loadWifiPortalConfig();  // needed before QMI decision below
-  if (s_shakeToWakeEnabled && s_sleepModeEnabled) {
-    initQmiShakeToWake();
-  }
   configureAxp2101PowerKey();
   Serial.printf("reset reason: %d\n", (int)esp_reset_reason());
   Serial.printf("free heap: %u\n", (unsigned)ESP.getFreeHeap());
@@ -12236,10 +12108,18 @@ void setup() {
   }
 
 
-  // ── Diagnostic log to SD ─────────────────────────────────────────────────
+  // ── Diagnostic log to SD (persistent across boots, 8MB cap) ─────────────
   {
-    File diagF = SD.open(SD_ROOT "/diag.txt", FILE_WRITE);
+    // Check size and reset if over 8MB
+    File diagCheck = SD.open(SD_ROOT "/diag.txt", FILE_READ);
+    bool needsTruncate = false;
+    if (diagCheck) {
+      if (diagCheck.size() > 8UL * 1024UL * 1024UL) needsTruncate = true;
+      diagCheck.close();
+    }
+    File diagF = SD.open(SD_ROOT "/diag.txt", needsTruncate ? FILE_WRITE : FILE_APPEND);
     if (diagF) {
+      diagF.printf("\n════════════════════════════════════════\n");
       int8_t batPct = readAxp2101BatPct();
       int chargeState = readAxp2101ChargeState();
       diagF.printf("LogID=%lu date=pending millis=%lu ms\n", (unsigned long)esp_random(), millis());

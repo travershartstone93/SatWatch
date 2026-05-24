@@ -1,0 +1,325 @@
+
+  ╔══════════════════════════════════════════════════════════╗
+  ║                    SAT WATCH                            ║
+  ║              Live Weather Satellite Display              ║
+  ║                   User Manual                           ║
+  ╚══════════════════════════════════════════════════════════╝
+
+
+  WHAT IS SAT WATCH?
+  ──────────────────
+
+  Sat Watch displays live weather satellite imagery from NASA's
+  GOES-East satellite on a wearable AMOLED display. It shows
+  a 24-hour animation of cloud movement over your location,
+  zooms into terrain views, displays weather forecasts, and
+  shows the current time — all on your wrist.
+
+
+  FIRST BOOT
+  ──────────
+
+  1. Insert a micro SD card (any size, FAT32 formatted).
+
+  2. Power on the device via USB-C.
+
+  3. The screen will show "Sat Watch" with WiFi credentials:
+
+       Network:   Sat Watch
+       Password:  123456789
+
+  4. Connect to the "Sat Watch" WiFi network from your phone
+     or computer.
+
+  5. Open a browser and go to:  http://satwatch.local
+
+  6. Enter your home WiFi network name and password in the
+     first field. Save and reboot.
+
+  7. The device will connect to your WiFi, download satellite
+     imagery, and begin the animation. First boot takes about
+     60-90 seconds.
+
+
+  THE ANIMATION LOOP
+  ──────────────────
+
+  The display cycles through these stages continuously:
+
+  ┌─────────────────────────────────────────────────────┐
+  │  1. SATELLITE ANIMATION (10 seconds)                │
+  │     24 hours of weather in smooth motion.            │
+  │     The top bar shows the frame timestamp and        │
+  │     how many hours ago it was captured.               │
+  │                                                      │
+  │  2. FREEZE + RED BBOX (2 seconds)                   │
+  │     The newest frame holds. Red rectangles flash     │
+  │     showing where the zoom will go.                  │
+  │                                                      │
+  │  3. ZOOM STAGES (3 seconds)                         │
+  │     Three zoom levels into your location,            │
+  │     each held for 1 second.                          │
+  │                                                      │
+  │  4. TERRAIN WIPE (1 second)                         │
+  │     A smooth wipe reveals the terrain layer          │
+  │     (Sentinel-2 satellite imagery at 10m detail).    │
+  │                                                      │
+  │  5. DEEP TERRAIN ZOOM (optional, 3 seconds)         │
+  │     If enabled: three more zoom stages into the      │
+  │     terrain, ending at ~30km showing individual      │
+  │     islands and bays. Radar overlaid if available.    │
+  │                                                      │
+  │  6. CLOCK OVERLAY (4-10 seconds)                    │
+  │     Current local time fades in over the terrain,    │
+  │     holds, then fades out.                           │
+  └─────────────────────────────────────────────────────┘
+
+  After the clock fades, the loop repeats with fresh data.
+
+
+  MOON BUTTONS
+  ────────────
+
+  Three moon phase images appear at the bottom of the
+  display. These are touch buttons:
+
+  ┌──────────┬──────────┬──────────┐
+  │  LEFT    │  CENTER  │  RIGHT   │
+  │  MOON    │  MOON    │  MOON    │
+  ├──────────┼──────────┼──────────┤
+  │ Previous │  Cycle   │   Next   │
+  │ ticker   │ display  │  ticker  │
+  │  mode    │  mode    │   mode   │
+  └──────────┴──────────┴──────────┘
+
+  CENTER MOON — tap to cycle through display modes:
+    Normal      →  Full display with bars and ticker
+    Clean       →  Satellite only, no bars or ticker
+    Time+Clean  →  Clock always visible, no bars
+    Time+Bars   →  Clock always visible with bars
+
+  LEFT/RIGHT MOON — tap to cycle ticker animation modes:
+    Scroll   →  Forecast scrolls continuously
+    Decode   →  Text reveals with scramble animation
+    Fade     →  Text fades in and out
+    Nowcast  →  Static current conditions display
+    None     →  No ticker, hard-cut daily forecasts
+
+  LONG PRESS (3 seconds on any moon) — enter fullscreen
+  mode. The satellite imagery fills the entire display.
+  Triple-tap anywhere to exit fullscreen.
+
+
+  FORECAST TICKER
+  ───────────────
+
+  The bottom bar shows a scrolling weather forecast:
+
+    "24th Sat(Today) 79/72F Drizzle 16kts E"
+
+  This includes:
+    • Day and date with ordinal (1st, 2nd, 3rd...)
+    • (Today) label on the current day
+    • High/low temperature in your chosen unit
+    • Weather condition (Clear, Drizzle, Rain, etc.)
+    • Wind speed and direction (today only)
+    • Weather icon: sun for clear, rain/snow/thunder
+
+  The forecast covers 5 days and updates automatically.
+
+
+  SETTINGS PORTAL
+  ───────────────
+
+  Access the settings portal at any time:
+
+    http://satwatch.local
+
+  Or connect to the "Sat Watch" WiFi network and go to
+  the portal page.
+
+  WIFI NETWORKS
+    • Primary network and up to 4 fallbacks
+    • The device tries each in order until one connects
+
+  TIME FORMAT
+    • 12-hour or 24-hour clock
+
+  UPDATE MODE
+    • Manual: only syncs on reboot
+    • Auto: syncs at regular intervals (15/30/60 min)
+    • Scheduled: syncs at specific times of day
+
+  START CUE
+    • Chime: plays a sound on boot
+    • Vibe pulse: haptic feedback
+    • Off: silent boot
+    • Volume: 0-100
+
+  SLEEP BEHAVIOUR
+    • Loops before sleep: how many animation cycles
+      before the device enters low-power sleep
+    • Shake to wake: flick your wrist to wake from sleep
+    • Display modes: enable/disable the moon button
+      mode cycling feature
+    • Fast boot: skip sync when cache is fresh
+      (boots in ~3 seconds instead of ~60)
+
+  DISPLAY
+    • Clock font size: Small / Medium / Large
+    • Clock color: pick any color
+    • Brightness: 10-255
+    • Animation speed: Fast (7s) / Normal (10s) / Slow (15s)
+    • Clock display time: Short (4s) / Normal (7s) / Long (10s)
+    • Deep terrain zoom: enable extra zoom stages
+      with stage count selector (1/2/3 stages)
+
+  FORECAST
+    • Enable/disable weather forecast bar
+    • Temperature unit: Fahrenheit or Celsius
+    • Ticker animation style (same as moon buttons)
+
+  HURRICANE WATCH
+    • Monitor for Atlantic hurricanes (Cat 1+)
+    • Optional tropical storm and depression alerts
+    • Custom alert sound and volume
+
+  MAINTENANCE
+    • Clear Frames & Reboot: deletes all cached data
+      and forces a full re-download. Use after moving
+      to a new location or if imagery looks corrupted.
+
+
+  GPS TRACKING (MOBILE USE)
+  ─────────────────────────
+
+  For travelers or mobile use:
+
+  1. Open Safari on your iPhone
+  2. Go to:  http://satwatch.local/track
+  3. Tap Share → Add to Home Screen
+  4. Tap the home screen icon anytime to push your
+     iPhone's GPS location to the watch
+
+  The watch will update its satellite view center to
+  your current position.
+
+
+  AUTO-UPDATE
+  ───────────
+
+  When auto-update is enabled, the device syncs fresh
+  satellite imagery in the background. The animation
+  continues playing during the sync — no interruption.
+
+  The update frequency is set in the portal:
+    • Every 15 minutes
+    • Every 30 minutes
+    • Every hour
+    • At specific scheduled times
+
+
+  SLEEP & WAKE
+  ────────────
+
+  After the configured number of animation loops, the
+  device enters low-power sleep. During sleep:
+
+    • The display turns off
+    • WiFi disconnects
+    • Power draw drops to minimal
+
+  To wake the device:
+    • Press the side button (short press)
+    • Shake/flick your wrist (if shake-to-wake is on)
+
+  During sleep, the device can still sync satellite
+  data on a timer so frames are fresh when you wake.
+
+
+  LOCATION
+  ────────
+
+  The watch determines your location automatically using
+  nearby WiFi access points (Apple BSSID geolocation).
+  This typically gives accuracy within 1-2 km.
+
+  Your location is saved and reused on subsequent boots
+  — no GPS or internet needed after the first sync.
+
+  To manually update your location:
+    • Use the GPS tracking feature (see above)
+    • Or clear frames and reboot to re-scan
+
+
+  RADAR OVERLAY
+  ─────────────
+
+  Where available, NOAA radar precipitation data is
+  overlaid on the terrain view. Green/yellow/red pixels
+  show rain intensity. Radar coverage depends on your
+  proximity to NOAA radar stations (primarily US and
+  territories).
+
+
+  NIGHT MODE
+  ──────────
+
+  The terrain layer automatically switches between:
+    • Daytime: Sentinel-2 cloudless imagery (10m detail)
+    • Nighttime: VIIRS Black Marble (city lights view)
+
+  The switch is based on local sunrise/sunset calculated
+  from your GPS coordinates.
+
+
+  TROUBLESHOOTING
+  ───────────────
+
+  STUCK ON WIFI SETUP PAGE
+    Power cycle the device (unplug USB, wait 10 seconds,
+    replug). This resets the WiFi radio hardware.
+
+  YELLOW/CORRUPT FRAMES IN ANIMATION
+    This is a GIBS server issue (wrong colormap). The
+    device automatically detects and rejects these frames.
+    Clear frames and reboot to force a fresh download.
+
+  NO FORECAST DATA
+    The forecast API may be temporarily unavailable.
+    The ticker will appear on the next successful sync.
+
+  ANIMATION STUTTERS / FREEZES
+    Gaps in GIBS satellite data (maintenance windows,
+    nighttime compositing delays) cause the animation
+    to show the same frame for a few seconds. This is
+    normal and not a device issue.
+
+  BOOT LOG
+    Access the diagnostic log at:
+      http://satwatch.local/diag
+
+
+  SPECIFICATIONS
+  ──────────────
+
+  Display:     2.06" AMOLED, 410×502 pixels
+  Processor:   ESP32-S3 dual-core, 240 MHz
+  Memory:      8 MB PSRAM, 32 MB flash
+  Storage:     Micro SD card (FAT32)
+  Connectivity: WiFi 802.11 b/g/n/ax
+  Sensors:     QMI8658 IMU (shake-to-wake)
+               FT3168 capacitive touch
+               PCF85063A real-time clock
+  Audio:       ES8311 codec + speaker
+  Power:       AXP2101 PMIC, USB-C
+  Satellite:   NASA GOES-East GeoColor (10-min cadence)
+  Terrain:     ESA Sentinel-2 cloudless (10m resolution)
+  Radar:       NOAA base reflectivity (where available)
+  Forecast:    NWS (US) / Open-Meteo (worldwide)
+
+
+  ════════════════════════════════════════════════════════
+  Sat Watch — Live weather from space, on your wrist.
+  ════════════════════════════════════════════════════════
+
