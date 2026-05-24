@@ -571,6 +571,16 @@ static bool s_startCuePending = false;
 static bool          s_fastBootEnabled = true;
 static volatile bool s_bgPhase1Done = false;
 static volatile bool s_bgPhase1WifiOk = false;
+
+// Background full sync (replaces ESP.restart auto-update)
+static volatile bool s_bgFullSyncDone = false;
+static volatile bool s_bgFullSyncRunning = false;
+static TaskHandle_t  s_bgFullSyncTaskHandle = nullptr;
+static volatile bool s_syncSuppressUi = false;
+
+// PSRAM animation cache (file-scope for bg sync splice access)
+static uint16_t* s_animCache = nullptr;
+static int       s_animCacheCount = 0;
 static TaskHandle_t  s_bgSyncTaskHandle = nullptr;
 
 // Per-device AP password derived from chip MAC (generated once at boot)
@@ -3347,6 +3357,7 @@ static bool jpegDrawLooksFullFrame() {
 //  UI helpers
 // ─────────────────────────────────────────────────────────────
 static void showMessage(const char* line1, const char* line2 = nullptr) {
+  if (s_syncSuppressUi) return;
 #if BOARD_IS_AMOLED_206
   int screenW = s_amoledOut ? s_amoledOut->width()  : AMOLED_WIDTH;
   int screenH = s_amoledOut ? s_amoledOut->height() : AMOLED_HEIGHT;
@@ -3650,6 +3661,7 @@ static void syncProgressEnd() {
 }
 
 static void showProgress(int current, int total, const char* label) {
+  if (s_syncSuppressUi) return;
   if (syncProgressIsActive() && s_syncProgPhaseUnits > 0) {
     syncProgressSetPhaseProgress(current, total);
     return;
@@ -10780,6 +10792,15 @@ static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
 // ─────────────────────────────────────────────────────────────
 static void fetchForecastData() {
   if (!s_forecastEnabled || !s_weatherGeoValid) return;
+  // Skip if forecast is fresh (< 30 min old)
+  if (s_forecast.valid && s_forecast.lastSyncUtc > 0) {
+    time_t age = time(nullptr) - s_forecast.lastSyncUtc;
+    if (age >= 0 && age < 1800) {
+      appendDiagLog("forecast: cached age=%llds, skip\n", (long long)age);
+      if (syncProgressIsActive()) syncProgressTick(10);
+      return;
+    }
+  }
   Serial.println("forecast: fetching...");
   // Reset forecast state before fetching — prevents stale RTC_DATA_ATTR values
   s_forecast.rainEtaMinutes = -1;
@@ -11030,6 +11051,8 @@ static void syncWeatherFrames() {
   int saved = 0;
   int skipped = 0;
   int dlFail = 0;
+  int consecutiveSkips = 0;
+  bool anyDownloadSucceeded = false;
   char url[512];
   const int fetchCadenceSec = max(60, cadenceMin * 60);
 
@@ -11064,6 +11087,11 @@ static void syncWeatherFrames() {
       stepCount = 1;
     } else if (s_gibsAvailCount > 0) {
       skipped++;
+      consecutiveSkips++;
+      if (anyDownloadSucceeded && consecutiveSkips >= 4) {
+        appendDiagLog("sync: early-exit after %d consecutive skips at slot %d\n", consecutiveSkips, i);
+        break;
+      }
       continue;
     } else {
       stepCount = 7;
@@ -11105,8 +11133,15 @@ static void syncWeatherFrames() {
 
     if (!fetchedOk) {
       dlFail++;
+      consecutiveSkips++;
+      if (anyDownloadSucceeded && consecutiveSkips >= 4) {
+        appendDiagLog("sync: early-exit after %d consecutive fails at slot %d\n", consecutiveSkips, i);
+        break;
+      }
       continue;
     }
+    consecutiveSkips = 0;
+    anyDownloadSucceeded = true;
 
     // Post-validators disabled for sync downloads — nighttime GOES GeoColor
     // frames trigger false positives on block/cyan/band checks due to dark
@@ -11381,10 +11416,65 @@ static void bgSyncPhase1Task(void* param) {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Background full sync task (replaces ESP.restart auto-update)
+// ─────────────────────────────────────────────────────────────
+static void bgFullSyncTask(void* param) {
+  (void)param;
+  s_bgFullSyncRunning = true;
+  s_syncSuppressUi = true;
+  appendDiagLog("[BG-FULL] start ms=%lu\n", millis());
+
+  bool wifiOk = connectWifiForSync(false, nullptr);
+  if (wifiOk) {
+    (void)syncClockFromNtpBestEffort(8);
+    refreshDisplayLocationTimeFromIpInfo();
+
+    // Hurricane check
+    if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
+      HurricaneInfo hStorms[4]; int hCount = 0;
+      if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
+        cleanupSuppressedStorms(hStorms, hCount);
+        for (int hi = 0; hi < hCount; hi++) {
+          if (!isStormSuppressed(hStorms[hi].id)) {
+            enterHurricaneMode(hStorms[hi]);
+            break;
+          }
+        }
+      }
+    }
+
+    syncWeatherFrames();
+    fetchForecastData();
+    s_tickerWidth = 0;
+    downloadMoonFramesIfMissing();
+    s_zoomSnapshotsRefreshPending = true;
+    maybeRefreshPendingZoomSnapshots();
+    noteSuccessfulScanNow();
+    disconnectWifiAfterSync();
+  } else {
+    appendDiagLog("[BG-FULL] wifi failed\n");
+  }
+
+  s_syncSuppressUi = false;
+  s_bgFullSyncRunning = false;
+  s_bgFullSyncDone = true;
+  appendDiagLog("[BG-FULL] done wifi=%d ms=%lu\n", (int)wifiOk, millis());
+  s_bgFullSyncTaskHandle = nullptr;
+  vTaskDelete(nullptr);
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Enter sleep (deep sleep if BOOT pin supports it; light sleep fallback on C6)
 // ─────────────────────────────────────────────────────────────
 static void goToSleep(bool buttonOnly = false) {
   Serial.printf("Sleeping %d h...\n", SLEEP_HOURS);
+  // Kill bg sync task if running (SD/WiFi will be torn down)
+  if (s_bgFullSyncRunning && s_bgFullSyncTaskHandle) {
+    vTaskDelete(s_bgFullSyncTaskHandle);
+    s_bgFullSyncTaskHandle = nullptr;
+    s_bgFullSyncRunning = false;
+    s_syncSuppressUi = false;
+  }
 #if INDEPENDENT_TICKER
   // Safe ticker teardown: signal stop, wait for task to exit, then force-delete as safety net.
   // Task checks s_tickerShouldRun BEFORE taking mutex, so it won't hold mutex when deleted.
@@ -12912,8 +13002,20 @@ static void reverseGeocode(float lat, float lon) {
   }
 }
 
+static bool s_forceGeoRefresh = false;  // set by /setlocation or portal relocate
+
 static void refreshDisplayLocationTimeFromIpInfo() {
   if (WiFi.status() != WL_CONNECTED) return;
+
+  // Skip geo if location already known (saves ~9s of BSSID scanning)
+  if (s_weatherGeoValid && !s_forceGeoRefresh) {
+    selectSatelliteForLon(s_weatherCenterLon);
+    if (syncProgressIsActive()) { syncProgressTick(7); }
+    appendDiagLog("geo: skip (known lat=%.4f lon=%.4f)\n",
+                  (double)s_weatherCenterLat, (double)s_weatherCenterLon);
+    return;
+  }
+  s_forceGeoRefresh = false;
 
   // ── Phase 1: Lat/lon via Starlink GPS or Apple BSSID multi-AP scan ──
   // These run independently of any IP API and are the primary geo source.
@@ -13983,11 +14085,27 @@ void loop() {
     }
   }
 
-  if (autoUpdateDueNow()) {
-    showMessage("Auto update", "Rebooting to rescan");
-    delayWithInputPoll(300);
-    SD_MMC.end();
-    ESP.restart();
+  // Background full sync splice — apply results from bg task
+  if (s_bgFullSyncDone && !s_bgFullSyncRunning) {
+    s_bgFullSyncDone = false;
+    appendDiagLog("[BG-FULL] splice start ms=%lu\n", millis());
+    closeStream();
+    loadIndex();
+    ensureStreamOpen();
+    s_validCount = -1;
+    s_tickerWidth = 0;
+    decodeMoonPhase();
+    // Invalidate PSRAM cache so next loop rebuilds from fresh stream.raw
+    if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; }
+    appendDiagLog("[BG-FULL] splice done ms=%lu\n", millis());
+  }
+
+  // Launch background auto-update (replaces ESP.restart)
+  if (autoUpdateDueNow() && !s_bgFullSyncRunning) {
+    s_bgFullSyncDone = false;
+    s_bgFullSyncRunning = true;
+    xTaskCreatePinnedToCore(bgFullSyncTask, "bgfull", 16384, nullptr, 1, &s_bgFullSyncTaskHandle, 0);
+    appendDiagLog("[BG-FULL] launched ms=%lu\n", millis());
   }
 
   // Loop timing: animation + 2s hold + 3×1s zoom + ~1s terrain + clock ≈ 17-28s.
@@ -14066,8 +14184,6 @@ void loop() {
   static const int CACHE_H = 140;
   static const size_t CACHE_FRAME_BYTES = (size_t)CACHE_W * CACHE_H * 2;
   static const int CACHE_TARGET_FRAMES = 144;
-  static uint16_t* s_animCache = nullptr;
-  static int s_animCacheCount = 0;
   static int s_animCacheMap[MAX_FRAMES] = {};  // validIdx index for each cache slot
 
   bool useCache = false;
@@ -14352,15 +14468,10 @@ void loop() {
     }
   }
 
-  // Freeze on the already-displayed final animation frame.
-  // Avoid any extra frame push at freeze entry (that's where transfer tear occurs).
+  // Freeze: reload full-res frame from SD (animation used low-res PSRAM cache)
   pollCleanModeToggle();
   int holdFrameIdx = (lastDisplayedFrameIdx >= 0) ? lastDisplayedFrameIdx : newestIdx;
-  if (s_frameDisplayBuf) {
-    // Re-present the exact current frame buffer once so the start of the freeze
-    // and the locator-cue redraws are guaranteed to use the same image.
-    presentScaledBuf(s_frameDisplayBuf);
-  }
+  showFrame(holdFrameIdx, true);
   runFreezeZoom3LocatorCue(latestFrameHoldMs, holdFrameIdx);
 
   // Zoom + terrain stages — each step is wall-clock governed so decode time is
