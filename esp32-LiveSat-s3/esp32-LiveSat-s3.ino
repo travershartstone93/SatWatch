@@ -552,11 +552,8 @@ static StartCueMode s_startCueMode = START_CUE_OFF;
 static uint8_t s_chimeVolume = 80;
 static char s_startCuePath[START_CUE_PATH_MAX] = "/power_up.raw";
 static time_t s_lastSuccessfulSyncUtc = 0;
-static uint32_t s_lastSuccessfulScanMs = 0;
-static bool s_lastSuccessfulScanMsValid = false;
 static char s_wifiDisplayName[33] = WIFI_SSID;
 static int16_t s_wifiRssi = -127;
-static bool s_wifiSyncInProgress = false;
 static IPAddress s_wifiPortalApIp(192, 168, 4, 1);
 static DNSServer s_wifiPortalDns;
 static WebServer s_wifiPortalServer(80);
@@ -845,8 +842,6 @@ static void loadWifiPortalConfig() {
   s_loopsBeforeSleep = LOOPS_BEFORE_SLEEP;
   s_shakeToWakeEnabled = false;
   s_lastSuccessfulSyncUtc = 0;
-  s_lastSuccessfulScanMsValid = false;
-  s_lastSuccessfulScanMs = 0;
 
   Preferences prefs;
   if (prefs.begin("satwatch", true)) {
@@ -1113,8 +1108,6 @@ static bool consumeSkipNextSyncOnce() {
 }
 
 static void noteSuccessfulScanNow() {
-  s_lastSuccessfulScanMs = millis();
-  s_lastSuccessfulScanMsValid = true;
 
   time_t nowUtc = time(nullptr);
   if (nowUtc <= 0) return;
@@ -4213,7 +4206,6 @@ static void tickerCopyWindow(int scrollX) {
 
 // ── Decode mode ───────────────────────────────────────────────────────
 static uint16_t* s_decodedBarBuf = nullptr;
-static uint16_t* s_scrambledBarBuf = nullptr;
 static int s_decodeCharXPos[128];
 static int s_decodeCharCount = 0;
 static int s_decodeSegWidth = 0;  // pixel width of current decoded segment
@@ -7843,10 +7835,10 @@ static bool downloadFrameToPathAtBbox(HTTPClient& http,
 
 static bool connectWifiForSync(bool required, const char* statusLine = "Connecting WiFi...") {
   (void)required;
+  setCpuFrequencyMhz(240);  // TLS handshake needs full CPU speed
   loadWifiPortalConfig();
   bool showStatus = (statusLine != nullptr);
   const char* title = statusLine ? statusLine : "Connecting WiFi...";
-  s_wifiSyncInProgress = true;
 
   if (s_wifiPortalDnsRunning) {
     s_wifiPortalDns.stop();
@@ -7872,7 +7864,16 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
     esp_wifi_set_protocol(WIFI_IF_STA,
       WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
       WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
-    WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
+    WiFi.setSleep(true);  // WIFI_PS_MIN_MODEM — saves ~40-80mA during idle
+    // Try cached BSSID/channel first for faster reconnect (~1-2s saved)
+    static RTC_DATA_ATTR uint8_t s_cachedBssid[6] = {};
+    static RTC_DATA_ATTR int32_t s_cachedChannel = 0;
+    static RTC_DATA_ATTR int     s_cachedSlot = -1;
+    if (s_cachedSlot == slot && s_cachedChannel > 0) {
+      WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass, s_cachedChannel, s_cachedBssid);
+    } else {
+      WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
+    }
 
     // Power-on/USB reset (after flash) needs longer for radio cold-start
     esp_reset_reason_t rst = esp_reset_reason();
@@ -7899,18 +7900,20 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
     Serial.printf("\nWiFi: %s (%s)\n",
                   WiFi.localIP().toString().c_str(),
                   s_wifiConfig[slot].ssid);
-    appendDiagLog("wifi: ok ssid=%s ip=%s rssi=%d millis=%lu ms\n",
+    // Cache BSSID/channel for faster reconnect next time
+    memcpy(s_cachedBssid, WiFi.BSSID(), 6);
+    s_cachedChannel = WiFi.channel();
+    s_cachedSlot = slot;
+    appendDiagLog("wifi: ok ssid=%s ip=%s rssi=%d ch=%d millis=%lu ms\n",
                   s_wifiConfig[slot].ssid,
                   WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI(), millis());
+                  WiFi.RSSI(), (int)s_cachedChannel, millis());
     refreshCachedWifiDisplayState();
-    s_wifiSyncInProgress = false;
     return true;
   }
 
   Serial.println("\nWiFi failed");
   appendDiagLog("wifi: all-slots-failed millis=%lu ms\n", millis());
-  s_wifiSyncInProgress = false;
   return false;
 }
 
@@ -11174,6 +11177,14 @@ static void syncWeatherFrames() {
       continue;
     }
 
+    // Save scaled pixels from validate decode BEFORE semantic check clobbers sprite.
+    // This eliminates decode #3 (re-read + re-decode after semantic neighbor reads).
+    bool rawSavedFromValidate = false;
+    if (s_frameDisplayBuf && ensureSprite()) {
+      scaleSpriteTo410x360(s_frameDisplayBuf);
+      rawSavedFromValidate = true;
+    }
+
     // Semantic outlier check — compare candidate sprite signature with neighbors.
     // Candidate sprite is still in the sprite buffer from validateBufferedWeatherFrameJpeg.
     // Neighbor reads will clobber s_dlBuf and sprite, but the candidate JPEG is
@@ -11251,9 +11262,13 @@ static void syncWeatherFrames() {
       continue;
     }
 
-    // Re-read candidate from slot and decode for raw (s_dlBuf/sprite were clobbered
-    // by semantic check neighbor reads, or are still valid if check was skipped)
-    {
+    // Write raw from saved scaled pixels (eliminates re-read + re-decode)
+    if (rawSavedFromValidate) {
+      if (!writeRawToSlot(i, (const uint8_t*)s_frameDisplayBuf)) {
+        s_idx.rawValid[i] = 0;
+      }
+    } else {
+      // Fallback: re-read and re-decode (shouldn't happen normally)
       size_t rereadLen = 0;
       if (!readJpegFromSlot(i, s_dlBuf, &rereadLen) || rereadLen == 0) {
         s_idx.jpegValid[i] = 0;
@@ -11475,6 +11490,8 @@ static void goToSleep(bool buttonOnly = false) {
     s_bgFullSyncRunning = false;
     s_syncSuppressUi = false;
   }
+  // Free PSRAM animation cache before sleep (frees ~6MB for timer-wake sync)
+  if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; }
 #if INDEPENDENT_TICKER
   // Safe ticker teardown: signal stop, wait for task to exit, then force-delete as safety net.
   // Task checks s_tickerShouldRun BEFORE taking mutex, so it won't hold mutex when deleted.
@@ -11487,6 +11504,10 @@ static void goToSleep(bool buttonOnly = false) {
 #endif
   s_buttonSleepTransition = true;
   closeStream();
+
+  // Shut down WiFi before sleep (saves ~60-100mA during pre-sleep fade)
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
 
   // Mute amp before sleep to prevent wake-pop. The I2S clock stops during
   // light sleep; with amp enabled the bias collapse on wake injects a pop.
@@ -12052,21 +12073,17 @@ void setup() {
   bool sdOk = false;
 #if BOARD_IS_AMOLED_206
   SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
-  // Try 40MHz (SDMMC_FREQ_HIGHSPEED) first — doubles read throughput
-  for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
-    if (sdTry > 0) delay(200);
-    sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
-  }
+  // Try 40MHz once, fall back immediately to 20MHz on failure
+  sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
   if (sdOk) {
     Serial.println("SD mounted at 40MHz");
   } else {
-    // Card doesn't support 40MHz — fall back to 20MHz
     SD_MMC.end();
-    for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
+    for (int sdTry = 0; sdTry < 3 && !sdOk; sdTry++) {
       if (sdTry > 0) delay(200);
       sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
     }
-    if (sdOk) Serial.println("SD mounted at 20MHz (40MHz failed)");
+    if (sdOk) Serial.println("SD mounted at 20MHz");
   }
 #else
   for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
@@ -14002,6 +14019,7 @@ static bool spriteLooksBlackSlabCorrupted() {
 //  loop() — animate frames, sleep after LOOPS_BEFORE_SLEEP
 // ─────────────────────────────────────────────────────────────
 void loop() {
+  setCpuFrequencyMhz(160);  // memory-bound playback doesn't need 240MHz (saves ~20-30mA)
   serviceWifiPortalServer();
   serviceUserButtons();
   if (!framesReady || frameCount == 0) {
@@ -14195,7 +14213,6 @@ void loop() {
       if (syncProgressIsActive()) {
         syncProgressBeginPhase("anim", (uint32_t)cacheCap);
       }
-      uint16_t rowBuf[SCALED_W];
       s_animCacheCount = 0;
       for (int ci = 0; ci < cacheCap; ci++) {
         int vi = (int)((uint32_t)ci * (uint32_t)validCount / (uint32_t)cacheCap);
@@ -14205,20 +14222,16 @@ void loop() {
         int phys = ((int)s_idx.head + idx) % MAX_FRAMES;
         uint32_t offset = (uint32_t)phys * (uint32_t)SCALED_FRAME_BYTES;
         if (!s_streamFile.seek(offset)) break;
+        // Read entire frame in one SD call, then downsample in RAM
+        size_t got = s_streamFile.read((uint8_t*)s_frameDisplayBuf, SCALED_FRAME_BYTES);
+        if (got != SCALED_FRAME_BYTES) break;
         uint16_t* dst = s_animCache + (size_t)ci * CACHE_W * CACHE_H;
-        bool readOk = true;
-        int lastDy = -1;
-        for (int y = 0; y < SCALED_H; y++) {
-          size_t got = s_streamFile.read((uint8_t*)rowBuf, SCALED_W * 2);
-          if (got != SCALED_W * 2) { readOk = false; break; }
-          int dy = y * CACHE_H / SCALED_H;
-          if (dy != lastDy) {
-            lastDy = dy;
-            for (int x = 0; x < CACHE_W; x++)
-              dst[dy * CACHE_W + x] = rowBuf[x * SCALED_W / CACHE_W];
-          }
+        for (int dy = 0; dy < CACHE_H; dy++) {
+          int sy = dy * SCALED_H / CACHE_H;
+          const uint16_t* srcRow = s_frameDisplayBuf + sy * SCALED_W;
+          for (int x = 0; x < CACHE_W; x++)
+            dst[dy * CACHE_W + x] = srcRow[x * SCALED_W / CACHE_W];
         }
-        if (!readOk) break;
         s_animCacheCount++;
         if (syncProgressIsActive()) syncProgressTick(1);
       }
@@ -14272,7 +14285,6 @@ void loop() {
   int animFramesPushed = 0;
   uint32_t frameMinMs = 9999, frameMaxMs = 0;
   uint32_t lastFrameMs = loopStartMs;
-  uint32_t lastSrcPos = 0;
   uint8_t shownMap[(MAX_FRAMES + 7) / 8] = {};
   int preUpscaledSlot = -1;  // cache slot already upscaled into s_frameDisplayBuf
   // Fixed-interval frame pacing for stable FPS when using PSRAM cache
@@ -14404,7 +14416,6 @@ void loop() {
         lastDisplayedFrameIdx = frameToShow;
         lastCacheSlot = cacheSlot;
         shownMap[srcPos / 8] |= (1 << (srcPos % 8));
-        lastSrcPos = srcPos;
         // Pre-upscale next frame immediately after present
         if (useCache && cacheSlot + 1 < s_animCacheCount) {
           upscaleCachedFrame(cacheSlot + 1);
@@ -14514,6 +14525,7 @@ void loop() {
             baseForClockOverlay = terrainShownForClock;
             // Deep terrain zoom stages (S2 cloudless, daytime only)
             if (s_deepTerrainZoomEnabled && !terrainUsesNightLayerForUtc(time(nullptr))) {
+              appendDiagLog("[DEEP-ZOOM] start ms=%lu\n", millis());
               delayWithInputPoll(1000);
               // Compute geometric-mean zoom levels (same formula as download)
               float baseWKm = ZOOM3_FINAL_W_KM, baseHKm = ZOOM3_FINAL_H_KM;
@@ -14533,12 +14545,15 @@ void loop() {
               };
               for (int tz = 0; tz <= finalTzLevel; tz++) {
                 uint32_t tzStart = millis();
-                if (!showZoomSnapshotFrame(tzPaths[tz], newestIdx)) break;
+                bool tzOk = showZoomSnapshotFrame(tzPaths[tz], newestIdx);
+                appendDiagLog("[DEEP-ZOOM] tz%d %s ms=%lu\n", tz, tzOk ? "ok" : "FAIL", millis());
+                if (!tzOk) break;
                 int32_t tzRemain = 1000 - (int32_t)(millis() - tzStart);
                 if (tzRemain > 0) delayWithInputPoll((uint32_t)tzRemain);
               }
             }
           } else {
+            appendDiagLog("[TERRAIN] crossfade failed, fallback\n");
             if (showZoomSnapshotFrame(activeTerrainJpegPath(), newestIdx)) {
               terrainShownForClock = true;
               delayWithInputPoll(terrainTransitionMs);
