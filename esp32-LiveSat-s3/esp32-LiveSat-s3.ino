@@ -354,6 +354,16 @@ public:
 
 static LGFX   tft;
 static JPEGDEC jpeg;
+
+// Decode context for background sync — allows bg task to use private sprite/dlBuf
+struct DecodeContext {
+  LGFX_Sprite* sprite;
+  uint8_t*     dlBuf;
+  bool         pixelsByteSwapped;
+};
+// Active decode target — jpegDraw callback writes here (defaults to global sprite)
+static LovyanGFX* s_activeDecodeTarget = nullptr;
+
 #if BOARD_IS_AMOLED_206
 static LGFX_Sprite sprite;
 static LGFX_Sprite s_clockFxSprite;
