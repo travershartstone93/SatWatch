@@ -4594,12 +4594,15 @@ static void renderBarsAtScaledRes(int frameIdx, bool skipBottomBar = false) {
     }
   }
 
-  // Read battery once per bar render so the indicator stays fresh
-  s_batPct = readAxp2101BatPct();
-  s_batChargeState = readAxp2101ChargeState();
-  // Playback normally runs with WiFi off, so this updates cached SSID/RSSI only
-  // when the radio is actually connected and otherwise renders the last known state.
-  refreshCachedWifiDisplayState();
+  // Throttle I2C reads to every 5s (avoids bus contention with touch polling)
+  static uint32_t s_lastBarI2cMs = 0;
+  uint32_t nowBar = millis();
+  if (nowBar - s_lastBarI2cMs > 5000) {
+    s_lastBarI2cMs = nowBar;
+    s_batPct = readAxp2101BatPct();
+    s_batChargeState = readAxp2101ChargeState();
+    refreshCachedWifiDisplayState();
+  }
 
   // Build strings for top (date/time) and bottom (location + radar split)
   // Icon prefix indicates which age: satellite or radar
@@ -6471,6 +6474,11 @@ static void presentScaledBuf(uint16_t* src) {
     int rows = CHUNK_ROWS;
     if (cy + rows > pushH) rows = pushH - cy;
     s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, src + cy * outW, outW, rows);
+    // Poll buttons between chunk pushes (~6.5ms apart, 6 opportunities per frame)
+    if (cy + CHUNK_ROWS < pushH) {
+      serviceUserButtons();
+      pollCleanModeToggle();
+    }
   }
   amoledUnlock();
 #else
@@ -7864,16 +7872,8 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
     esp_wifi_set_protocol(WIFI_IF_STA,
       WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
       WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
-    WiFi.setSleep(true);  // WIFI_PS_MIN_MODEM — saves ~40-80mA during idle
-    // Try cached BSSID/channel first for faster reconnect (~1-2s saved)
-    static RTC_DATA_ATTR uint8_t s_cachedBssid[6] = {};
-    static RTC_DATA_ATTR int32_t s_cachedChannel = 0;
-    static RTC_DATA_ATTR int     s_cachedSlot = -1;
-    if (s_cachedSlot == slot && s_cachedChannel > 0) {
-      WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass, s_cachedChannel, s_cachedBssid);
-    } else {
-      WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
-    }
+    // BSSID/channel cache disabled — was causing WiFi connect failures after flash
+    WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
 
     // Power-on/USB reset (after flash) needs longer for radio cold-start
     esp_reset_reason_t rst = esp_reset_reason();
@@ -7900,14 +7900,10 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
     Serial.printf("\nWiFi: %s (%s)\n",
                   WiFi.localIP().toString().c_str(),
                   s_wifiConfig[slot].ssid);
-    // Cache BSSID/channel for faster reconnect next time
-    memcpy(s_cachedBssid, WiFi.BSSID(), 6);
-    s_cachedChannel = WiFi.channel();
-    s_cachedSlot = slot;
     appendDiagLog("wifi: ok ssid=%s ip=%s rssi=%d ch=%d millis=%lu ms\n",
                   s_wifiConfig[slot].ssid,
                   WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI(), (int)s_cachedChannel, millis());
+                  WiFi.RSSI(), WiFi.channel(), millis());
     refreshCachedWifiDisplayState();
     return true;
   }
@@ -9616,21 +9612,45 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
       return decodeTerrainCompositeToSprite();  // base terrain + base radar
     }
     if (isTerrainStage && tzRadarPath) {
-      // Deep zoom terrain: decode tz JPEG, then overlay per-zoom radar
+      // Deep zoom terrain: decode tz JPEG, then overlay BASE radar (cropped+scaled)
       if (!decodeJpegPathToSprite(path)) return false;
-      if (fileExistsNonEmpty(tzRadarPath) && ensureSprite()) {
+      if (fileExistsNonEmpty(ZOOM_TERRAIN_RADAR_FILE) && ensureSprite()) {
         size_t spriteSz = RAW_FRAME_BYTES;
         uint16_t* terrainPx = (uint16_t*)heap_caps_malloc(spriteSz, MALLOC_CAP_SPIRAM);
         if (terrainPx) {
           memcpy(terrainPx, sprite.getBuffer(), spriteSz);
-          if (decodeJpegPathToSprite(tzRadarPath, true)) {
+          if (decodeJpegPathToSprite(ZOOM_TERRAIN_RADAR_FILE, true)) {
+            float zoomW = ZOOM3_FINAL_W_KM, zoomH = ZOOM3_FINAL_H_KM;
+            if (strcmp(path, TERRAIN_Z1_FILE) == 0) {
+              zoomW = sqrtf(ZOOM3_FINAL_W_KM * sqrtf(ZOOM3_FINAL_W_KM * TERRAIN_ZOOM_FINAL_W_KM));
+              zoomH = sqrtf(ZOOM3_FINAL_H_KM * sqrtf(ZOOM3_FINAL_H_KM * TERRAIN_ZOOM_FINAL_H_KM));
+            } else if (strcmp(path, TERRAIN_Z2_FILE) == 0) {
+              zoomW = sqrtf(ZOOM3_FINAL_W_KM * TERRAIN_ZOOM_FINAL_W_KM);
+              zoomH = sqrtf(ZOOM3_FINAL_H_KM * TERRAIN_ZOOM_FINAL_H_KM);
+            } else {
+              zoomW = TERRAIN_ZOOM_FINAL_W_KM;
+              zoomH = TERRAIN_ZOOM_FINAL_H_KM;
+            }
+            float ratioW = zoomW / ZOOM3_FINAL_W_KM;
+            float ratioH = zoomH / ZOOM3_FINAL_H_KM;
+            int cropW = (int)(DISP_W * ratioW);
+            int cropH = (int)(DISP_H * ratioH);
+            int cropX = (DISP_W - cropW) / 2;
+            int cropY = (DISP_H - cropH) / 2;
             uint16_t* radarPx = (uint16_t*)sprite.getBuffer();
-            for (int i = 0; i < DISP_W * DISP_H; i++) {
-              uint16_t rv = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(radarPx[i]) : radarPx[i];
-              int r = (rv >> 11) & 0x1F, g = ((rv >> 5) & 0x3F) >> 1, b = rv & 0x1F;
-              int sat = max(r, max(g, b)) - min(r, min(g, b));
-              if (sat >= 5 && (r + g + b) >= 8) {
-                terrainPx[i] = radarPx[i];
+            for (int y = 0; y < DISP_H; y++) {
+              int srcY = cropY + (y * cropH) / DISP_H;
+              if (srcY < 0) srcY = 0; if (srcY >= DISP_H) srcY = DISP_H - 1;
+              for (int x = 0; x < DISP_W; x++) {
+                int srcX = cropX + (x * cropW) / DISP_W;
+                if (srcX < 0) srcX = 0; if (srcX >= DISP_W) srcX = DISP_W - 1;
+                uint16_t rp = radarPx[srcY * DISP_W + srcX];
+                uint16_t rv = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(rp) : rp;
+                int r = (rv >> 11) & 0x1F, g = ((rv >> 5) & 0x3F) >> 1, b = rv & 0x1F;
+                int sat = max(r, max(g, b)) - min(r, min(g, b));
+                if (sat >= 5 && (r + g + b) >= 8) {
+                  terrainPx[y * DISP_W + x] = rp;
+                }
               }
             }
           }
@@ -14296,6 +14316,12 @@ void loop() {
     if (elapsed >= animationDurationMs) break;
     // Pace: wait until the next frame tick
     if (useCache) {
+      // Poll buttons during pacing slack
+      while ((int32_t)(nextFrameMs - millis()) > 3) {
+        serviceUserButtons();
+        pollCleanModeToggle();
+        delay(2);
+      }
       int32_t waitMs = (int32_t)(nextFrameMs - millis());
       if (waitMs > 0) delay((uint32_t)waitMs);
     } else {
@@ -14390,6 +14416,8 @@ void loop() {
         int64_t tA = esp_timer_get_time();
         if (preUpscaledSlot != cacheSlot)
           upscaleCachedFrame(cacheSlot);
+        { int vi = s_animCacheMap[cacheSlot];
+          updateBarBufs(validIdx[vi], true); }
         int64_t tB = esp_timer_get_time();
         presentScaledBuf(s_frameDisplayBuf);
         int64_t tC = esp_timer_get_time();
