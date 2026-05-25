@@ -14018,12 +14018,12 @@ void loop() {
     appendDiagLog("[BG-FULL] splice done ms=%lu\n", millis());
   }
 
-  // Launch background auto-update (replaces ESP.restart)
-  if (autoUpdateDueNow() && !s_bgFullSyncRunning) {
-    s_bgFullSyncDone = false;
-    s_bgFullSyncRunning = true;
-    xTaskCreatePinnedToCore(bgFullSyncTask, "bgfull", 16384, nullptr, 1, &s_bgFullSyncTaskHandle, 0);
-    appendDiagLog("[BG-FULL] launched ms=%lu\n", millis());
+  // Auto-update: foreground reboot (bg sync crashes due to shared sprite/dlBuf)
+  if (autoUpdateDueNow()) {
+    showMessage("Auto update", "Resyncing...");
+    delayWithInputPoll(300);
+    SD_MMC.end();
+    ESP.restart();
   }
 
   // Loop timing: animation + 2s hold + 3×1s zoom + ~1s terrain + clock ≈ 17-28s.
