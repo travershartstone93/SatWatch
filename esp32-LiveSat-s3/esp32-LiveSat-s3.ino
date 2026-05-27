@@ -229,6 +229,14 @@ static NullSerialSink s_nullSerial;
 #define WEATHER_LAYER_GOES_EAST   "GOES-East_ABI_GeoColor"
 #define WEATHER_LAYER_GOES_WEST   "GOES-West_ABI_GeoColor"
 #define WEATHER_LAYER_HIMAWARI_IR "Himawari_AHI_Band13_Clean_Infrared"
+#define WEATHER_LAYER_METEOSAT_FES  "msg_fes:ir108"
+#define WEATHER_LAYER_METEOSAT_IODC "msg_iodc:ir108"
+
+// EUMETView WMS endpoint (no API key required)
+#define EUMETVIEW_WMS_BASE \
+  "https://view.eumetsat.int/geoserver/ows" \
+  "?service=WMS&version=1.1.1&request=GetMap" \
+  "&styles=&srs=EPSG:4326"
 
 // ─────────────────────────────────────────────────────────────
 //  LovyanGFX display configuration
@@ -462,6 +470,8 @@ RTC_DATA_ATTR static int     s_activeCadenceMin = CADENCE_MIN;
 RTC_DATA_ATTR static int     s_activeLagHours = GIBS_LAG_HOURS;
 RTC_DATA_ATTR static char    s_activeGibsLayer[48] = WEATHER_LAYER_GOES_EAST;
 RTC_DATA_ATTR static char    s_activeWeatherSource[20] = "GOES-East";
+RTC_DATA_ATTR static bool    s_activeSourceIsEumetview = false;
+RTC_DATA_ATTR static bool    s_activeSourceIsIR = false;
 
 // Battery state — updated once per bar render from AXP2101 PMIC
 static int8_t s_batPct = -1;  // -1 = not yet read / unavailable
@@ -6622,37 +6632,73 @@ static int targetFrameCount() {
 static void setActiveSatelliteProfile(const char* layer,
                                       int cadenceMin,
                                       int lagHours,
-                                      const char* sourceLabel) {
+                                      const char* sourceLabel,
+                                      bool isEumetview = false,
+                                      bool isIR = false) {
   if (!layer || !sourceLabel) return;
+  bool layerChanged = (strcmp(s_activeGibsLayer, layer) != 0);
   strlcpy(s_activeGibsLayer, layer, sizeof(s_activeGibsLayer));
   strlcpy(s_activeWeatherSource, sourceLabel, sizeof(s_activeWeatherSource));
   s_activeCadenceMin = cadenceMin;
   s_activeLagHours = lagHours;
+  s_activeSourceIsEumetview = isEumetview;
+  s_activeSourceIsIR = isIR;
+  // Invalidate land mask when layer changes (bbox will be different)
+  if (layerChanged) SD.remove(SD_ROOT "/frames/landmask.bin");
 }
 
 static void selectSatelliteForLon(float lonDeg, bool force) {
-  // Boundary tests for validation:
-  //  - GOES-West/GOES-East split at ~-110° (verify both crossing directions)
-  //  - GOES-East/Himawari split at ~+60° (APAC IR fallback)
+  // Region boundaries (degrees longitude):
+  //   GOES-West:       lon < -110
+  //   GOES-East:       -110 to -15
+  //   Meteosat FES:    -15 to +40  (Europe/Africa)
+  //   Meteosat IODC:   +40 to +80  (Indian Ocean)
+  //   Himawari IR:     +80 and east
   static constexpr float kGoesSplitLon = -110.0f;
-  static constexpr float kApacSplitLon = 60.0f;
+  static constexpr float kGoesEastLon  = -15.0f;
+  static constexpr float kFesIodcLon   = 40.0f;
+  static constexpr float kIodcHimaLon  = 80.0f;
   static constexpr float kHystDeg = 2.0f;
 
   float lon = normalizeLon180(lonDeg);
+
+  // Himawari IR (Asia-Pacific): lon >= 80
   bool keepHimawari =
-    !force && activeLayerIs(WEATHER_LAYER_HIMAWARI_IR) && (lon >= (kApacSplitLon - kHystDeg));
-  bool enterHimawari = (lon >= (kApacSplitLon + kHystDeg));
+    !force && activeLayerIs(WEATHER_LAYER_HIMAWARI_IR) && (lon >= (kIodcHimaLon - kHystDeg));
+  bool enterHimawari = (lon >= (kIodcHimaLon + kHystDeg));
   if (keepHimawari || enterHimawari) {
-    setActiveSatelliteProfile(WEATHER_LAYER_HIMAWARI_IR, 10, 3, "Himawari-IR");
+    setActiveSatelliteProfile(WEATHER_LAYER_HIMAWARI_IR, 10, 3, "Himawari-IR", false, true);
     return;
   }
 
+  // Meteosat IODC (Indian Ocean): lon 40-80
+  bool keepIodc =
+    !force && activeLayerIs(WEATHER_LAYER_METEOSAT_IODC) &&
+    (lon >= (kFesIodcLon - kHystDeg)) && (lon < (kIodcHimaLon + kHystDeg));
+  bool enterIodc = (lon >= (kFesIodcLon + kHystDeg)) && (lon < (kIodcHimaLon - kHystDeg));
+  if (keepIodc || enterIodc) {
+    setActiveSatelliteProfile(WEATHER_LAYER_METEOSAT_IODC, 15, 3, "Meteosat-IODC", true, true);
+    return;
+  }
+
+  // Meteosat FES (Europe/Africa): lon -15 to +40
+  bool keepFes =
+    !force && activeLayerIs(WEATHER_LAYER_METEOSAT_FES) &&
+    (lon >= (kGoesEastLon - kHystDeg)) && (lon < (kFesIodcLon + kHystDeg));
+  bool enterFes = (lon >= (kGoesEastLon + kHystDeg)) && (lon < (kFesIodcLon - kHystDeg));
+  if (keepFes || enterFes) {
+    setActiveSatelliteProfile(WEATHER_LAYER_METEOSAT_FES, 15, 3, "Meteosat-FES", true, true);
+    return;
+  }
+
+  // GOES-West: lon < -110
   bool keepWest =
     !force && activeLayerIs(WEATHER_LAYER_GOES_WEST) && (lon < (kGoesSplitLon + kHystDeg));
   bool enterWest = (lon < (kGoesSplitLon - kHystDeg));
   if (keepWest || enterWest) {
     setActiveSatelliteProfile(WEATHER_LAYER_GOES_WEST, 10, 2, "GOES-West");
   } else {
+    // GOES-East: -110 to -15 (default for Americas)
     setActiveSatelliteProfile(WEATHER_LAYER_GOES_EAST, 10, 2, "GOES-East");
   }
 }
@@ -6681,12 +6727,24 @@ static bool buildWeatherFrameUrl(char* out, size_t outLen,
   const char* layer = s_activeGibsLayer[0] ? s_activeGibsLayer : WEATHER_LAYER_GOES_EAST;
   char timeISO[32];
   toISO(t, timeISO, sizeof(timeISO));
-  int n = snprintf(out, outLen,
-    "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
-    GIBS_WMS_BASE, layer,
-    (double)bboxWest, (double)bboxSouth,
-    (double)bboxEast, (double)bboxNorth,
-    reqW, reqH, timeISO);
+  int n;
+  if (s_activeSourceIsEumetview) {
+    // EUMETView WMS — uses unescaped format param
+    n = snprintf(out, outLen,
+      "%s&layers=%s&bbox=%.1f,%.1f,%.1f,%.1f&width=%d&height=%d&format=image/jpeg&TIME=%s",
+      EUMETVIEW_WMS_BASE, layer,
+      (double)bboxWest, (double)bboxSouth,
+      (double)bboxEast, (double)bboxNorth,
+      reqW, reqH, timeISO);
+  } else {
+    // NASA GIBS WMS
+    n = snprintf(out, outLen,
+      "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
+      GIBS_WMS_BASE, layer,
+      (double)bboxWest, (double)bboxSouth,
+      (double)bboxEast, (double)bboxNorth,
+      reqW, reqH, timeISO);
+  }
   return (n > 0 && (size_t)n < outLen);
 }
 
@@ -7111,6 +7169,7 @@ static bool buildFilteredZoomRawFromJpeg(const char* jpegPath, const char* rawPa
   if (spriteLooksPartialDecode()) return false;
   if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) return false;
 
+  if (s_activeSourceIsIR) applyFalseColorToSprite();
   applyGentleLowPassOnSprite();
 
   uint16_t* src = (uint16_t*)sprite.getBuffer();
@@ -7541,6 +7600,266 @@ static bool writeRawToSlot(int logicalIdx, const uint8_t* buf) {
   return true;
 }
 
+// False-color IR palettes — land (green) and ocean (blue), shared cyan/white for clouds
+// Index 0 = warm, index 255 = cold cloud tops
+static const uint16_t kIrPaletteLand[256] PROGMEM = {
+  0x0061, 0x0061, 0x0081, 0x0081, 0x0081, 0x0081, 0x0081, 0x00A1,
+  0x00A1, 0x00A1, 0x00A1, 0x00A1, 0x08C1, 0x08C1, 0x08C1, 0x08C1,
+  0x08C1, 0x08E1, 0x08E1, 0x08E1, 0x08E1, 0x08E1, 0x0901, 0x0901,
+  0x0901, 0x0901, 0x0902, 0x0922, 0x0922, 0x0922, 0x0922, 0x0922,
+  0x0942, 0x0942, 0x0942, 0x0942, 0x0942, 0x0962, 0x0962, 0x0962,
+  0x0962, 0x0962, 0x0982, 0x1182, 0x1182, 0x1182, 0x11A2, 0x11A2,
+  0x11A2, 0x11A3, 0x11A3, 0x11C3, 0x11C3, 0x11C3, 0x11C3, 0x11E3,
+  0x11E3, 0x11E3, 0x11E3, 0x11E3, 0x1203, 0x1203, 0x1203, 0x1203,
+  0x1223, 0x1223, 0x1223, 0x1223, 0x1243, 0x1244, 0x1244, 0x1244,
+  0x1244, 0x1A64, 0x1A64, 0x1A64, 0x1A64, 0x1A84, 0x1A84, 0x1A84,
+  0x1A84, 0x1A84, 0x1AA4, 0x1AA4, 0x1AA4, 0x1AA5, 0x1AA5, 0x1AC5,
+  0x1AC5, 0x1AC5, 0x1AC5, 0x1AC5, 0x1AE5, 0x1AE5, 0x1AE5, 0x1AE5,
+  0x1AE5, 0x1B06, 0x1B06, 0x1B06, 0x1B06, 0x1B06, 0x1B26, 0x1B26,
+  0x2326, 0x2326, 0x2326, 0x2326, 0x2346, 0x2347, 0x2347, 0x2347,
+  0x2347, 0x2367, 0x2367, 0x2367, 0x2367, 0x2368, 0x2368, 0x2388,
+  0x2388, 0x2388, 0x2389, 0x2389, 0x2389, 0x23A9, 0x23AA, 0x23AA,
+  0x23AA, 0x23AA, 0x23AA, 0x23AB, 0x23CB, 0x23CB, 0x23CB, 0x23CC,
+  0x23CC, 0x23CC, 0x23EC, 0x23EC, 0x23ED, 0x23ED, 0x23ED, 0x23ED,
+  0x23EE, 0x240E, 0x240E, 0x240E, 0x2C0F, 0x2C0F, 0x2C2F, 0x2C30,
+  0x2C30, 0x2C30, 0x2C30, 0x2C51, 0x2C51, 0x2C51, 0x2C52, 0x2C72,
+  0x2C72, 0x2C73, 0x2C73, 0x2C93, 0x2C94, 0x2C94, 0x2C94, 0x2CB5,
+  0x2CB5, 0x2CB5, 0x2CB6, 0x2CD6, 0x2CD6, 0x34D7, 0x34D7, 0x34F7,
+  0x34F8, 0x34F8, 0x34F8, 0x3519, 0x3519, 0x3D39, 0x3D39, 0x3D39,
+  0x4559, 0x4559, 0x4D7A, 0x4D7A, 0x4D7A, 0x559A, 0x559A, 0x55BA,
+  0x5DBA, 0x5DBB, 0x5DDB, 0x65DB, 0x65FB, 0x6DFB, 0x6DFB, 0x6E1B,
+  0x761C, 0x763C, 0x763C, 0x7E5C, 0x7E5C, 0x7E5C, 0x867C, 0x867D,
+  0x8E9D, 0x8E9D, 0x8E9D, 0x96BD, 0x96BD, 0x9EBD, 0x9EBD, 0x9EDD,
+  0xA6DD, 0xA6DD, 0xA6FE, 0xAEFE, 0xAEFE, 0xB71E, 0xB71E, 0xB71E,
+  0xBF1E, 0xBF3E, 0xC73E, 0xC73E, 0xC75E, 0xCF5E, 0xCF5E, 0xD75E,
+  0xD77F, 0xD77F, 0xDF7F, 0xDF9F, 0xDF9F, 0xE79F, 0xE79F, 0xE79F,
+  0xE79F, 0xE7BF, 0xEFBF, 0xEFBF, 0xEFBF, 0xEFBF, 0xEFDF, 0xF7DF,
+  0xF7DF, 0xF7DF, 0xF7DF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+};
+static const uint16_t kIrPaletteOcean[256] PROGMEM = {
+  0x0022, 0x0022, 0x0022, 0x0022, 0x0022, 0x0022, 0x0023, 0x0023,
+  0x0023, 0x0023, 0x0023, 0x0023, 0x0043, 0x0043, 0x0043, 0x0043,
+  0x0044, 0x0044, 0x0044, 0x0044, 0x0044, 0x0044, 0x0044, 0x0844,
+  0x0844, 0x0844, 0x0845, 0x0865, 0x0865, 0x0865, 0x0865, 0x0865,
+  0x0865, 0x0865, 0x0865, 0x0865, 0x0866, 0x0866, 0x0866, 0x0866,
+  0x0866, 0x0886, 0x0886, 0x0886, 0x0887, 0x0887, 0x0887, 0x0887,
+  0x0887, 0x0887, 0x0887, 0x08A7, 0x08A8, 0x08A8, 0x08A8, 0x08A8,
+  0x08A8, 0x08A8, 0x08A8, 0x08A8, 0x08A9, 0x08A9, 0x10C9, 0x10C9,
+  0x10C9, 0x10C9, 0x10C9, 0x10CA, 0x10CA, 0x10CA, 0x10CA, 0x10CA,
+  0x10EA, 0x10EA, 0x10EA, 0x10EB, 0x10EB, 0x10EB, 0x10EB, 0x10EB,
+  0x10EB, 0x110B, 0x110C, 0x110C, 0x110C, 0x110C, 0x110C, 0x110C,
+  0x112C, 0x112D, 0x112D, 0x112D, 0x192D, 0x192D, 0x192D, 0x192D,
+  0x194E, 0x194E, 0x194E, 0x194E, 0x194E, 0x194E, 0x194F, 0x194F,
+  0x196F, 0x196F, 0x196F, 0x196F, 0x196F, 0x1970, 0x1970, 0x1990,
+  0x1990, 0x1990, 0x1990, 0x1990, 0x1991, 0x19B1, 0x19B1, 0x19B1,
+  0x19B1, 0x19B1, 0x19D1, 0x19D1, 0x19D2, 0x19D2, 0x19F2, 0x19F2,
+  0x19F2, 0x21F2, 0x21F2, 0x2213, 0x2213, 0x2213, 0x2213, 0x2233,
+  0x2233, 0x2233, 0x2233, 0x2234, 0x2254, 0x2254, 0x2254, 0x2254,
+  0x2274, 0x2274, 0x2274, 0x2275, 0x2295, 0x2295, 0x22B5, 0x22B5,
+  0x22D5, 0x22D5, 0x22F5, 0x2316, 0x2316, 0x2336, 0x2336, 0x2B56,
+  0x2B56, 0x2B76, 0x2B96, 0x2B97, 0x2BB7, 0x2BB7, 0x2BD7, 0x2BD7,
+  0x2BF7, 0x2C17, 0x2C17, 0x2C38, 0x2C38, 0x2C58, 0x2C58, 0x3478,
+  0x3498, 0x3498, 0x34B8, 0x34B9, 0x34D9, 0x3CD9, 0x3CF9, 0x3CF9,
+  0x4519, 0x4519, 0x4D3A, 0x4D3A, 0x4D5A, 0x555A, 0x557A, 0x557A,
+  0x5D9A, 0x5D9B, 0x5DBB, 0x65BB, 0x65DB, 0x6DDB, 0x6DFB, 0x6DFB,
+  0x761C, 0x761C, 0x763C, 0x7E3C, 0x7E5C, 0x7E5C, 0x865C, 0x867D,
+  0x8E7D, 0x8E9D, 0x8E9D, 0x96BD, 0x96BD, 0x9EBD, 0x9EBD, 0x9EDD,
+  0xA6DD, 0xA6DD, 0xA6FE, 0xAEFE, 0xAEFE, 0xB71E, 0xB71E, 0xB71E,
+  0xBF1E, 0xBF3E, 0xC73E, 0xC73E, 0xC75E, 0xCF5E, 0xCF5E, 0xD75E,
+  0xD77F, 0xD77F, 0xDF7F, 0xDF9F, 0xDF9F, 0xE79F, 0xE79F, 0xE79F,
+  0xE79F, 0xE7BF, 0xEFBF, 0xEFBF, 0xEFBF, 0xEFBF, 0xEFDF, 0xF7DF,
+  0xF7DF, 0xF7DF, 0xF7DF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+};
+
+// IR land mask — packed bits, 1 = land, 0 = ocean. Built from Blue Marble reference.
+#define IR_LANDMASK_BYTES ((DISP_W * DISP_H + 7) / 8)  // 7040 bytes
+#define IR_LANDMASK_FILE SD_ROOT "/frames/landmask.bin"
+static uint8_t* s_irLandMask = nullptr;  // PSRAM, IR_LANDMASK_BYTES
+
+static bool irLandMaskBit(int idx) {
+  if (!s_irLandMask) return false;
+  return (s_irLandMask[idx >> 3] >> (idx & 7)) & 1;
+}
+
+static void setIrLandMaskBit(int idx, bool val) {
+  if (!s_irLandMask) return;
+  if (val) s_irLandMask[idx >> 3] |=  (1 << (idx & 7));
+  else     s_irLandMask[idx >> 3] &= ~(1 << (idx & 7));
+}
+
+// Build land mask from Blue Marble JPEG already decoded into sprite.
+// Land pixels: brighter and greener than ocean.
+static void buildLandMaskFromSprite() {
+  if (!s_irLandMask) {
+    s_irLandMask = (uint8_t*)heap_caps_calloc(IR_LANDMASK_BYTES, 1, MALLOC_CAP_SPIRAM);
+    if (!s_irLandMask) return;
+  }
+  memset(s_irLandMask, 0, IR_LANDMASK_BYTES);
+  const uint16_t* px = (const uint16_t*)sprite.getBuffer();
+  if (!px) return;
+  bool swapped = s_mainSpritePixelsByteSwapped;
+
+  // First pass: classify each pixel
+  for (int i = 0; i < DISP_W * DISP_H; i++) {
+    uint16_t c = swapped ? __builtin_bswap16(px[i]) : px[i];
+    int r5 = (c >> 11) & 0x1F;
+    int g6 = (c >> 5) & 0x3F;
+    int b5 = c & 0x1F;
+    int r8 = (r5 << 3) | (r5 >> 2);
+    int g8 = (g6 << 2) | (g6 >> 4);
+    int b8 = (b5 << 3) | (b5 >> 2);
+    int brightness = (r8 + g8 + b8) / 3;
+    int greenExcess = g8 - (r8 + b8) / 2;
+    bool isLand = (brightness > 40) && (greenExcess > -10 || brightness > 80);
+    setIrLandMaskBit(i, isLand);
+  }
+
+  // Simple 3x3 box blur to smooth coastlines (majority vote)
+  uint8_t* tmp = (uint8_t*)heap_caps_calloc(IR_LANDMASK_BYTES, 1, MALLOC_CAP_SPIRAM);
+  if (tmp) {
+    for (int y = 1; y < DISP_H - 1; y++) {
+      for (int x = 1; x < DISP_W - 1; x++) {
+        int sum = 0;
+        for (int dy = -1; dy <= 1; dy++)
+          for (int dx = -1; dx <= 1; dx++)
+            sum += irLandMaskBit((y + dy) * DISP_W + (x + dx)) ? 1 : 0;
+        int idx = y * DISP_W + x;
+        if (sum >= 5)
+          tmp[idx >> 3] |= (1 << (idx & 7));
+      }
+    }
+    memcpy(s_irLandMask, tmp, IR_LANDMASK_BYTES);
+    heap_caps_free(tmp);
+  }
+}
+
+// Save land mask to SD for reuse across boots
+static bool saveIrLandMask() {
+  if (!s_irLandMask) return false;
+  SD.remove(IR_LANDMASK_FILE);
+  File f = SD.open(IR_LANDMASK_FILE, FILE_WRITE);
+  if (!f) return false;
+  size_t wrote = f.write(s_irLandMask, IR_LANDMASK_BYTES);
+  f.flush();
+  f.close();
+  return (wrote == IR_LANDMASK_BYTES);
+}
+
+// Load land mask from SD into PSRAM
+static bool loadIrLandMask() {
+  if (!s_irLandMask) {
+    s_irLandMask = (uint8_t*)heap_caps_calloc(IR_LANDMASK_BYTES, 1, MALLOC_CAP_SPIRAM);
+    if (!s_irLandMask) return false;
+  }
+  File f = SD.open(IR_LANDMASK_FILE, FILE_READ);
+  if (!f || f.size() != IR_LANDMASK_BYTES) {
+    if (f) f.close();
+    return false;
+  }
+  size_t got = f.read(s_irLandMask, IR_LANDMASK_BYTES);
+  f.close();
+  return (got == IR_LANDMASK_BYTES);
+}
+
+// Download Sentinel-2 cloudless reference at given bbox, build and save land mask.
+// Uses s_dlBuf and sprite (caller must ensure they're available).
+static bool downloadAndBuildIrLandMask(float bboxW, float bboxS, float bboxE, float bboxN) {
+  if (!ensureSprite()) return false;
+
+  char url[512];
+  int n = snprintf(url, sizeof(url),
+    "https://tiles.maps.eox.at/wms"
+    "?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap"
+    "&LAYERS=s2cloudless-2024"
+    "&STYLES=&SRS=EPSG:4326"
+    "&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d"
+    "&FORMAT=image%%2Fjpeg",
+    (double)bboxW, (double)bboxS, (double)bboxE, (double)bboxN,
+    DISP_W, DISP_H);
+  if (n <= 0 || (size_t)n >= sizeof(url)) return false;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, url);
+  http.setTimeout(10000);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    appendDiagLog("landmask: S2 HTTP-%d\n", code);
+    return false;
+  }
+
+  int contentLen = http.getSize();
+  if (contentLen <= 0 || contentLen > (int)DL_BUF_BYTES) {
+    http.end();
+    return false;
+  }
+  WiFiClient* stream = http.getStreamPtr();
+  size_t rd = 0;
+  while (rd < (size_t)contentLen) {
+    size_t avail = stream->available();
+    if (avail == 0) { delay(1); continue; }
+    size_t chunk = stream->readBytes((char*)(s_dlBuf + rd), min(avail, (size_t)contentLen - rd));
+    if (chunk == 0) break;
+    rd += chunk;
+  }
+  http.end();
+  if ((int)rd < 1000) return false;
+
+  // Decode Blue Marble JPEG into sprite
+  LovyanGFX* prevTarget = g_drawTarget;
+  sprite.fillScreen(TFT_BLACK);
+  g_drawTarget = &sprite;
+  resetJpegDrawStats();
+  bool ok = false;
+  if (jpeg.openRAM(s_dlBuf, (int)rd, jpegDraw)) {
+    if (jpeg.getWidth() == DISP_W && jpeg.getHeight() == DISP_H) {
+      jpeg.setPixelType(RGB565_BIG_ENDIAN);
+      ok = jpeg.decode(0, 0, 0);
+    }
+    jpeg.close();
+  }
+  g_drawTarget = prevTarget;
+  if (!ok) { appendDiagLog("landmask: decode fail\n"); return false; }
+
+  buildLandMaskFromSprite();
+  saveIrLandMask();
+  appendDiagLog("landmask: built ok\n");
+  return true;
+}
+
+// Ensure IR land mask is available (load from SD or download fresh)
+static void ensureIrLandMask(float bboxW, float bboxS, float bboxE, float bboxN) {
+  if (!s_activeSourceIsIR) return;
+  if (loadIrLandMask()) return;
+  downloadAndBuildIrLandMask(bboxW, bboxS, bboxE, bboxN);
+}
+
+// Apply false-color IR palette to sprite buffer in-place.
+// Uses land mask to pick green (land) or blue (ocean) palette per pixel.
+static void applyFalseColorToSprite() {
+  uint16_t* px = (uint16_t*)sprite.getBuffer();
+  if (!px) return;
+  bool swapped = s_mainSpritePixelsByteSwapped;
+  bool haveMask = (s_irLandMask != nullptr);
+  int total = DISP_W * DISP_H;
+  for (int i = 0; i < total; i++) {
+    uint16_t c = swapped ? __builtin_bswap16(px[i]) : px[i];
+    uint8_t r5 = (c >> 11) & 0x1F;
+    uint8_t g6 = (c >> 5) & 0x3F;
+    uint8_t b5 = c & 0x1F;
+    uint8_t r8 = (r5 << 3) | (r5 >> 2);
+    uint8_t g8 = (g6 << 2) | (g6 >> 4);
+    uint8_t b8 = (b5 << 3) | (b5 >> 2);
+    uint8_t lum = (uint8_t)((r8 * 77 + g8 * 150 + b8 * 29) >> 8);
+    bool isLand = haveMask && irLandMaskBit(i);
+    const uint16_t* lut = isLand ? kIrPaletteLand : kIrPaletteOcean;
+    uint16_t colored = pgm_read_word(&lut[lum]);
+    px[i] = swapped ? __builtin_bswap16(colored) : colored;
+  }
+}
+
 // Decode JPEG from s_dlBuf, validate all sprite checks, scale, write raw slot.
 // Returns true if raw slot was successfully written.
 static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
@@ -7579,6 +7898,9 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   if (spriteLooksCyanWhiteBlockCorrupted()) { appendDiagLog("rawdec[%d]: cyanwhite\n", logicalIdx); return false; }
   if (spriteLooksBottomBandJunkCorrupted()) { appendDiagLog("rawdec[%d]: bottomband\n", logicalIdx); return false; }
   // slab detector disabled — GOES-West disk edge triggers false positives for limb regions
+
+  // Apply false-color palette to IR sources (already validated on raw grayscale above)
+  if (s_activeSourceIsIR) applyFalseColorToSprite();
 
   scaleSpriteTo410x360(s_frameDisplayBuf);
 
@@ -8266,9 +8588,12 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
       return false;
     }
   }
+  // Apply false-color palette to IR sources (validated on raw grayscale above)
+  if (s_activeSourceIsIR) applyFalseColorToSprite();
+
   // GIBS color-shift: wrong colormap produces solid yellow/orange frames.
-  // Normal frames have blue ocean. Reject if avg color is warm with no blue.
-  {
+  // Only applies to GeoColor — IR sources use our false-color palette.
+  if (!s_activeSourceIsIR) {
     const uint16_t* px = (const uint16_t*)sprite.getBuffer();
     if (px) {
       uint32_t rSum = 0, gSum = 0, bSum = 0, count = 0;
@@ -9592,7 +9917,9 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
     }
     if (loadRawStage(rawPath)) return true;
     if (ensureFilteredZoomRaw(path, true) && loadRawStage(rawPath)) return true;
-    return decodeJpegPathToSprite(path);
+    if (!decodeJpegPathToSprite(path)) return false;
+    if (s_activeSourceIsIR) applyFalseColorToSprite();
+    return true;
   };
 
   if (!decodeStage()) {
@@ -10984,22 +11311,29 @@ static void syncWeatherFrames() {
     return;
   }
 
-  // Fetch GIBS available times
+  // Fetch GIBS available times (skip for EUMETView — no DescribeDomains support)
   appendDiagLog("[SYNC] fetchGibs start ms=%lu\n", millis());
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setReuse(true);
-  fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
-  appendDiagLog("[SYNC] fetchGibs done ms=%lu\n", millis());
+  if (!s_activeSourceIsEumetview) {
+    fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
+  } else {
+    s_gibsAvailCount = 0;
+  }
+  appendDiagLog("[SYNC] fetchGibs done ms=%lu src=%s\n", millis(), s_activeWeatherSource);
 
   // Download frames
-  if (!syncProgressIsActive()) showMessage("Updating cache...", "NASA GIBS");
+  if (!syncProgressIsActive()) showMessage("Updating cache...", s_activeSourceIsEumetview ? "EUMETView" : "NASA GIBS");
   if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
   appendDiagLog("[SYNC] download loop start dl=%d total=%d ms=%lu\n", downloadCount, totalFrames, millis());
 
   float bboxWest, bboxSouth, bboxEast, bboxNorth;
   getActiveWeatherBbox(&bboxWest, &bboxSouth, &bboxEast, &bboxNorth);
+
+  // Ensure IR land mask is ready (downloads Blue Marble reference if needed)
+  ensureIrLandMask(bboxWest, bboxSouth, bboxEast, bboxNorth);
 
   int saved = 0;
   int skipped = 0;
@@ -14179,6 +14513,8 @@ void loop() {
   LagFrame lagFrames[16] = {};
   int lagCount = 0;
   uint32_t compUpMax = 0, compPresMax = 0;
+  // Frame time histogram: buckets [<60] [60-64] [65-69] [70-74] [75-79] [80-84] [85-89] [90+] ms
+  uint8_t ftHist[8] = {};
 
   uint32_t loopStartMs = millis();
   int lastDisplayedFrameIdx = -1;
@@ -14344,6 +14680,9 @@ void loop() {
           }
           if (dt < frameMinMs) frameMinMs = dt;
           if (dt > frameMaxMs) frameMaxMs = dt;
+          // Histogram: <60, 60-64, 65-69, 70-74, 75-79, 80-84, 85-89, 90+
+          int bucket = (dt < 60) ? 0 : (dt >= 90) ? 7 : (int)((dt - 60) / 5) + 1;
+          if (bucket >= 0 && bucket < 8) ftHist[bucket]++;
         }
         // Advance fixed-interval tick
         if (useCache) nextFrameMs += framePaceMs;
@@ -14365,6 +14704,9 @@ void loop() {
     // Component peaks
     appendDiagLog("anim-comp: upMax=%luus presMax=%luus\n",
                   (unsigned long)compUpMax, (unsigned long)compPresMax);
+    appendDiagLog("anim-hist: <60=%d 60-64=%d 65-69=%d 70-74=%d 75-79=%d 80-84=%d 85-89=%d 90+=%d\n",
+                  ftHist[0], ftHist[1], ftHist[2], ftHist[3],
+                  ftHist[4], ftHist[5], ftHist[6], ftHist[7]);
     // Lag frames (exceeded budget)
     if (lagCount > 0) {
       for (int li = 0; li < lagCount; li++) {
