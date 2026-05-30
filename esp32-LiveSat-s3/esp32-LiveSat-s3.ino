@@ -56,6 +56,7 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <JPEGDEC.h>
+#include <pngle.h>       // PNG decoder for RainViewer radar tiles (international.ino)
 
 #include "config-s3.h"
 #include "scramble_glyphs.h"
