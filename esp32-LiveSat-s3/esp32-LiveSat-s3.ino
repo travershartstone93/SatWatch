@@ -9820,7 +9820,13 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
   SD.remove(radarBestPath);
 
   if (!radarOk) {
-    if (hadExistingRadar) {
+    // Check if existing radar is too old to keep (>60 min)
+    bool existingTooOld = false;
+    if (hadExistingRadar && s_lastRadarUtcValid && s_lastRadarUtc > 0) {
+      long ageMin = (long)(difftime(time(nullptr), s_lastRadarUtc) / 60.0);
+      if (ageMin > 60) existingTooOld = true;
+    }
+    if (hadExistingRadar && !existingTooOld) {
       Serial.println("radar weak -> keep prev");
       // Keep existing radar file and timestamp; don't update status flags.
     } else if (anyDownloadSucceeded) {
