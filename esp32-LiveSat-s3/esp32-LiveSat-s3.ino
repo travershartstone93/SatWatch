@@ -226,9 +226,11 @@ static NullSerialSink s_nullSerial;
   "?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap" \
   "&STYLES=&SRS=EPSG:4326"
 
-#define WEATHER_LAYER_GOES_EAST   "GOES-East_ABI_GeoColor"
-#define WEATHER_LAYER_GOES_WEST   "GOES-West_ABI_GeoColor"
-#define WEATHER_LAYER_HIMAWARI_IR "Himawari_AHI_Band13_Clean_Infrared"
+#define WEATHER_LAYER_GOES_EAST     "GOES-East_ABI_GeoColor"
+#define WEATHER_LAYER_GOES_WEST     "GOES-West_ABI_GeoColor"
+#define WEATHER_LAYER_HIMAWARI_IR   "Himawari_AHI_Band13_Clean_Infrared"
+#define WEATHER_LAYER_MTG_GEOCOLOR  "mtg_fd:rgb_geocolour"
+// Legacy (replaced by MTG GeoColor):
 #define WEATHER_LAYER_METEOSAT_FES  "msg_fes:ir108"
 #define WEATHER_LAYER_METEOSAT_IODC "msg_iodc:ir108"
 
@@ -1329,6 +1331,29 @@ static void sendWifiPortalPage() {
             "Open <a href='/track' style='color:#38bdf8'>satwatch.local/track</a> in Safari, "
             "then tap Share &rarr; Add to Home Screen.<br>"
             "Tap the icon anytime to push iPhone GPS to the watch.</div>");
+  // Manual location override
+  html += F("<div class='hint' style='margin-top:12px;border-top:1px solid #444;padding-top:12px'>"
+            "<b>Manual Location:</b><br>"
+            "<span id='curloc'>");
+  html += htmlEscape(s_displayLocationFull);
+  html += F(" (");
+  html += String((double)s_weatherCenterLat, 2);
+  html += F(", ");
+  html += String((double)s_weatherCenterLon, 2);
+  html += F(")</span><br>"
+            "<div style='display:flex;gap:8px;margin:8px 0'>"
+            "<label style='flex:1'>Lat <input type='number' id='mlat' step='0.01' min='-90' max='90' value='");
+  html += String((double)s_weatherCenterLat, 4);
+  html += F("' style='width:100%;background:#1f2937;color:#f9fafb;border:1px solid #374151;padding:4px;border-radius:4px'></label>"
+            "<label style='flex:1'>Lon <input type='number' id='mlon' step='0.01' min='-180' max='180' value='");
+  html += String((double)s_weatherCenterLon, 4);
+  html += F("' style='width:100%;background:#1f2937;color:#f9fafb;border:1px solid #374151;padding:4px;border-radius:4px'></label>"
+            "</div>"
+            "<button onclick=\"fetch('/setlocation?lat='+document.getElementById('mlat').value+'&lon='+document.getElementById('mlon').value)"
+            ".then(r=>r.text()).then(t=>{document.getElementById('locst').innerText=t})\" "
+            "style='background:#2563eb;color:#fff;border:none;padding:6px 16px;border-radius:4px;cursor:pointer'>Set Location</button>"
+            " <span id='locst' style='color:#4ade80'></span>"
+            "</div>");
   html += F("</div>");
   html += F("<script>"
             "var s_rowCount=0;"
@@ -6644,50 +6669,41 @@ static void setActiveSatelliteProfile(const char* layer,
   s_activeSourceIsEumetview = isEumetview;
   s_activeSourceIsIR = isIR;
   // Invalidate land mask when layer changes (bbox will be different)
-  if (layerChanged) SD.remove(SD_ROOT "/frames/landmask.bin");
+  if (layerChanged) {
+    SD.remove(SD_ROOT "/frames/landmask.bin");  // legacy
+    SD.remove(SD_ROOT "/frames/terrain.raw");
+  }
 }
 
 static void selectSatelliteForLon(float lonDeg, bool force) {
   // Region boundaries (degrees longitude):
   //   GOES-West:       lon < -110
   //   GOES-East:       -110 to -15
-  //   Meteosat FES:    -15 to +40  (Europe/Africa)
-  //   Meteosat IODC:   +40 to +80  (Indian Ocean)
-  //   Himawari IR:     +80 and east
+  //   MTG GeoColor:    -15 to +80  (Europe/Africa/Middle East/India)
+  //   Himawari IR:     +80 and east (Asia-Pacific, IR + terrain composite)
   static constexpr float kGoesSplitLon = -110.0f;
   static constexpr float kGoesEastLon  = -15.0f;
-  static constexpr float kFesIodcLon   = 40.0f;
-  static constexpr float kIodcHimaLon  = 80.0f;
+  static constexpr float kMtgHimaLon   = 80.0f;
   static constexpr float kHystDeg = 2.0f;
 
   float lon = normalizeLon180(lonDeg);
 
   // Himawari IR (Asia-Pacific): lon >= 80
   bool keepHimawari =
-    !force && activeLayerIs(WEATHER_LAYER_HIMAWARI_IR) && (lon >= (kIodcHimaLon - kHystDeg));
-  bool enterHimawari = (lon >= (kIodcHimaLon + kHystDeg));
+    !force && activeLayerIs(WEATHER_LAYER_HIMAWARI_IR) && (lon >= (kMtgHimaLon - kHystDeg));
+  bool enterHimawari = (lon >= (kMtgHimaLon + kHystDeg));
   if (keepHimawari || enterHimawari) {
     setActiveSatelliteProfile(WEATHER_LAYER_HIMAWARI_IR, 10, 3, "Himawari-IR", false, true);
     return;
   }
 
-  // Meteosat IODC (Indian Ocean): lon 40-80
-  bool keepIodc =
-    !force && activeLayerIs(WEATHER_LAYER_METEOSAT_IODC) &&
-    (lon >= (kFesIodcLon - kHystDeg)) && (lon < (kIodcHimaLon + kHystDeg));
-  bool enterIodc = (lon >= (kFesIodcLon + kHystDeg)) && (lon < (kIodcHimaLon - kHystDeg));
-  if (keepIodc || enterIodc) {
-    setActiveSatelliteProfile(WEATHER_LAYER_METEOSAT_IODC, 15, 3, "Meteosat-IODC", true, true);
-    return;
-  }
-
-  // Meteosat FES (Europe/Africa): lon -15 to +40
-  bool keepFes =
-    !force && activeLayerIs(WEATHER_LAYER_METEOSAT_FES) &&
-    (lon >= (kGoesEastLon - kHystDeg)) && (lon < (kFesIodcLon + kHystDeg));
-  bool enterFes = (lon >= (kGoesEastLon + kHystDeg)) && (lon < (kFesIodcLon - kHystDeg));
-  if (keepFes || enterFes) {
-    setActiveSatelliteProfile(WEATHER_LAYER_METEOSAT_FES, 15, 3, "Meteosat-FES", true, true);
+  // MTG GeoColor (Europe/Africa/Middle East/India): lon -15 to +80
+  bool keepMtg =
+    !force && activeLayerIs(WEATHER_LAYER_MTG_GEOCOLOR) &&
+    (lon >= (kGoesEastLon - kHystDeg)) && (lon < (kMtgHimaLon + kHystDeg));
+  bool enterMtg = (lon >= (kGoesEastLon + kHystDeg)) && (lon < (kMtgHimaLon - kHystDeg));
+  if (keepMtg || enterMtg) {
+    setActiveSatelliteProfile(WEATHER_LAYER_MTG_GEOCOLOR, 10, 1, "MTG-GeoColor", true, false);
     return;
   }
 
@@ -7169,7 +7185,7 @@ static bool buildFilteredZoomRawFromJpeg(const char* jpegPath, const char* rawPa
   if (spriteLooksPartialDecode()) return false;
   if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) return false;
 
-  if (s_activeSourceIsIR) applyFalseColorToSprite();
+  if (s_activeSourceIsIR) compositeIrOverTerrain();
   applyGentleLowPassOnSprite();
 
   uint16_t* src = (uint16_t*)sprite.getBuffer();
@@ -7600,9 +7616,11 @@ static bool writeRawToSlot(int logicalIdx, const uint8_t* buf) {
   return true;
 }
 
-// False-color IR palettes — land (green) and ocean (blue), shared cyan/white for clouds
-// Index 0 = warm, index 255 = cold cloud tops
-static const uint16_t kIrPaletteLand[256] PROGMEM = {
+// Terrain composite for IR sources — see international.ino
+// (replaced old kIrPaletteLand/Ocean LUTs and applyFalseColorToSprite)
+
+#if 0  // ──── REMOVED: old false-color palette approach ────
+static const uint16_t kIrPaletteLand_REMOVED[256] PROGMEM = {
   0x0061, 0x0061, 0x0081, 0x0081, 0x0081, 0x0081, 0x0081, 0x00A1,
   0x00A1, 0x00A1, 0x00A1, 0x00A1, 0x08C1, 0x08C1, 0x08C1, 0x08C1,
   0x08C1, 0x08E1, 0x08E1, 0x08E1, 0x08E1, 0x08E1, 0x0901, 0x0901,
@@ -7859,6 +7877,7 @@ static void applyFalseColorToSprite() {
     px[i] = swapped ? __builtin_bswap16(colored) : colored;
   }
 }
+#endif  // ──── END REMOVED ────
 
 // Decode JPEG from s_dlBuf, validate all sprite checks, scale, write raw slot.
 // Returns true if raw slot was successfully written.
@@ -7900,7 +7919,7 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   // slab detector disabled — GOES-West disk edge triggers false positives for limb regions
 
   // Apply false-color palette to IR sources (already validated on raw grayscale above)
-  if (s_activeSourceIsIR) applyFalseColorToSprite();
+  if (s_activeSourceIsIR) compositeIrOverTerrain();
 
   scaleSpriteTo410x360(s_frameDisplayBuf);
 
@@ -8589,7 +8608,7 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
     }
   }
   // Apply false-color palette to IR sources (validated on raw grayscale above)
-  if (s_activeSourceIsIR) applyFalseColorToSprite();
+  if (s_activeSourceIsIR) compositeIrOverTerrain();
 
   // GIBS color-shift: wrong colormap produces solid yellow/orange frames.
   // Only applies to GeoColor — IR sources use our false-color palette.
@@ -9918,7 +9937,7 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
     if (loadRawStage(rawPath)) return true;
     if (ensureFilteredZoomRaw(path, true) && loadRawStage(rawPath)) return true;
     if (!decodeJpegPathToSprite(path)) return false;
-    if (s_activeSourceIsIR) applyFalseColorToSprite();
+    if (s_activeSourceIsIR) compositeIrOverTerrain();
     return true;
   };
 
@@ -11333,7 +11352,7 @@ static void syncWeatherFrames() {
   getActiveWeatherBbox(&bboxWest, &bboxSouth, &bboxEast, &bboxNorth);
 
   // Ensure IR land mask is ready (downloads Blue Marble reference if needed)
-  ensureIrLandMask(bboxWest, bboxSouth, bboxEast, bboxNorth);
+  ensureTerrainReference(bboxWest, bboxSouth, bboxEast, bboxNorth);
 
   int saved = 0;
   int skipped = 0;
