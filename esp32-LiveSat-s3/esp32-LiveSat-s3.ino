@@ -9728,6 +9728,26 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
   unsigned long long radarLatestMs = 0ULL;
   unsigned long long selectedRadarMs = 0ULL;
   unsigned long long radarReqBust = 0ULL;
+
+  // International radar: use RainViewer outside US
+  if (!locationHasNoaaRadar()) {
+    if (fetchRainViewerLatestPath(client, http)) {
+      radarOk = downloadRainViewerRadarAtBbox(client, http,
+        bboxWest, bboxSouth, bboxEast, bboxNorth,
+        DISP_W, DISP_H, ZOOM_TERRAIN_RADAR_FILE);
+      if (radarOk) {
+        anyDownloadSucceeded = true;
+        s_radarNoSignatures = false;
+        s_radarDownloadFailed = false;
+        Serial.println("rainviewer radar ok");
+      } else {
+        s_radarDownloadFailed = true;
+        Serial.println("rainviewer radar fail");
+      }
+    }
+  } else {
+  // US radar: NOAA
+  {
   time_t nowUtc = time(nullptr);
   if (nowUtc > 1000000000) {
     radarReqBust = ((unsigned long long)nowUtc * 1000ULL) + (unsigned long long)(millis() & 0x7FFU);
@@ -9735,6 +9755,7 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
     radarReqBust = (unsigned long long)millis();
   }
   if (radarReqBust == 0ULL) radarReqBust = 1ULL;
+  }
   if (fetchRadarLatestTimeMs(http, client, &radarLatestMs) && radarLatestMs > 0ULL) {
     long radarAgeMin = (long)(difftime(time(nullptr), (time_t)(radarLatestMs / 1000ULL)) / 60.0);
     if (radarAgeMin < 0) radarAgeMin = 0;
@@ -9826,6 +9847,7 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
     }
     Serial.printf("radar ok %u\n", (unsigned)bestSignal);
   }
+  } // end NOAA radar else block
 
   // Download radar at each terrain zoom bbox (reuse radarLatestMs from base radar)
   if (radarLatestMs > 0ULL) {
@@ -11114,9 +11136,11 @@ static void fetchForecastData() {
   HTTPClient http;
   http.setReuse(true);
 
-  // Tier 1: Nowcast via radar
+  // Tier 1: Nowcast via radar (NOAA US-only; RainViewer nowcast TBD)
   if (syncProgressIsActive()) syncProgressTick(1);
-  fetchAndAnalyzeNowcastRadar(client, http);
+  if (locationHasNoaaRadar()) {
+    fetchAndAnalyzeNowcastRadar(client, http);
+  }
   if (syncProgressIsActive()) syncProgressTick(3);
 
   // Tier 2+3: NWS → Open-Meteo fallback
