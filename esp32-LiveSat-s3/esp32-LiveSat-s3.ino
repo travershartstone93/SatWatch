@@ -695,6 +695,7 @@ static inline bool isCleanMode()    { return s_displayMode == DISPLAY_CLEAN || s
 static inline bool isTimeAlwaysOn() { return s_displayMode == DISPLAY_TIME_CLEAN || s_displayMode == DISPLAY_TIME_BARS; }
 static bool s_cleanModeFeatureEnabled = false;          // portal checkbox (loaded from NVS)
 static bool s_fullscreenMode = false;                   // runtime-only, resets on reboot/sleep
+static bool s_fullscreenPending = false;               // deferred toggle, applied in animation pacing loop
 static bool s_pinOverlayRequested = false;              // stamp location pin in next presentScaledBuf
 #if BOARD_IS_AMOLED_206
 static I2SClass s_audioI2s;
@@ -5971,21 +5972,13 @@ static void initCleanModeTouch() {
 static void updateBarBufs(int frameIdx, bool skipBottomBar = false);  // forward decl
 
 static void enterFullscreen() {
-  s_fullscreenMode = true;
-  amoledLock();
-  if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
-  amoledUnlock();
+  s_fullscreenPending = true;
 }
 
 static void exitFullscreen() {
-  s_fullscreenMode = false;
-  amoledLock();
-  if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
-  amoledUnlock();
-  s_moonDrawn = false;
-  s_hurricaneHintDrawn = false;
-  updateBarBufs(s_newestCachedIdx);
+  s_fullscreenPending = true;
 }
+
 
 static void cycleDisplayMode() {
   s_displayMode = (s_displayMode + 1) % 4;
@@ -14201,7 +14194,7 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
   }
 #endif
 
-  // Helper: upscale cached frame into s_frameDisplayBuf (no present)
+  // Helper: upscale cached frame into s_frameDisplayBuf (native byte order)
   auto upscaleCachedFrame = [&](int cacheSlot) {
     if (cacheSlot < 0 || cacheSlot >= s_animCacheCount || !s_frameDisplayBuf) return;
     const uint16_t* src = s_animCache + (size_t)cacheSlot * CACHE_W * CACHE_H;
@@ -14249,6 +14242,16 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
       while ((int32_t)(nextFrameMs - millis()) > 3) {
         serviceUserButtons();
         pollCleanModeToggle();
+        if (s_fullscreenPending) {
+          s_fullscreenPending = false;
+          s_fullscreenMode = !s_fullscreenMode;
+          s_moonDrawn = false;
+          s_amoledClearBeforeNextPresent = true;
+          if (!s_fullscreenMode) {
+            s_hurricaneHintDrawn = false;
+            updateBarBufs(newestIdx);
+          }
+        }
         delay(2);
       }
       int32_t waitMs = (int32_t)(nextFrameMs - millis());
@@ -14338,6 +14341,18 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
     } else {
       frameToShow = validIdx[srcPos];
     }
+    // Apply deferred fullscreen toggle (guaranteed check every frame)
+    if (s_fullscreenPending) {
+      s_fullscreenPending = false;
+      s_fullscreenMode = !s_fullscreenMode;
+      s_moonDrawn = false;
+      s_amoledClearBeforeNextPresent = true;
+      if (!s_fullscreenMode) {
+        s_hurricaneHintDrawn = false;
+        updateBarBufs(newestIdx);
+      }
+    }
+
     bool isNewFrame = useCache ? (cacheSlot != lastCacheSlot) : (frameToShow != lastDisplayedFrameIdx);
     if (isNewFrame) {
       bool ok = false;
