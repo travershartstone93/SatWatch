@@ -1220,8 +1220,18 @@ static void sendWifiPortalPage() {
   html += F("<h1>Sat Watch</h1><div class='hint'>Connect this device to your home WiFi and set basic display options.</div>");
   html += F("<form method='POST' action='/save'>");
   html += F("<div class='card'><h2>WiFi Networks</h2>");
+  // Count populated slots to show only what's needed + one empty
+  int lastPopulated = 0;
   for (int i = 0; i < WIFI_CONFIG_SLOTS; ++i) {
-    html += F("<label>");
+    if (s_wifiConfig[i].ssid[0]) lastPopulated = i;
+  }
+  int visibleSlots = min(lastPopulated + 2, WIFI_CONFIG_SLOTS);
+  for (int i = 0; i < WIFI_CONFIG_SLOTS; ++i) {
+    html += F("<div id='ws");
+    html += String(i);
+    html += F("'");
+    if (i >= visibleSlots) html += F(" style='display:none'");
+    html += F("><label>");
     if (i == 0) html += F("Primary Network");
     else {
       html += F("Fallback ");
@@ -1236,8 +1246,16 @@ static void sendWifiPortalPage() {
     html += String(i);
     html += F("' value='");
     html += htmlEscape(s_wifiConfig[i].pass);
-    html += F("'>");
+    html += F("'></div>");
   }
+  html += F("<button type='button' id='addwifi' onclick=\""
+            "for(var i=0;i<");
+  html += String(WIFI_CONFIG_SLOTS);
+  html += F(";i++){var e=document.getElementById('ws'+i);"
+            "if(e&&e.style.display==='none'){e.style.display='';break;}}"
+            "\" style='background:#1f2937;border:1px solid #374151;color:#9ca3af;"
+            "padding:4px 12px;border-radius:4px;margin-top:8px;cursor:pointer'>"
+            "+ Add WiFi Network</button>");
   html += F("</div>");
   html += F("<div class='card'><h2>Device Settings</h2>");
   html += F("<label>Time Format</label><select name='timefmt'>");
@@ -11440,8 +11458,8 @@ static void goToSleep(bool buttonOnly = false) {
     s_bgFullSyncRunning = false;
     s_syncSuppressUi = false;
   }
-  // Free PSRAM animation cache before sleep (frees ~6MB for timer-wake sync)
-  if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; }
+  // Keep PSRAM animation cache across sleep for instant wake playback.
+  // Timer-wake sync will free it if it needs the memory.
 #if INDEPENDENT_TICKER
   // Safe ticker teardown: signal stop, wait for task to exit, then force-delete as safety net.
   // Task checks s_tickerShouldRun BEFORE taking mutex, so it won't hold mutex when deleted.
@@ -11523,7 +11541,10 @@ static void goToSleep(bool buttonOnly = false) {
 
 #if BOARD_IS_AMOLED_206
   gpio_num_t bootPin = (gpio_num_t)BOOT_BTN_GPIO;
+  gpio_reset_pin(bootPin);
+  gpio_set_direction(bootPin, GPIO_MODE_INPUT);
   gpio_pullup_en(bootPin);
+  gpio_pulldown_dis(bootPin);
   gpio_wakeup_enable(bootPin, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
 
@@ -11565,6 +11586,8 @@ static void goToSleep(bool buttonOnly = false) {
 
     // ── Timer wake: silent background sync, then re-sleep ──
     if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
+      // Free PSRAM cache for sync (needs memory for downloads)
+      if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; }
       // Silent background sync — mount SD, sync, unmount, re-sleep
       bool sdOk = false;
       for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
@@ -13923,8 +13946,13 @@ void loop() {
   serviceWifiPortalServer();
   serviceUserButtons();
   if (!framesReady || frameCount == 0) {
-    showMessage("No frames", "Reset to retry download");
-    delayWithInputPoll(5000);
+    showMessage("No frames", "satwatch.local/diag");
+    // Keep portal alive during no-frames state so diag is accessible
+    for (uint32_t t0 = millis(); millis() - t0 < 5000; ) {
+      serviceWifiPortalServer();
+      serviceUserButtons();
+      delay(50);
+    }
     return;
   }
 
