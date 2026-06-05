@@ -14134,6 +14134,10 @@ void loop() {
 
   bool useCache = false;
   if (!s_animCache && validCount > 0 && s_streamReady && s_streamFile) {
+    // Show feedback during cache rebuild (e.g. after timer-wake freed the cache)
+    if (!syncProgressIsActive()) {
+      showMessage("Loading...", nullptr);
+    }
     int cacheCap = min(validCount, CACHE_TARGET_FRAMES);
     size_t cacheNeeded = (size_t)cacheCap * CACHE_FRAME_BYTES;
     s_animCache = (uint16_t*)heap_caps_malloc(cacheNeeded, MALLOC_CAP_SPIRAM);
