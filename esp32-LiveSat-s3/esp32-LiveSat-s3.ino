@@ -4486,11 +4486,13 @@ static void tickerTask(void*) {
         xSemaphoreGive(s_amoledMutex);
         s_tickerPushCount++;
         if (s_tickerPushCount % 100 == 0) {
-          appendDiagLog("[TICKER] push=%u skip=%u contention=%.1f%%\n",
+          #if 0  // verbose perf log disabled
+appendDiagLog("[TICKER] push=%u skip=%u contention=%.1f%%\n",
             (unsigned)s_tickerPushCount, (unsigned)s_tickerSkipCount,
             (s_tickerPushCount + s_tickerSkipCount) > 0
               ? (float)s_tickerSkipCount * 100.0f / (float)(s_tickerPushCount + s_tickerSkipCount)
               : 0.0f);
+#endif
         }
       } else if (needsPush) {
         s_tickerSkipCount++;
@@ -6440,8 +6442,10 @@ static void presentScaledBuf(uint16_t* src) {
   s_presentCount++;
   s_presentUsTotal += (uint64_t)(presentEnd - presentStart);
   if (s_presentCount % 100 == 0) {
-    appendDiagLog("[PERF] present x%u: avg=%lluus\n",
+    #if 0  // verbose perf log disabled
+appendDiagLog("[PERF] present x%u: avg=%lluus\n",
       (unsigned)s_presentCount, s_presentUsTotal / s_presentCount);
+#endif
   }
 
   // Restore clean buffer so terrain crossfade / subsequent reads see no clock residue
@@ -8216,10 +8220,12 @@ static bool showFrame(int idx, bool skipBottomBar = false) {
   s_showFrameSdUsTotal += (uint64_t)(t1 - t0);
   s_showFramePresentUsTotal += (uint64_t)(t2 - t1);
   if (s_showFrameCount % 50 == 0) {
-    appendDiagLog("[PERF] showFrame x%u: sdRead avg=%lluus  present avg=%lluus\n",
+    #if 0  // verbose perf log disabled
+appendDiagLog("[PERF] showFrame x%u: sdRead avg=%lluus  present avg=%lluus\n",
       (unsigned)s_showFrameCount,
       s_showFrameSdUsTotal / s_showFrameCount,
       s_showFramePresentUsTotal / s_showFrameCount);
+#endif
   }
   return true;
 }
@@ -9472,9 +9478,14 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
   SD.remove(radarBestPath);
 
   if (!radarOk) {
-    if (hadExistingRadar) {
-      Serial.println("radar weak -> keep prev");
-      // Keep existing radar file and timestamp; don't update status flags.
+    if (hadExistingRadar && anyDownloadSucceeded) {
+      // Had old radar, new download shows no signal — clear the stale file
+      s_radarNoSignatures = true;
+      s_radarDownloadFailed = false;
+      s_lastRadarCheckUtc = time(nullptr);
+      SD.remove(ZOOM_TERRAIN_RADAR_FILE);
+      clearRadarMeta();
+      appendDiagLog("radar: was stale, now clear\n");
     } else if (anyDownloadSucceeded) {
       // Download reached the service and got a valid JPEG, but no precipitation detected.
       s_radarNoSignatures = true;
@@ -10846,8 +10857,16 @@ static void syncWeatherFrames() {
   if (syncProgressIsActive()) syncProgressBeginPhase("geo", 10U);
   appendDiagLog("[SYNC] refreshGeo start ms=%lu\n", millis());
   refreshDisplayLocationTimeFromIpInfo();
-  appendDiagLog("[SYNC] refreshGeo done ms=%lu\n", millis());
+  appendDiagLog("[SYNC] refreshGeo done valid=%d lat=%.4f lon=%.4f ms=%lu\n",
+                (int)s_weatherGeoValid, (double)s_weatherCenterLat, (double)s_weatherCenterLon, millis());
   if (syncProgressIsActive()) syncProgressCompletePhase();
+
+  // Don't download frames if we don't know where we are
+  if (!s_weatherGeoValid) {
+    appendDiagLog("[SYNC] abort: no valid location\n");
+    showMessage("Location unknown", "Connect WiFi near known APs");
+    return;
+  }
 
   const int cadenceMin = activeCadenceMin();
   const int lagHours = activeLagHours();
@@ -12059,18 +12078,19 @@ void setup() {
     s_timesLoaded = false;
     s_displayUtcOffsetSec = loadUtcOffsetFromNvs();  // restore from NVS; 0 if never synced
     s_displayUtcOffsetValid = loadUtcOffsetValidFromNvs();
-    // Restore last known good location from NVS; fall back to config defaults.
+    // Restore last known good location from NVS.
+    // If NVS is empty, do NOT use hardcoded defaults — leave invalid
+    // so BSSID geo runs before any frames are downloaded.
     {
       float nvsLat, nvsLon;
       if (loadGeoFromNvs(&nvsLat, &nvsLon)) {
         s_weatherCenterLat = nvsLat;
         s_weatherCenterLon = nvsLon;
+        s_weatherGeoValid = true;
       } else {
-        s_weatherCenterLat = (BBOX_SOUTH + BBOX_NORTH) * 0.5f;
-        s_weatherCenterLon = (BBOX_WEST + BBOX_EAST) * 0.5f;
+        s_weatherGeoValid = false;
       }
     }
-    s_weatherGeoValid = true;
     selectSatelliteForLon(s_weatherCenterLon, true);
     s_lastRadarUtc = 0;
     s_lastRadarUtcValid = false;
@@ -12947,14 +12967,7 @@ static bool s_forceGeoRefresh = false;  // set by /setlocation or portal relocat
 static void refreshDisplayLocationTimeFromIpInfo() {
   if (WiFi.status() != WL_CONNECTED) return;
 
-  // Skip geo if location already known (saves ~9s of BSSID scanning)
-  if (s_weatherGeoValid && !s_forceGeoRefresh) {
-    selectSatelliteForLon(s_weatherCenterLon);
-    if (syncProgressIsActive()) { syncProgressTick(7); }
-    appendDiagLog("geo: skip (known lat=%.4f lon=%.4f)\n",
-                  (double)s_weatherCenterLat, (double)s_weatherCenterLon);
-    return;
-  }
+  // Always run BSSID geo on every sync to stay current
   s_forceGeoRefresh = false;
 
   // ── Phase 1: Lat/lon via Starlink GPS or Apple BSSID multi-AP scan ──
@@ -14079,7 +14092,9 @@ void loop() {
       int end = min(row + 24, frameCount);
       for (int j = row; j < end; j++) map[j - row] = s_streamValid[j] ? 'V' : '.';
       map[end - row] = '\0';
-      appendDiagLog("vmap[%03d]: %s\n", row, map);
+      #if 0  // verbose perf log disabled
+appendDiagLog("vmap[%03d]: %s\n", row, map);
+#endif
     }
     // Log jpegLen for all slots so we can see nighttime sizes
     for (int row = 0; row < frameCount; row += 8) {
@@ -14090,7 +14105,9 @@ void loop() {
         pos += snprintf(buf + pos, sizeof(buf) - pos, "%u%s",
                         (unsigned)s_idx.jpegLen[j], j < end - 1 ? "," : "");
       }
-      appendDiagLog("jlen[%03d]: %s\n", row, buf);
+      #if 0  // verbose perf log disabled
+appendDiagLog("jlen[%03d]: %s\n", row, buf);
+#endif
     }
   }
 
@@ -14390,23 +14407,31 @@ void loop() {
   if (s_animLoopNum <= 3) {
     uint32_t actualMs = millis() - loopStartMs;
     float fps = actualMs > 0 ? (float)animFramesPushed * 1000.0f / (float)actualMs : 0;
-    appendDiagLog("anim-loop[%d]: pushed=%d fps=%.1f min=%lums max=%lums vc=%d dur=%lu\n",
+    #if 0  // verbose perf log disabled
+appendDiagLog("anim-loop[%d]: pushed=%d fps=%.1f min=%lums max=%lums vc=%d dur=%lu\n",
                   s_animLoopNum, animFramesPushed, (double)fps,
                   (unsigned long)frameMinMs, (unsigned long)frameMaxMs,
                   validCount, animationDurationMs);
+#endif
     // Component peaks
-    appendDiagLog("anim-comp: upMax=%luus presMax=%luus\n",
+    #if 0  // verbose perf log disabled
+appendDiagLog("anim-comp: upMax=%luus presMax=%luus\n",
                   (unsigned long)compUpMax, (unsigned long)compPresMax);
+#endif
     // Lag frames (exceeded budget)
     if (lagCount > 0) {
       for (int li = 0; li < lagCount; li++) {
-        appendDiagLog("anim-lag: f%d up=%.1fms pres=%.1fms total=%.1fms\n",
+        #if 0  // verbose perf log disabled
+appendDiagLog("anim-lag: f%d up=%.1fms pres=%.1fms total=%.1fms\n",
           (int)lagFrames[li].frameNum,
           lagFrames[li].upUs / 10.0, lagFrames[li].presUs / 10.0,
           lagFrames[li].totalUs / 10.0);
+#endif
       }
     } else {
-      appendDiagLog("anim-lag: none (all frames within budget)\n");
+      #if 0  // verbose perf log disabled
+appendDiagLog("anim-lag: none (all frames within budget)\n");
+#endif
     }
     // Dump shown/skipped map: S=shown, .=skipped
     for (int row = 0; row < validCount; row += 24) {
@@ -14415,7 +14440,9 @@ void loop() {
       for (int j = row; j < end; j++)
         map[j - row] = (shownMap[j / 8] & (1 << (j % 8))) ? 'S' : '.';
       map[end - row] = '\0';
-      appendDiagLog("fmap[%03d]: %s\n", row, map);
+      #if 0  // verbose perf log disabled
+appendDiagLog("fmap[%03d]: %s\n", row, map);
+#endif
     }
   }
 
@@ -14457,8 +14484,10 @@ void loop() {
 #endif
             bool _wOk = runTerrainCrossfadeSegment(newestIdx, true);
 #if INDEPENDENT_TICKER
-            appendDiagLog("[TICKER-DURING-WIPE] push=%u skip=%u\n",
+            #if 0  // verbose perf log disabled
+appendDiagLog("[TICKER-DURING-WIPE] push=%u skip=%u\n",
               (unsigned)(s_tickerPushCount - _wPush0), (unsigned)(s_tickerSkipCount - _wSkip0));
+#endif
 #endif
             _wOk; })) {
             terrainShownForClock = true;
@@ -14555,10 +14584,12 @@ void loop() {
                 loopsDone, s_loopsBeforeSleep,
                 validCount, loopElapsedMs, loopExpectedMs, loopDriftMs);
   float animFps = (animationDurationMs > 0) ? (float)animFramesPushed * 1000.0f / (float)animationDurationMs : 0.0f;
-  appendDiagLog("loop: %d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d fps=%.1f (%d frames/%ums)\n",
+  #if 0  // verbose perf log disabled
+appendDiagLog("loop: %d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d fps=%.1f (%d frames/%ums)\n",
                 loopsDone, s_loopsBeforeSleep, validCount, frameCount, newestIdx,
                 loopElapsedMs, loopExpectedMs, loopDriftMs,
                 (double)animFps, animFramesPushed, animationDurationMs);
+#endif
 
   // Prevent sleep during hurricane mode
   if (s_sleepModeEnabled && !s_hurricaneMode && loopsDone >= s_loopsBeforeSleep) {
