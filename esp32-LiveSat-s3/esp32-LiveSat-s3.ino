@@ -2038,6 +2038,7 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/track", HTTP_GET, handleTrackPage);
 
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
+  registerInternationalHandlers();
   s_wifiPortalHandlersReady = true;
 }
 
