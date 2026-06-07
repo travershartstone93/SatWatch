@@ -1,9 +1,10 @@
-// Minimal test-only file. No sync path changes. No satellite selection changes.
-// Just a /teststb endpoint to test stb_image decode in isolation.
+// International satellite coverage + stb_image test endpoint
 
 extern bool decodeProgressiveJpegToSprite(const uint8_t* data, size_t len,
                                           uint16_t* buf, int w, int h, bool swap);
 extern char g_stbLastError[64];
+
+static bool isEumetviewSource() { return s_activeSourceIsEumetview; }
 
 static void handleTestStb() {
     WiFiClientSecure client;

@@ -44,6 +44,7 @@
 #include <esp_timer.h>
 #include <driver/gpio.h>   // gpio_wakeup_enable()
 #include <esp_wifi.h>      // esp_wifi_set_protocol()
+#include <HTTPUpdate.h>    // OTA firmware update
 // FT3168 touch IC accessed via direct I2C (addr 0x38)
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
 #define ESP32QSPI_MAX_PIXELS_AT_ONCE 4096  // reduce SPI transaction overhead (default 1024)
@@ -87,6 +88,13 @@
 #ifndef ENABLE_SERIAL_DIAG
 #define ENABLE_SERIAL_DIAG 0
 #endif
+
+// ─────────────────────────────────────────────────────────────
+//  OTA firmware update
+// ─────────────────────────────────────────────────────────────
+#define FIRMWARE_VERSION    7
+#define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
+#define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
 #if !ENABLE_SERIAL_DIAG
 class NullSerialSink {
@@ -1559,6 +1567,38 @@ static void sendWifiPortalPage() {
                 "<button type='submit' style='background:#dc2626;'>Clear Frames &amp; Reboot</button>"
               "</form>"
             "</div>"
+            "<div class='card' style='margin-top:14px;border:1px solid #2563eb;'>"
+              "<h2 style='color:#60a5fa;margin-bottom:8px;'>Firmware Update</h2>"
+              "<div class='hint'>Current version: <b>v");
+  html += String(FIRMWARE_VERSION);
+  html += F("</b></div>"
+              "<button type='button' onclick='checkUpdate()' style='background:#2563eb;margin-top:8px;'>Check for Update</button>"
+              "<div id='otastatus' style='margin-top:8px;font-size:14px;'></div>"
+            "</div>"
+            "<script>"
+            "function checkUpdate(){"
+              "var st=document.getElementById('otastatus');"
+              "st.innerText='Checking...';"
+              "fetch('/checkupdate').then(function(r){return r.json();}).then(function(d){"
+                "if(d.update){"
+                  "st.innerHTML='Update available: <b>v'+d.remote+'</b>"
+                    "<br><button type=\"button\" onclick=\"doUpdate()\" "
+                    "style=\"background:#dc2626;color:white;border:0;border-radius:10px;"
+                    "padding:10px 20px;font-size:14px;font-weight:700;margin-top:8px;cursor:pointer\">"
+                    "Install Update</button>';"
+                "}else{"
+                  "st.innerText='Up to date (v'+d.current+')';"
+                "}"
+              "}).catch(function(e){st.innerText='Check failed: '+e;});"
+            "}"
+            "function doUpdate(){"
+              "var st=document.getElementById('otastatus');"
+              "st.innerHTML='<b>Updating... do not power off.</b>';"
+              "fetch('/doupdate').then(function(r){return r.text();}).then(function(t){"
+                "st.innerText=t;"
+              "}).catch(function(e){st.innerText='Update failed: '+e;});"
+            "}"
+            "</script>"
             "</body></html>");
   s_wifiPortalServer.send(200, "text/html", html);
 }
@@ -2019,6 +2059,59 @@ static void handleSetLocation() {
   s_wifiPortalServer.send(200, "text/plain", resp);
 }
 
+// ── OTA update handlers ──
+static void handleCheckUpdate() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, OTA_VERSION_URL);
+  http.setTimeout(10000);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    s_wifiPortalServer.send(200, "application/json",
+      "{\"error\":\"Check failed (HTTP " + String(code) + ")\",\"current\":" + String(FIRMWARE_VERSION) + "}");
+    return;
+  }
+  String body = http.getString();
+  http.end();
+  // Parse {"version": N, ...} — minimal JSON parse
+  int remoteVersion = FIRMWARE_VERSION;
+  int vi = body.indexOf("\"version\"");
+  if (vi >= 0) {
+    int ci = body.indexOf(':', vi);
+    if (ci >= 0) remoteVersion = body.substring(ci + 1).toInt();
+  }
+  bool hasUpdate = remoteVersion > FIRMWARE_VERSION;
+  String resp = "{\"update\":" + String(hasUpdate ? "true" : "false") +
+                ",\"current\":" + String(FIRMWARE_VERSION) +
+                ",\"remote\":" + String(remoteVersion) + "}";
+  s_wifiPortalServer.send(200, "application/json", resp);
+}
+
+static void handleDoUpdate() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.setLedPin(-1);
+  t_httpUpdate_return ret = httpUpdate.update(client, OTA_FIRMWARE_URL);
+  switch (ret) {
+    case HTTP_UPDATE_OK:
+      s_wifiPortalServer.send(200, "text/plain", "Update OK, rebooting...");
+      delay(500);
+      ESP.restart();
+      break;
+    case HTTP_UPDATE_FAILED:
+      s_wifiPortalServer.send(200, "text/plain",
+        "Update failed: " + httpUpdate.getLastErrorString());
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      s_wifiPortalServer.send(200, "text/plain", "No update needed");
+      break;
+  }
+}
+
 static void ensureWifiPortalHandlers() {
   if (s_wifiPortalHandlersReady) return;
   s_wifiPortalServer.on("/", HTTP_GET, sendWifiPortalPage);
@@ -2036,9 +2129,10 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/dl", HTTP_GET, handleDownloadFile);
   s_wifiPortalServer.on("/setlocation", HTTP_GET, handleSetLocation);
   s_wifiPortalServer.on("/track", HTTP_GET, handleTrackPage);
+  s_wifiPortalServer.on("/checkupdate", HTTP_GET, handleCheckUpdate);
+  s_wifiPortalServer.on("/doupdate", HTTP_GET, handleDoUpdate);
 
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
-  registerInternationalHandlers();
   s_wifiPortalHandlersReady = true;
 }
 
