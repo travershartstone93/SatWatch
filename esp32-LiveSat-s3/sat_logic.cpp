@@ -1,9 +1,16 @@
 #include "sat_logic.h"
 
+#ifdef ARDUINO
+#include <cstring>
+#else
+#include <cstring>
+#include <cstdlib>
+#endif
+
 // Layer name constants (must match firmware #defines)
-static const char LAYER_GOES_EAST[]   = "GOES-East_ABI_GeoColor";
-static const char LAYER_GOES_WEST[]   = "GOES-West_ABI_GeoColor";
-static const char LAYER_HIMAWARI_IR[] = "Himawari_AHI_Band13_Clean_Infrared";
+static const char LAYER_GOES_EAST[]    = "GOES-East_ABI_GeoColor";
+static const char LAYER_GOES_WEST[]    = "GOES-West_ABI_GeoColor";
+static const char LAYER_HIMAWARI_IR[]  = "Himawari_AHI_Band13_Clean_Infrared";
 static const char LAYER_MTG_GEOCOLOR[] = "mtg_fd:rgb_geocolour";
 
 static float normalizeLon180(float lon) {
@@ -12,44 +19,45 @@ static float normalizeLon180(float lon) {
     return lon;
 }
 
-static SatProfile makeProfile(const char* layer, int cadenceMin, int lagHours,
-                               const char* source, bool eumetview) {
-    SatProfile p;
-    memset(&p, 0, sizeof(p));
-    strncpy(p.layer, layer, sizeof(p.layer) - 1);
-    strncpy(p.source, source, sizeof(p.source) - 1);
-    p.cadenceMin = cadenceMin;
-    p.lagHours = lagHours;
-    p.isEumetview = eumetview;
-    return p;
-}
-
-SatProfile selectSatelliteForLon(float lonDeg) {
+SatProfile selectSatelliteForLonPure(float lonDeg, const char* currentLayer, bool force) {
     static constexpr float kGoesSplitLon = -110.0f;
     static constexpr float kMtgWestLon   = -15.0f;
     static constexpr float kApacSplitLon = 80.0f;
-    // Hysteresis not applicable for stateless version — use exact boundaries
-    // (hysteresis requires knowing the previous active layer, which is a global)
+    static constexpr float kHystDeg      = 2.0f;
 
     float lon = normalizeLon180(lonDeg);
 
-    // Himawari: >= +80
-    if (lon >= kApacSplitLon) {
-        return makeProfile(LAYER_HIMAWARI_IR, 10, 3, "Himawari-IR", false);
+    auto layerIs = [&](const char* layer) -> bool {
+        return currentLayer && layer && strcmp(currentLayer, layer) == 0;
+    };
+
+    // Himawari: > +80
+    bool keepHimawari =
+        !force && layerIs(LAYER_HIMAWARI_IR) && (lon >= (kApacSplitLon - kHystDeg));
+    bool enterHimawari = (lon >= (kApacSplitLon + kHystDeg));
+    if (keepHimawari || enterHimawari) {
+        return { LAYER_HIMAWARI_IR, 10, 3, "Himawari-IR", false };
     }
 
     // MTG GeoColor: -15 to +80
-    if (lon >= kMtgWestLon && lon < kApacSplitLon) {
-        return makeProfile(LAYER_MTG_GEOCOLOR, 10, 1, "MTG-GeoColor", true);
+    bool keepMtg =
+        !force && layerIs(LAYER_MTG_GEOCOLOR) &&
+        (lon >= (kMtgWestLon - kHystDeg)) && (lon < (kApacSplitLon + kHystDeg));
+    bool enterMtg = (lon >= (kMtgWestLon + kHystDeg)) && (lon < (kApacSplitLon - kHystDeg));
+    if (keepMtg || enterMtg) {
+        return { LAYER_MTG_GEOCOLOR, 10, 1, "MTG-GeoColor", true };
     }
 
     // GOES-West: < -110
-    if (lon < kGoesSplitLon) {
-        return makeProfile(LAYER_GOES_WEST, 10, 2, "GOES-West", false);
+    bool keepWest =
+        !force && layerIs(LAYER_GOES_WEST) && (lon < (kGoesSplitLon + kHystDeg));
+    bool enterWest = (lon < (kGoesSplitLon - kHystDeg));
+    if (keepWest || enterWest) {
+        return { LAYER_GOES_WEST, 10, 2, "GOES-West", false };
     }
 
-    // GOES-East: -110 to -15
-    return makeProfile(LAYER_GOES_EAST, 10, 2, "GOES-East", false);
+    // GOES-East: fallback
+    return { LAYER_GOES_EAST, 10, 2, "GOES-East", false };
 }
 
 bool isProgressiveJpeg(const uint8_t* data, size_t len) {
@@ -63,7 +71,7 @@ bool isProgressiveJpeg(const uint8_t* data, size_t len) {
     return false;
 }
 
-time_t snapToNearestGibsTime(const time_t* times, int count, time_t t, int maxOffsetSec) {
+time_t snapToNearestTime(const time_t* times, int count, time_t t, int maxOffsetSec) {
     if (count == 0 || !times) return 0;
     int lo = 0, hi = count - 1;
     while (lo < hi) {
@@ -81,4 +89,14 @@ time_t snapToNearestGibsTime(const time_t* times, int count, time_t t, int maxOf
         }
     }
     return (bestDist <= maxOffsetSec) ? best : 0;
+}
+
+int generateFrameTimes(time_t* out, int maxFrames, time_t fetchEnd, int cadenceSec, int totalFrames) {
+    if (!out || maxFrames <= 0 || cadenceSec <= 0 || totalFrames <= 0) return 0;
+    int count = totalFrames < maxFrames ? totalFrames : maxFrames;
+    time_t fetchStart = fetchEnd - (time_t)((count - 1) * cadenceSec);
+    for (int i = 0; i < count; i++) {
+        out[i] = fetchStart + (time_t)(i * cadenceSec);
+    }
+    return count;
 }

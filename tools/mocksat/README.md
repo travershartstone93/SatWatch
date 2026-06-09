@@ -1,71 +1,80 @@
-# mocksat -- Mock Satellite WMS Server
+# MockSat -- Mock WMS Satellite Server
 
-HTTPS mock for GIBS and EUMETView WMS endpoints. Serves JPEG fixtures with fault injection for testing firmware resilience.
+HTTPS server that mimics GIBS and EUMETView WMS GetMap endpoints for testing
+ESP32 firmware sync without hitting real servers.
 
 ## Setup
 
 ```bash
 cd tools/mocksat
-bash gen_cert.sh        # one-time: creates mock.crt / mock.key
+./generate_cert.sh
+python3 server.py
 ```
 
-## Add fixtures
-
-Drop JPEG files into `fixtures/`. Name them to match the LAYERS parameter with colons replaced by underscores:
-
-```
-fixtures/GOES-East_ABI_GeoColor.jpg
-fixtures/mtg_fd_rgb_geocolour.jpg
-fixtures/black.jpg                    # used by the "black" fault
-```
-
-If no exact match is found, the server serves the first `.jpg` alphabetically.
-
-## Start
+## Point device at mock server
 
 ```bash
-python3 server.py                     # https://0.0.0.0:4443
-python3 server.py --port 8443         # custom port
-python3 server.py --no-tls            # plain HTTP (for quick tests)
+curl 'http://satwatch.local/seturl?gibs=https://LAPTOP_IP:4443&eumet=https://LAPTOP_IP:4443'
 ```
 
 ## Fault injection
 
-Inject a rule (applies to any URL containing the match substring):
+Inject a fault that matches requests containing a URL substring:
 
 ```bash
-# Return 503 for the next 3 GIBS requests
-curl -k -X POST https://localhost:4443/ctl \
-  -d '{"match": "GeoColor", "fault": "503", "times": 3}'
+# All EUMETView requests get connection-closed (forever)
+curl -X POST http://localhost:4443/ctl \
+  -d '{"match":"mtg_fd","fault":"close","times":9999}'
 
-# Truncate EUMETView responses to 30% forever
-curl -k -X POST https://localhost:4443/ctl \
-  -d '{"match": "mtg_fd", "fault": "truncate", "arg": 0.3, "times": -1}'
+# Next 3 GIBS requests return 503
+curl -X POST http://localhost:4443/ctl \
+  -d '{"match":"GOES","fault":"503","times":3}'
 
-# Drip at 500 bytes/sec
-curl -k -X POST https://localhost:4443/ctl \
-  -d '{"match": "GeoColor", "fault": "slow", "arg": 500, "times": 1}'
-```
+# Truncate response at 30% of body
+curl -X POST http://localhost:4443/ctl \
+  -d '{"match":"GOES","fault":"truncate","arg":30,"times":1}'
 
-Clear all rules:
+# Slow drip at 512 bytes/sec
+curl -X POST http://localhost:4443/ctl \
+  -d '{"match":"GOES","fault":"slow","arg":512,"times":1}'
 
-```bash
-curl -k https://localhost:4443/reset
+# Corrupt JPEG scan data
+curl -X POST http://localhost:4443/ctl \
+  -d '{"match":"GOES","fault":"corrupt","times":1}'
+
+# Serve all-black frame (validator test)
+curl -X POST http://localhost:4443/ctl \
+  -d '{"match":"GOES","fault":"black","times":1}'
 ```
 
 ### Fault table
 
-| fault      | arg                | effect                                 |
-|------------|--------------------|----------------------------------------|
-| `ok`       | --                 | normal response                        |
-| `close`    | --                 | adds `Connection: close` header        |
-| `429`      | --                 | HTTP 429, empty body                   |
-| `503`      | --                 | HTTP 503, empty body                   |
-| `truncate` | 0.0-1.0            | send fraction of body then close       |
-| `slow`     | bytes/sec          | drip body at given rate                |
-| `corrupt`  | --                 | flip random bytes after byte 100       |
-| `black`    | --                 | serve `fixtures/black.jpg` instead     |
+| fault      | arg          | effect                                    |
+|------------|--------------|-------------------------------------------|
+| `ok`       | --           | normal response                           |
+| `close`    | --           | `Connection: close` header, no body       |
+| `429`      | --           | HTTP 429, empty body                      |
+| `503`      | --           | HTTP 503, empty body                      |
+| `truncate` | percent 1-99 | send arg% of body then close              |
+| `slow`     | bytes/sec    | drip body at given rate                   |
+| `corrupt`  | --           | flip bytes after SOS marker               |
+| `black`    | --           | serve `fixtures/black.jpg` instead        |
 
-## Point firmware at it
+## Control endpoints
 
-In config-s3.h, override the WMS host/port to point at your dev machine running mocksat. The ESP32 must trust the self-signed cert (use `setInsecure()` during testing).
+```bash
+# Reset all fault rules
+curl http://localhost:4443/reset
+
+# Show active rules and request count
+curl http://localhost:4443/status
+```
+
+## Fixtures
+
+Place real JPEG captures in `fixtures/`. See `fixtures/README.txt` for
+capture commands. Fixture routing by LAYERS parameter:
+
+- LAYERS contains "GOES" -> `fixtures/gibs_baseline.jpg`
+- LAYERS contains "mtg_fd" -> `fixtures/eumet_progressive.jpg`
+- Default -> `fixtures/gibs_baseline.jpg`

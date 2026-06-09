@@ -248,10 +248,9 @@ static NullSerialSink s_nullSerial;
 
 static bool s_activeSourceIsEumetview = false;
 
-// D2: URL overrides for mock satellite server testing
+// D2: URL override for mock satellite server testing
 static char s_urlOverrideGibs[128] = {};
 static char s_urlOverrideEumet[128] = {};
-static bool s_urlOverrideActive = false;
 
 // ─────────────────────────────────────────────────────────────
 //  LovyanGFX display configuration
@@ -2196,19 +2195,18 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/seturl", HTTP_GET, []() {
     String gibs = s_wifiPortalServer.arg("gibs");
     String eumet = s_wifiPortalServer.arg("eumet");
-    gibs.toCharArray(s_urlOverrideGibs, sizeof(s_urlOverrideGibs));
-    eumet.toCharArray(s_urlOverrideEumet, sizeof(s_urlOverrideEumet));
-    s_urlOverrideActive = (s_urlOverrideGibs[0] || s_urlOverrideEumet[0]);
     Preferences p; if (p.begin("satwatch", false)) {
-      p.putString("urlov_gibs", s_urlOverrideGibs);
-      p.putString("urlov_eumet", s_urlOverrideEumet);
+      if (gibs.length()) { p.putString("urlov_gibs", gibs); gibs.toCharArray(s_urlOverrideGibs, sizeof(s_urlOverrideGibs)); }
+      else { p.remove("urlov_gibs"); s_urlOverrideGibs[0] = '\0'; }
+      if (eumet.length()) { p.putString("urlov_eumet", eumet); eumet.toCharArray(s_urlOverrideEumet, sizeof(s_urlOverrideEumet)); }
+      else { p.remove("urlov_eumet"); s_urlOverrideEumet[0] = '\0'; }
       p.end();
     }
     appendDiagLog("SYNC", "msg=url_override gibs=%s eumet=%s\n",
-                  s_urlOverrideGibs[0] ? s_urlOverrideGibs : "(none)",
-                  s_urlOverrideEumet[0] ? s_urlOverrideEumet : "(none)");
+                  s_urlOverrideGibs[0] ? s_urlOverrideGibs : "(prod)",
+                  s_urlOverrideEumet[0] ? s_urlOverrideEumet : "(prod)");
     char resp[256];
-    snprintf(resp, sizeof(resp), "URL override: gibs=%s eumet=%s",
+    snprintf(resp, sizeof(resp), "gibs=%s\neumet=%s",
              s_urlOverrideGibs[0] ? s_urlOverrideGibs : "(production)",
              s_urlOverrideEumet[0] ? s_urlOverrideEumet : "(production)");
     s_wifiPortalServer.send(200, "text/plain", resp);
@@ -6898,12 +6896,12 @@ static bool buildWeatherFrameUrl(char* out, size_t outLen,
   const char* layer = s_activeGibsLayer[0] ? s_activeGibsLayer : WEATHER_LAYER_GOES_EAST;
   char timeISO[32];
   toISO(t, timeISO, sizeof(timeISO));
-  // D2: Use override URL if set, otherwise production endpoint
+  // D2: Use URL override if set, otherwise production endpoints
   const char* base;
   if (s_activeSourceIsEumetview) {
-    base = (s_urlOverrideActive && s_urlOverrideEumet[0]) ? s_urlOverrideEumet : EUMETVIEW_WMS_BASE;
+    base = s_urlOverrideEumet[0] ? s_urlOverrideEumet : EUMETVIEW_WMS_BASE;
   } else {
-    base = (s_urlOverrideActive && s_urlOverrideGibs[0]) ? s_urlOverrideGibs : GIBS_WMS_BASE;
+    base = s_urlOverrideGibs[0] ? s_urlOverrideGibs : GIBS_WMS_BASE;
   }
   int n = snprintf(out, outLen,
     "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
@@ -11392,7 +11390,6 @@ static void syncWeatherFrames() {
     s_activeSourceIsEumetview ? "EUMETView" : "NASA GIBS");
   if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
   appendDiagLog("SYNC", "msg=download_loop_start dl=%d total=%d\n", downloadCount, totalFrames);
-  if (s_urlOverrideActive) appendDiagLog("SYNC", "msg=url_override_active\n");
 
   // F3: Clear stale GIBS times when source is EUMETView
   if (s_activeSourceIsEumetview) s_gibsAvailCount = 0;
@@ -12691,15 +12688,21 @@ void setup() {
       s_frMagic = 0xF11E0AECUL;
     }
 
-    // Load netlog preference from NVS
-    { Preferences nlp; if (nlp.begin("satwatch", true)) { s_netlogEnabled = nlp.getBool("netlog", true); nlp.end(); } }
-    // D2: Load URL overrides from NVS
-    { Preferences up; if (up.begin("satwatch", true)) {
-        up.getString("urlov_gibs", s_urlOverrideGibs, sizeof(s_urlOverrideGibs));
-        up.getString("urlov_eumet", s_urlOverrideEumet, sizeof(s_urlOverrideEumet));
-        s_urlOverrideActive = (s_urlOverrideGibs[0] || s_urlOverrideEumet[0]);
-        up.end();
-    } }
+    // Load netlog + URL override preferences from NVS
+    {
+      Preferences nlp;
+      if (nlp.begin("satwatch", true)) {
+        s_netlogEnabled = nlp.getBool("netlog", true);
+        nlp.getString("urlov_gibs", s_urlOverrideGibs, sizeof(s_urlOverrideGibs));
+        nlp.getString("urlov_eumet", s_urlOverrideEumet, sizeof(s_urlOverrideEumet));
+        nlp.end();
+      }
+      if (s_urlOverrideGibs[0] || s_urlOverrideEumet[0]) {
+        appendDiagLog("SYNC", "msg=url_override gibs=%s eumet=%s\n",
+                      s_urlOverrideGibs[0] ? s_urlOverrideGibs : "(prod)",
+                      s_urlOverrideEumet[0] ? s_urlOverrideEumet : "(prod)");
+      }
+    }
 
     // Workstream C: Battery canary — baseline sample at boot
     logBatterySample("boot");

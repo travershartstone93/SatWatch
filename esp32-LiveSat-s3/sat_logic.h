@@ -1,23 +1,23 @@
 #pragma once
-#include <cstdint>
-#include <cstddef>
-#include <ctime>
-#include <cmath>
-#include <cstring>
+#include <stdint.h>
+#include <stddef.h>
+#include <time.h>
 
+// Satellite source selection
 struct SatProfile {
-    char layer[48];
-    char source[20];
+    const char* layer;
     int cadenceMin;
     int lagHours;
+    const char* label;
     bool isEumetview;
 };
+SatProfile selectSatelliteForLonPure(float lonDeg, const char* currentLayer, bool force);
 
-// Select satellite source based on longitude
-SatProfile selectSatelliteForLon(float lonDeg);
-
-// Detect progressive JPEG from SOF2 marker
+// Progressive JPEG detection
 bool isProgressiveJpeg(const uint8_t* data, size_t len);
 
-// Snap time to nearest available GIBS time within tolerance
-time_t snapToNearestGibsTime(const time_t* times, int count, time_t t, int maxOffsetSec);
+// Time snapping
+time_t snapToNearestTime(const time_t* times, int count, time_t t, int maxOffsetSec);
+
+// Frame time generation
+int generateFrameTimes(time_t* out, int maxFrames, time_t fetchEnd, int cadenceSec, int totalFrames);
