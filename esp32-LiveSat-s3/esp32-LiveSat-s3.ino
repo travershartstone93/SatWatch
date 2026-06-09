@@ -44,6 +44,7 @@
 #include <esp_timer.h>
 #include <driver/gpio.h>   // gpio_wakeup_enable()
 #include <esp_wifi.h>      // esp_wifi_set_protocol()
+#include <WiFiUdp.h>       // Workstream A: UDP live log
 #include <HTTPUpdate.h>    // OTA firmware update
 // FT3168 touch IC accessed via direct I2C (addr 0x38)
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
@@ -92,7 +93,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    9
+#define FIRMWARE_VERSION    10
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -491,6 +492,26 @@ RTC_NOINIT_ATTR static uint16_t s_bcSdRemountFail;
 RTC_NOINIT_ATTR static uint16_t s_bcSleepErr;
 RTC_NOINIT_ATTR static uint8_t  s_bcLastWakeCause;
 RTC_NOINIT_ATTR static uint8_t  s_bcBatPctAtSleep;
+
+// Workstream A: UDP live log streaming
+static WiFiUDP   s_netlogUdp;
+static bool      s_netlogEnabled = true;
+static const uint16_t NETLOG_PORT = 9999;
+
+// Workstream B: RTC flight recorder — survives panics, not power loss
+struct FrEntry { uint32_t tMs; char tag[8]; char msg[36]; };  // 48 bytes
+RTC_NOINIT_ATTR static FrEntry  s_frRing[32];                 // 1536 bytes
+RTC_NOINIT_ATTR static uint8_t  s_frHead;
+RTC_NOINIT_ATTR static uint32_t s_frMagic;                    // 0xF11E0AEC
+static portMUX_TYPE s_frMux = portMUX_INITIALIZER_UNLOCKED;
+
+// Workstream C: Battery canary — drain rate tracking across power transitions
+RTC_DATA_ATTR static uint8_t  s_batLastPct = 0;
+RTC_DATA_ATTR static int64_t  s_batLastUs  = 0;
+RTC_DATA_ATTR static uint8_t  s_batLastCtx = 0;  // 0=boot 1=sleepenter 2=timerwake 3=wake
+
+// logBatterySample() defined later (after readAxp2101BatPct + appendDiagLog)
+static void logBatterySample(const char* ctx);
 
 // Battery state — updated once per bar render from AXP2101 PMIC
 static int8_t s_batPct = -1;  // -1 = not yet read / unavailable
@@ -2163,6 +2184,13 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/checkupdate", HTTP_GET, handleCheckUpdate);
   s_wifiPortalServer.on("/doupdate", HTTP_GET, handleDoUpdate);
 
+  s_wifiPortalServer.on("/netlog", HTTP_GET, []() {
+    bool on = s_wifiPortalServer.arg("on") == "1";
+    s_netlogEnabled = on;
+    Preferences p; if (p.begin("satwatch", false)) { p.putBool("netlog", on); p.end(); }
+    appendDiagLog("NETLOG", "enabled=%d\n", (int)on);
+    s_wifiPortalServer.send(200, "text/plain", on ? "netlog ON" : "netlog OFF");
+  });
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
   registerInternationalHandlers();
   s_wifiPortalHandlersReady = true;
@@ -7385,6 +7413,8 @@ static bool zoomSnapshotsCurrentAndUsable(time_t newestUtc) {
 #endif
 
 #if ENABLE_DIAG_LOG
+static SemaphoreHandle_t s_diagMutex = nullptr;
+
 static void appendDiagLog(const char* tag, const char* fmt, ...) {
   char line[300];
   unsigned long ms = millis();
@@ -7392,16 +7422,66 @@ static void appendDiagLog(const char* tag, const char* fmt, ...) {
                      ms / 1000, ms % 1000, (unsigned long)s_diagBootNum, tag);
   va_list args;
   va_start(args, fmt);
-  vsnprintf(line + pfx, sizeof(line) - pfx, fmt, args);
+  int bodyLen = vsnprintf(line + pfx, sizeof(line) - pfx, fmt, args);
   va_end(args);
-  File fc = SD.open(SD_ROOT "/diag-current.log", FILE_APPEND);
-  if (fc) { fc.print(line); fc.close(); }
-  File fp = SD.open(SD_ROOT "/diag.log", FILE_APPEND);
-  if (fp) { fp.print(line); fp.close(); }
+
+  // Workstream B: Flight recorder — always write, never blocked by SD/WiFi
+  {
+    portENTER_CRITICAL(&s_frMux);
+    if (s_frMagic == 0xF11E0AECUL) {
+      FrEntry& e = s_frRing[s_frHead % 32];
+      e.tMs = (uint32_t)ms;
+      strncpy(e.tag, tag, sizeof(e.tag) - 1); e.tag[sizeof(e.tag) - 1] = '\0';
+      int msgOff = pfx;  // skip the prefix, copy just the payload
+      strncpy(e.msg, line + msgOff, sizeof(e.msg) - 1); e.msg[sizeof(e.msg) - 1] = '\0';
+      s_frHead = (s_frHead + 1) % 32;
+    }
+    portEXIT_CRITICAL(&s_frMux);
+  }
+
+  // SD + UDP writes under mutex (50ms timeout — skip on contention)
+  if (!s_diagMutex) s_diagMutex = xSemaphoreCreateMutex();
+  if (s_diagMutex && xSemaphoreTake(s_diagMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+    File fc = SD.open(SD_ROOT "/diag-current.log", FILE_APPEND);
+    if (fc) { fc.print(line); fc.close(); }
+    File fp = SD.open(SD_ROOT "/diag.log", FILE_APPEND);
+    if (fp) { fp.print(line); fp.close(); }
+
+    // Workstream A: UDP live log broadcast
+    if (s_netlogEnabled && WiFi.status() == WL_CONNECTED) {
+      if (s_netlogUdp.beginPacket(WiFi.broadcastIP(), NETLOG_PORT)) {
+        s_netlogUdp.write((const uint8_t*)line, strlen(line));
+        s_netlogUdp.endPacket();
+      }
+    }
+    xSemaphoreGive(s_diagMutex);
+  }
 }
 #else
 static inline void appendDiagLog(const char*, const char*, ...) {}
 #endif
+
+// Workstream C: Battery canary implementation
+static void logBatterySample(const char* ctx) {
+  int8_t pct = readAxp2101BatPct();
+  if (pct < 0) return;
+  int64_t nowUs = esp_timer_get_time();
+  if (s_batLastUs > 0 && s_batLastPct > 0) {
+    int dPct = (int)s_batLastPct - (int)pct;
+    int64_t dUs = nowUs - s_batLastUs;
+    float dMin = (float)dUs / 60000000.0f;
+    float ratePerH = (dMin > 0.5f) ? (float)dPct / (dMin / 60.0f) : 0.0f;
+    appendDiagLog("BAT", "ctx=%s pct=%d dpct=%d dmin=%d rate=%.1f\n",
+                  ctx, (int)pct, dPct, (int)dMin, (double)ratePerH);
+    if (dMin > 10.0f && ratePerH > 3.0f) {
+      appendDiagLog("BAT", "msg=drain_warn rate=%.1f ctx=%s\n", (double)ratePerH, ctx);
+    }
+  } else {
+    appendDiagLog("BAT", "ctx=%s pct=%d baseline\n", ctx, (int)pct);
+  }
+  s_batLastPct = (uint8_t)pct;
+  s_batLastUs = nowUs;
+}
 
 // ─────────────────────────────────────────────────────────────
 //  Pre-allocated frame store helpers
@@ -11866,6 +11946,8 @@ static void goToSleep(bool buttonOnly = false) {
   Wire.write(0x01);  // bit0 SensorDisable = 1
   Wire.endTransmission();
 
+  // Workstream C: Battery canary at sleep entry
+  logBatterySample("sleepenter");
   // C6: Capture battery state for breadcrumb before I2C goes away
   s_bcBatPctAtSleep = (uint8_t)max(0, (int)readAxp2101BatPct());
   if (s_bcMagic != 0xB007B007UL) {
@@ -12013,6 +12095,7 @@ static void goToSleep(bool buttonOnly = false) {
 
   // Re-init I2C bus (was released before sleep)
   Wire.begin(SDA, SCL);
+  logBatterySample("wake");
 
   // Clear any PKEY IRQs that accumulated during sleep to prevent
   // stale short-press bits from triggering ESP.restart() on first poll.
@@ -12557,6 +12640,35 @@ void setup() {
     // Reset breadcrumbs on hard boot
     s_bcMagic = 0; s_bcWakeGpio = 0; s_bcWakeTimer = 0;
     s_bcSdRemountFail = 0; s_bcSleepErr = 0;
+
+    // Workstream B: Dump flight recorder if crash/abnormal reset
+    if (s_frMagic == 0xF11E0AECUL) {
+      esp_reset_reason_t frRst = esp_reset_reason();
+      if (frRst == ESP_RST_PANIC || frRst == ESP_RST_TASK_WDT ||
+          frRst == ESP_RST_INT_WDT || frRst == ESP_RST_WDT || frRst == ESP_RST_BROWNOUT) {
+        appendDiagLog("FR", "msg=dump_begin rst=%d\n", (int)frRst);
+        for (int fi = 0; fi < 32; fi++) {
+          int idx = (s_frHead + fi) % 32;
+          if (s_frRing[idx].tMs == 0 && s_frRing[idx].tag[0] == '\0') continue;
+          appendDiagLog("FR", "i=%d tMs=%lu tag=%s msg=%s\n",
+                        fi, (unsigned long)s_frRing[idx].tMs,
+                        s_frRing[idx].tag, s_frRing[idx].msg);
+        }
+        appendDiagLog("FR", "msg=dump_end\n");
+      }
+    }
+    // Init flight recorder for this session
+    if (s_frMagic != 0xF11E0AECUL) {
+      memset(s_frRing, 0, sizeof(s_frRing));
+      s_frHead = 0;
+      s_frMagic = 0xF11E0AECUL;
+    }
+
+    // Load netlog preference from NVS
+    { Preferences nlp; if (nlp.begin("satwatch", true)) { s_netlogEnabled = nlp.getBool("netlog", true); nlp.end(); } }
+
+    // Workstream C: Battery canary — baseline sample at boot
+    logBatterySample("boot");
   }
 
   // Apply RTC time early so hot-boot freshness check has valid time(nullptr)
