@@ -93,7 +93,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    10
+#define FIRMWARE_VERSION    11
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -247,6 +247,11 @@ static NullSerialSink s_nullSerial;
   "&styles=&srs=EPSG:4326"
 
 static bool s_activeSourceIsEumetview = false;
+
+// D2: URL overrides for mock satellite server testing
+static char s_urlOverrideGibs[128] = {};
+static char s_urlOverrideEumet[128] = {};
+static bool s_urlOverrideActive = false;
 
 // ─────────────────────────────────────────────────────────────
 //  LovyanGFX display configuration
@@ -1601,7 +1606,11 @@ static void sendWifiPortalPage() {
               "<button type='submit' style='background:#374151;width:auto;padding:4px 14px;font-size:13px;'>Clear suppression list</button>"
             "</form>"
             "<div class='hint' style='margin-top:14px;text-align:center;'>"
-              "<a href='/diag' target='_blank' style='color:#60a5fa;'>View Boot Log</a>"
+              "<a href='/diag' target='_blank' style='color:#60a5fa;'>Boot Log</a>"
+              " &middot; "
+              "<a href='/diag?full' target='_blank' style='color:#60a5fa;'>Full Log</a>"
+              " &middot; "
+              "<a href='#' onclick=\"fetch('/netlog?on='+(this.dataset.on^=1)).then(r=>r.text()).then(t=>{this.textContent=t});this.dataset.on=this.dataset.on;return false;\" data-on='0' style='color:#38bdf8;'>UDP Log: OFF</a>"
             "</div>"
             "<div class='card' style='margin-top:14px;border:1px solid #dc2626;'>"
               "<h2 style='color:#f87171;margin-bottom:8px;'>Maintenance</h2>"
@@ -2184,6 +2193,26 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/checkupdate", HTTP_GET, handleCheckUpdate);
   s_wifiPortalServer.on("/doupdate", HTTP_GET, handleDoUpdate);
 
+  s_wifiPortalServer.on("/seturl", HTTP_GET, []() {
+    String gibs = s_wifiPortalServer.arg("gibs");
+    String eumet = s_wifiPortalServer.arg("eumet");
+    gibs.toCharArray(s_urlOverrideGibs, sizeof(s_urlOverrideGibs));
+    eumet.toCharArray(s_urlOverrideEumet, sizeof(s_urlOverrideEumet));
+    s_urlOverrideActive = (s_urlOverrideGibs[0] || s_urlOverrideEumet[0]);
+    Preferences p; if (p.begin("satwatch", false)) {
+      p.putString("urlov_gibs", s_urlOverrideGibs);
+      p.putString("urlov_eumet", s_urlOverrideEumet);
+      p.end();
+    }
+    appendDiagLog("SYNC", "msg=url_override gibs=%s eumet=%s\n",
+                  s_urlOverrideGibs[0] ? s_urlOverrideGibs : "(none)",
+                  s_urlOverrideEumet[0] ? s_urlOverrideEumet : "(none)");
+    char resp[256];
+    snprintf(resp, sizeof(resp), "URL override: gibs=%s eumet=%s",
+             s_urlOverrideGibs[0] ? s_urlOverrideGibs : "(production)",
+             s_urlOverrideEumet[0] ? s_urlOverrideEumet : "(production)");
+    s_wifiPortalServer.send(200, "text/plain", resp);
+  });
   s_wifiPortalServer.on("/netlog", HTTP_GET, []() {
     bool on = s_wifiPortalServer.arg("on") == "1";
     s_netlogEnabled = on;
@@ -6869,22 +6898,19 @@ static bool buildWeatherFrameUrl(char* out, size_t outLen,
   const char* layer = s_activeGibsLayer[0] ? s_activeGibsLayer : WEATHER_LAYER_GOES_EAST;
   char timeISO[32];
   toISO(t, timeISO, sizeof(timeISO));
-  int n;
+  // D2: Use override URL if set, otherwise production endpoint
+  const char* base;
   if (s_activeSourceIsEumetview) {
-    n = snprintf(out, outLen,
-      "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
-      EUMETVIEW_WMS_BASE, layer,
-      (double)bboxWest, (double)bboxSouth,
-      (double)bboxEast, (double)bboxNorth,
-      reqW, reqH, timeISO);
+    base = (s_urlOverrideActive && s_urlOverrideEumet[0]) ? s_urlOverrideEumet : EUMETVIEW_WMS_BASE;
   } else {
-    n = snprintf(out, outLen,
-      "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
-      GIBS_WMS_BASE, layer,
-      (double)bboxWest, (double)bboxSouth,
-      (double)bboxEast, (double)bboxNorth,
-      reqW, reqH, timeISO);
+    base = (s_urlOverrideActive && s_urlOverrideGibs[0]) ? s_urlOverrideGibs : GIBS_WMS_BASE;
   }
+  int n = snprintf(out, outLen,
+    "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
+    base, layer,
+    (double)bboxWest, (double)bboxSouth,
+    (double)bboxEast, (double)bboxNorth,
+    reqW, reqH, timeISO);
   return (n > 0 && (size_t)n < outLen);
 }
 
@@ -11366,6 +11392,7 @@ static void syncWeatherFrames() {
     s_activeSourceIsEumetview ? "EUMETView" : "NASA GIBS");
   if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
   appendDiagLog("SYNC", "msg=download_loop_start dl=%d total=%d\n", downloadCount, totalFrames);
+  if (s_urlOverrideActive) appendDiagLog("SYNC", "msg=url_override_active\n");
 
   // F3: Clear stale GIBS times when source is EUMETView
   if (s_activeSourceIsEumetview) s_gibsAvailCount = 0;
@@ -12666,6 +12693,13 @@ void setup() {
 
     // Load netlog preference from NVS
     { Preferences nlp; if (nlp.begin("satwatch", true)) { s_netlogEnabled = nlp.getBool("netlog", true); nlp.end(); } }
+    // D2: Load URL overrides from NVS
+    { Preferences up; if (up.begin("satwatch", true)) {
+        up.getString("urlov_gibs", s_urlOverrideGibs, sizeof(s_urlOverrideGibs));
+        up.getString("urlov_eumet", s_urlOverrideEumet, sizeof(s_urlOverrideEumet));
+        s_urlOverrideActive = (s_urlOverrideGibs[0] || s_urlOverrideEumet[0]);
+        up.end();
+    } }
 
     // Workstream C: Battery canary — baseline sample at boot
     logBatterySample("boot");
