@@ -92,7 +92,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    7
+#define FIRMWARE_VERSION    9
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -237,6 +237,15 @@ static NullSerialSink s_nullSerial;
 #define WEATHER_LAYER_GOES_EAST   "GOES-East_ABI_GeoColor"
 #define WEATHER_LAYER_GOES_WEST   "GOES-West_ABI_GeoColor"
 #define WEATHER_LAYER_HIMAWARI_IR "Himawari_AHI_Band13_Clean_Infrared"
+#define WEATHER_LAYER_MTG_GEOCOLOR "mtg_fd:rgb_geocolour"
+
+// EUMETView WMS endpoint (MTG GeoColor — progressive JPEG, chunked transfer)
+#define EUMETVIEW_WMS_BASE \
+  "https://view.eumetsat.int/geoserver/ows" \
+  "?service=WMS&version=1.1.1&request=GetMap" \
+  "&styles=&srs=EPSG:4326"
+
+static bool s_activeSourceIsEumetview = false;
 
 // ─────────────────────────────────────────────────────────────
 //  LovyanGFX display configuration
@@ -466,10 +475,22 @@ RTC_DATA_ATTR static bool    s_displayUtcOffsetValid = false;
 RTC_DATA_ATTR static bool    s_weatherGeoValid = false;
 RTC_DATA_ATTR static float   s_weatherCenterLat = 0.0f;
 RTC_DATA_ATTR static float   s_weatherCenterLon = 0.0f;
+static bool s_geoManualOverride = false;  // set by /setlocation, persisted in NVS
 RTC_DATA_ATTR static int     s_activeCadenceMin = CADENCE_MIN;
 RTC_DATA_ATTR static int     s_activeLagHours = GIBS_LAG_HOURS;
 RTC_DATA_ATTR static char    s_activeGibsLayer[48] = WEATHER_LAYER_GOES_EAST;
 RTC_DATA_ATTR static char    s_activeWeatherSource[20] = "GOES-East";
+
+static uint32_t s_diagBootNum = 0;  // NVS-persistent boot counter, embedded in every log line
+
+// C6: Sleep breadcrumbs — survive light sleep and soft resets (RTC_NOINIT_ATTR)
+RTC_NOINIT_ATTR static uint32_t s_bcMagic;
+RTC_NOINIT_ATTR static uint16_t s_bcWakeGpio;
+RTC_NOINIT_ATTR static uint16_t s_bcWakeTimer;
+RTC_NOINIT_ATTR static uint16_t s_bcSdRemountFail;
+RTC_NOINIT_ATTR static uint16_t s_bcSleepErr;
+RTC_NOINIT_ATTR static uint8_t  s_bcLastWakeCause;
+RTC_NOINIT_ATTR static uint8_t  s_bcBatPctAtSleep;
 
 // Battery state — updated once per bar render from AXP2101 PMIC
 static int8_t s_batPct = -1;  // -1 = not yet read / unavailable
@@ -722,6 +743,7 @@ static bool s_audioCueReady = false;
 static char s_audioCueLoadedPath[START_CUE_PATH_MAX] = "";
 #endif
 static bool s_buttonSleepTransition = false;
+static bool s_wakeTransition = false;       // suppress overlays on first frame after wake
 static bool s_serviceButtonsWakeReset = false;
 static void serviceUserButtons();
 
@@ -1741,20 +1763,25 @@ static void handleWifiPortalSave() {
 
 static void sendDiagHandler() {
   s_wifiPortalServer.sendHeader("Cache-Control", "no-cache");
+  const char* logPath = s_wifiPortalServer.hasArg("full")
+                        ? SD_ROOT "/diag.log"
+                        : SD_ROOT "/diag-current.log";
   String resp;
-  resp.reserve(2048);
-  // Part 1: existing diag.txt from SD
-  File f = SD.open(SD_ROOT "/diag.txt", FILE_READ);
+  File f = SD.open(logPath, FILE_READ);
   if (f) {
+    size_t sz = f.size();
+    size_t cap = (sz > 128UL * 1024UL) ? 128UL * 1024UL : sz;
+    resp.reserve(cap + 2048);
+    if (sz > 128UL * 1024UL) f.seek(sz - cap);
     while (f.available()) {
-      char buf[256];
+      char buf[512];
       int n = f.readBytes(buf, sizeof(buf) - 1);
       buf[n] = '\0';
       resp += buf;
     }
     f.close();
   } else {
-    resp += "(no diag.txt on SD)\n";
+    resp += "(no log file)\n";
   }
   // Part 2: live forecast state
   resp += "\n--- forecast state ---\n";
@@ -1829,10 +1856,12 @@ static void handleClearFrames() {
     Preferences prefs;
     if (prefs.begin("satwatch", false)) {
       prefs.putBool("skp", false);
+      prefs.putBool("safeboot", false);
+      prefs.putUInt("crashstreak", 0);
       prefs.end();
     }
   }
-  appendDiagLog("portal: clear-frames requested\n");
+  appendDiagLog("PORTAL", "msg=clear-frames\n");
   s_wifiPortalServer.send(200, "text/html",
     "<!doctype html><html><body style='font-family:Arial;background:#111827;"
     "color:#f9fafb;padding:24px;'>"
@@ -2047,11 +2076,13 @@ static void handleSetLocation() {
   s_weatherCenterLat = stableLat;
   s_weatherCenterLon = stableLon;
   s_weatherGeoValid = true;
+  s_geoManualOverride = true;
   saveGeoToNvs(stableLat, stableLon);
+  { Preferences p; if (p.begin("satwatch", false)) { p.putBool("geoman", true); p.end(); } }
   reverseGeocode(stableLat, stableLon);
   selectSatelliteForLon(s_weatherCenterLon);
   s_zoomSnapshotsRefreshPending = true;
-  appendDiagLog("setlocation: lat=%.4f lon=%.4f label=%s\n",
+  appendDiagLog("GEO", "lat=%.4f lon=%.4f label=%s src=manual_override\n",
                 (double)stableLat, (double)stableLon, s_displayLocationLabel);
   char resp[128];
   snprintf(resp, sizeof(resp), "Location set: %s (%.4f, %.4f)",
@@ -2133,6 +2164,7 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/doupdate", HTTP_GET, handleDoUpdate);
 
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
+  registerInternationalHandlers();
   s_wifiPortalHandlersReady = true;
 }
 
@@ -2185,7 +2217,7 @@ static bool initAudioStartCue() {
   es8311_voice_volume_set(s_audioCodec, (int)s_chimeVolume, &unused);
   s_audioPathPrimed = false;
   s_audioReady = true;
-  appendDiagLog("[AUDIO] init ok i2s=%d codec=%p\n", (int)s_i2sStarted, s_audioCodec);
+  appendDiagLog("CUE", "msg=init_ok i2s=%d codec=%p\n", (int)s_i2sStarted, s_audioCodec);
   return true;
 }
 
@@ -2333,10 +2365,10 @@ static void audioCueWorkerTask(void* arg) {
         vTaskDelay(pdMS_TO_TICKS(200));
       }
       uint32_t cueDur = millis() - cueStart;
-      appendDiagLog("[CUE] played=%d len=%u vol=%d dur=%lums\n",
+      appendDiagLog("CUE", "played=%d len=%u vol=%d dur=%lums\n",
                     (int)played, (unsigned)s_audioCueLen, (int)req.volume, (unsigned long)cueDur);
     } else {
-      appendDiagLog("[CUE] worker skip ready=%d buf=%d len=%u\n",
+      appendDiagLog("CUE", "msg=worker_skip ready=%d buf=%d len=%u\n",
                     (int)s_audioCueReady, (s_audioCueBuf != nullptr), (unsigned)s_audioCueLen);
     }
     s_audioCueBusy = false;
@@ -2369,28 +2401,28 @@ static bool playStartCueIfEnabled() {
   char cuePath[START_CUE_PATH_MAX] = {};
   uint8_t cueVol = 0;
   if (!resolveSelectedCuePathAndVolume(cuePath, sizeof(cuePath), &cueVol)) {
-    appendDiagLog("[CUE] off (mode=%d)\n", (int)s_startCueMode);
+    appendDiagLog("CUE", "msg=off mode=%d\n", (int)s_startCueMode);
     return true;
   }
   if (!s_audioCueReady || strcmp(s_audioCueLoadedPath, cuePath) != 0) {
     if (!preloadSelectedCueToPsram(false)) {
-      appendDiagLog("[CUE] preload fail path=%s\n", cuePath);
+      appendDiagLog("CUE", "msg=preload_fail path=%s\n", cuePath);
       return false;
     }
   }
   ensureAudioCueWorker();
   if (!s_audioCueQueue || s_audioCueBusy) {
-    appendDiagLog("[CUE] queue/busy q=%d b=%d\n", (int)(s_audioCueQueue != nullptr), (int)s_audioCueBusy);
+    appendDiagLog("CUE", "msg=queue_busy q=%d b=%d\n", (int)(s_audioCueQueue != nullptr), (int)s_audioCueBusy);
     return false;
   }
   AudioCueRequest req{};
   req.volume = cueVol;
   if (uxQueueSpacesAvailable(s_audioCueQueue) == 0) {
-    appendDiagLog("[CUE] queue full\n");
+    appendDiagLog("CUE", "msg=queue_full\n");
     return false;
   }
   bool sent = (xQueueSend(s_audioCueQueue, &req, 0) == pdTRUE);
-  appendDiagLog("[CUE] queued=%d vol=%d path=%s\n", (int)sent, (int)cueVol, cuePath);
+  appendDiagLog("CUE", "queued=%d vol=%d path=%s\n", (int)sent, (int)cueVol, cuePath);
   return sent;
 #else
   (void)0;
@@ -2609,10 +2641,10 @@ static void runWifiConfigPortal(bool canSkip = false) {
     }
 
     // Retry all known SSIDs (tears down AP temporarily)
-    appendDiagLog("portal: wifi-retry\n");
+    appendDiagLog("PORTAL", "msg=wifi-retry\n");
     if (connectWifiForSync(false, "Retrying WiFi...")) {
       // Connected — reboot so setup() runs the full sync path cleanly
-      appendDiagLog("portal: wifi-retry ok -> restart\n");
+      appendDiagLog("PORTAL", "msg=wifi-retry_ok action=restart\n");
       SD_MMC.end();
       ESP.restart();
     }
@@ -3607,7 +3639,7 @@ static bool syncProgressIsActive() {
 }
 
 static void syncProgressBegin(uint32_t totalUnits, const char* line1, const char* line2) {
-  appendDiagLog("[PROG] BEGIN total=%lu ms=%lu\n", (unsigned long)totalUnits, millis());
+  appendDiagLog("PROG", "msg=begin total=%lu ms=%lu\n", (unsigned long)totalUnits, millis());
   if (totalUnits == 0) totalUnits = 1;
   s_syncProgActive = true;
   s_syncProgTotalUnits = totalUnits;
@@ -3624,7 +3656,7 @@ static void syncProgressBegin(uint32_t totalUnits, const char* line1, const char
 
 static void syncProgressBeginPhase(const char* label, uint32_t phaseUnits) {
   if (!syncProgressIsActive()) return;
-  appendDiagLog("[PROG] PHASE \"%s\" units=%lu base=%lu done=%lu ms=%lu\n",
+  appendDiagLog("PROG", "msg=phase label=%s units=%lu base=%lu done=%lu ms=%lu\n",
                label ? label : "?", (unsigned long)phaseUnits,
                (unsigned long)s_syncProgPhaseBase, (unsigned long)s_syncProgDoneUnits, millis());
   uint32_t prevEnd = s_syncProgPhaseBase + s_syncProgPhaseUnits;
@@ -3663,7 +3695,7 @@ static void syncProgressTick(uint32_t units) {
 
 static void syncProgressCompletePhase() {
   if (!syncProgressIsActive()) return;
-  appendDiagLog("[PROG] COMPLETE phase base=%lu units=%lu done=%lu ms=%lu\n",
+  appendDiagLog("PROG", "msg=complete_phase base=%lu units=%lu done=%lu ms=%lu\n",
                (unsigned long)s_syncProgPhaseBase, (unsigned long)s_syncProgPhaseUnits,
                (unsigned long)s_syncProgDoneUnits, millis());
   uint32_t endUnits = s_syncProgPhaseBase + s_syncProgPhaseUnits;
@@ -3677,7 +3709,7 @@ static void syncProgressCompletePhase() {
 
 static void syncProgressEnd() {
   if (!syncProgressIsActive()) return;
-  appendDiagLog("[PROG] END done=%lu total=%lu ms=%lu\n",
+  appendDiagLog("PROG", "msg=end done=%lu total=%lu ms=%lu\n",
                (unsigned long)s_syncProgDoneUnits, (unsigned long)s_syncProgTotalUnits, millis());
   // Signal completion — let background task snap to 100%
   s_progFinished = true;
@@ -4583,7 +4615,7 @@ static void tickerTask(void*) {
         s_tickerPushCount++;
         if (s_tickerPushCount % 100 == 0) {
           #if 0  // verbose perf log disabled
-appendDiagLog("[TICKER] push=%u skip=%u contention=%.1f%%\n",
+appendDiagLog("TICKER", "push=%u skip=%u contention=%.1f%%\n",
             (unsigned)s_tickerPushCount, (unsigned)s_tickerSkipCount,
             (s_tickerPushCount + s_tickerSkipCount) > 0
               ? (float)s_tickerSkipCount * 100.0f / (float)(s_tickerPushCount + s_tickerSkipCount)
@@ -5741,7 +5773,7 @@ static void enterHurricaneMode(const HurricaneInfo& storm) {
   s_hurricaneHintDrawn = false;
   Serial.printf("hurricane: enter %s %s cat=%d at %.1f,%.1f\n",
                 storm.id, storm.name, storm.category, (double)storm.lat, (double)storm.lon);
-  appendDiagLog("hurricane: enter %s %s cat=%d lat=%.1f lon=%.1f wind=%ukt %umb\n",
+  appendDiagLog("HURRICANE", "id=%s name=%s cat=%d lat=%.1f lon=%.1f wind=%ukt pressure=%umb action=enter\n",
                 storm.id, storm.name, storm.category, (double)storm.lat, (double)storm.lon,
                 (unsigned)storm.windKt, (unsigned)storm.pressureMb);
 }
@@ -5753,7 +5785,7 @@ static void exitHurricaneMode() {
   s_weatherGeoValid = s_savedWeatherGeoValid;
 
   Serial.printf("hurricane: exit %s\n", s_activeStorm.id);
-  appendDiagLog("hurricane: exit %s\n", s_activeStorm.id);
+  appendDiagLog("HURRICANE", "id=%s action=exit\n", s_activeStorm.id);
 
   s_hurricaneMode = false;
   memset(&s_activeStorm, 0, sizeof(s_activeStorm));
@@ -5972,7 +6004,7 @@ static bool decodeMoonFrameInto(int frameIdx, uint16_t* buf, int px, int scale) 
 static bool decodeMoonPhase() {
   time_t now = time(nullptr);
   if (now < 1000000000) {
-    appendDiagLog("moon: skip — NTP not set (now=%ld)\n", (long)now);
+    appendDiagLog("MOON", "action=skip reason=ntp-not-set now=%ld\n", (long)now);
     return false;
   }
 
@@ -6001,7 +6033,7 @@ static bool decodeMoonPhase() {
   if (s_moonPrevBuf) decodeMoonFrameInto(prevIdx, s_moonPrevBuf, MOON_DECODED_PX, JPEG_SCALE_QUARTER);
   if (s_moonNextBuf) decodeMoonFrameInto(nextIdx, s_moonNextBuf, MOON_DECODED_PX, JPEG_SCALE_QUARTER);
 
-  appendDiagLog("moon: frame=%d(±%d) phase=%.2f decode=%s\n",
+  appendDiagLog("MOON", "frame=%d flank=%d phase=%.2f decode=%s\n",
                 frameIdx, MOON_FLANK_STEP, (double)phase, ok ? "ok" : "FAIL");
   return ok;
 }
@@ -6054,9 +6086,9 @@ static void initCleanModeTouch() {
     delay(20);
     s_ftPresent = true;
     s_touchHasCoords = true;
-    appendDiagLog("clean-touch: FT3168 OK coord mode\n");
+    appendDiagLog("TOUCH", "ft3168=ok mode=coord\n");
   } else {
-    appendDiagLog("clean-touch: FT3168 not found, any-touch mode\n");
+    appendDiagLog("TOUCH", "ft3168=missing mode=any-touch\n");
   }
 
   // Both modes: arm GPIO38 interrupt
@@ -6531,7 +6563,7 @@ static void presentScaledBuf(uint16_t* src) {
   s_presentUsTotal += (uint64_t)(presentEnd - presentStart);
   if (s_presentCount % 100 == 0) {
     #if 0  // verbose perf log disabled
-appendDiagLog("[PERF] present x%u: avg=%lluus\n",
+appendDiagLog("PERF", "present count=%u avg=%lluus\n",
       (unsigned)s_presentCount, s_presentUsTotal / s_presentCount);
 #endif
   }
@@ -6741,22 +6773,40 @@ static void setActiveSatelliteProfile(const char* layer,
 }
 
 static void selectSatelliteForLon(float lonDeg, bool force) {
-  // Boundary tests for validation:
-  //  - GOES-West/GOES-East split at ~-110° (verify both crossing directions)
-  //  - GOES-East/Himawari split at ~+60° (APAC IR fallback)
+  // Coverage zones:
+  //   GOES-West:  lon < -110
+  //   GOES-East:  -110 to -15
+  //   MTG:        -15 to +80   (EUMETView, progressive JPEG)
+  //   Himawari:   > +80        (GIBS IR)
   static constexpr float kGoesSplitLon = -110.0f;
-  static constexpr float kApacSplitLon = 60.0f;
+  static constexpr float kMtgWestLon   = -15.0f;
+  static constexpr float kApacSplitLon = 80.0f;
   static constexpr float kHystDeg = 2.0f;
 
   float lon = normalizeLon180(lonDeg);
+
+  // Himawari: > +80°
   bool keepHimawari =
     !force && activeLayerIs(WEATHER_LAYER_HIMAWARI_IR) && (lon >= (kApacSplitLon - kHystDeg));
   bool enterHimawari = (lon >= (kApacSplitLon + kHystDeg));
   if (keepHimawari || enterHimawari) {
     setActiveSatelliteProfile(WEATHER_LAYER_HIMAWARI_IR, 10, 3, "Himawari-IR");
+    s_activeSourceIsEumetview = false;
     return;
   }
 
+  // MTG GeoColor: -15° to +80°
+  bool keepMtg =
+    !force && activeLayerIs(WEATHER_LAYER_MTG_GEOCOLOR) &&
+    (lon >= (kMtgWestLon - kHystDeg)) && (lon < (kApacSplitLon + kHystDeg));
+  bool enterMtg = (lon >= (kMtgWestLon + kHystDeg)) && (lon < (kApacSplitLon - kHystDeg));
+  if (keepMtg || enterMtg) {
+    setActiveSatelliteProfile(WEATHER_LAYER_MTG_GEOCOLOR, 10, 1, "MTG-GeoColor");
+    s_activeSourceIsEumetview = true;
+    return;
+  }
+
+  s_activeSourceIsEumetview = false;
   bool keepWest =
     !force && activeLayerIs(WEATHER_LAYER_GOES_WEST) && (lon < (kGoesSplitLon + kHystDeg));
   bool enterWest = (lon < (kGoesSplitLon - kHystDeg));
@@ -6791,12 +6841,22 @@ static bool buildWeatherFrameUrl(char* out, size_t outLen,
   const char* layer = s_activeGibsLayer[0] ? s_activeGibsLayer : WEATHER_LAYER_GOES_EAST;
   char timeISO[32];
   toISO(t, timeISO, sizeof(timeISO));
-  int n = snprintf(out, outLen,
-    "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
-    GIBS_WMS_BASE, layer,
-    (double)bboxWest, (double)bboxSouth,
-    (double)bboxEast, (double)bboxNorth,
-    reqW, reqH, timeISO);
+  int n;
+  if (s_activeSourceIsEumetview) {
+    n = snprintf(out, outLen,
+      "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
+      EUMETVIEW_WMS_BASE, layer,
+      (double)bboxWest, (double)bboxSouth,
+      (double)bboxEast, (double)bboxNorth,
+      reqW, reqH, timeISO);
+  } else {
+    n = snprintf(out, outLen,
+      "%s&LAYERS=%s&BBOX=%.1f,%.1f,%.1f,%.1f&WIDTH=%d&HEIGHT=%d&FORMAT=image%%2Fjpeg&TIME=%s",
+      GIBS_WMS_BASE, layer,
+      (double)bboxWest, (double)bboxSouth,
+      (double)bboxEast, (double)bboxNorth,
+      reqW, reqH, timeISO);
+  }
   return (n > 0 && (size_t)n < outLen);
 }
 
@@ -7325,19 +7385,22 @@ static bool zoomSnapshotsCurrentAndUsable(time_t newestUtc) {
 #endif
 
 #if ENABLE_DIAG_LOG
-static void appendDiagLog(const char* fmt, ...) {
-  File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-  if (!diagF) return;
-  char line[256];
+static void appendDiagLog(const char* tag, const char* fmt, ...) {
+  char line[300];
+  unsigned long ms = millis();
+  int pfx = snprintf(line, sizeof(line), "t=%lu.%03lu boot=%lu tag=%s ",
+                     ms / 1000, ms % 1000, (unsigned long)s_diagBootNum, tag);
   va_list args;
   va_start(args, fmt);
-  vsnprintf(line, sizeof(line), fmt, args);
+  vsnprintf(line + pfx, sizeof(line) - pfx, fmt, args);
   va_end(args);
-  diagF.print(line);
-  diagF.close();
+  File fc = SD.open(SD_ROOT "/diag-current.log", FILE_APPEND);
+  if (fc) { fc.print(line); fc.close(); }
+  File fp = SD.open(SD_ROOT "/diag.log", FILE_APPEND);
+  if (fp) { fp.print(line); fp.close(); }
 }
 #else
-static inline void appendDiagLog(const char*, ...) {}
+static inline void appendDiagLog(const char*, const char*, ...) {}
 #endif
 
 // ─────────────────────────────────────────────────────────────
@@ -7366,7 +7429,7 @@ static void initFrameStore() {
     if (lf) { lf.close(); hasLegacy = true; }
   }
   if (hasLegacy) {
-    appendDiagLog("initFrameStore: legacy files detected, cleaning up\n");
+    appendDiagLog("SD", "action=initFrameStore result=legacy-cleanup\n");
     // Remove old metadata files
     SD.remove(META_FILE);
     SD.remove(TIMES_FILE);
@@ -7431,7 +7494,7 @@ static void initFrameStore() {
         }
         wf.flush();
         wf.close();
-        appendDiagLog("initFrameStore: frames.bin created %u bytes\n", (unsigned)framesBinSize);
+        appendDiagLog("SD", "action=initFrameStore file=frames.bin size=%u\n", (unsigned)framesBinSize);
       }
     }
   }
@@ -7463,7 +7526,7 @@ static void initFrameStore() {
         }
         wf.flush();
         wf.close();
-        appendDiagLog("initFrameStore: stream.raw created %u bytes\n", (unsigned)streamRawSize);
+        appendDiagLog("SD", "action=initFrameStore file=stream.raw size=%u\n", (unsigned)streamRawSize);
       }
     }
   }
@@ -7475,7 +7538,7 @@ static bool loadIndex() {
 
   File f = SD.open(INDEX_BIN_FILE, FILE_READ);
   if (!f) {
-    appendDiagLog("loadIndex: no index.bin\n");
+    appendDiagLog("SD", "action=loadIndex result=no-file\n");
     frameCount = 0;
     framesReady = false;
     s_timesLoaded = true;
@@ -7483,7 +7546,7 @@ static bool loadIndex() {
   }
   if (f.size() != sizeof(FrameStoreIndex)) {
     f.close();
-    appendDiagLog("loadIndex: bad size %u\n", (unsigned)f.size());
+    appendDiagLog("SD", "action=loadIndex result=bad-size size=%u\n", (unsigned)f.size());
     frameCount = 0;
     framesReady = false;
     s_timesLoaded = true;
@@ -7492,7 +7555,7 @@ static bool loadIndex() {
   size_t got = f.read((uint8_t*)&s_idx, sizeof(s_idx));
   f.close();
   if (got != sizeof(s_idx)) {
-    appendDiagLog("loadIndex: short read %u/%u\n", (unsigned)got, (unsigned)sizeof(s_idx));
+    appendDiagLog("SD", "action=loadIndex result=short-read got=%u want=%u\n", (unsigned)got, (unsigned)sizeof(s_idx));
     memset(&s_idx, 0, sizeof(s_idx));
     frameCount = 0;
     framesReady = false;
@@ -7501,7 +7564,7 @@ static bool loadIndex() {
   }
 
   if (s_idx.magic != INDEX_MAGIC) {
-    appendDiagLog("loadIndex: bad magic 0x%08X\n", s_idx.magic);
+    appendDiagLog("SD", "action=loadIndex result=bad-magic magic=0x%08X\n", s_idx.magic);
     memset(&s_idx, 0, sizeof(s_idx));
     frameCount = 0;
     framesReady = false;
@@ -7528,7 +7591,7 @@ static bool loadIndex() {
       fb.read(hdr, 2);
       if (hdr[0] != 0xFF || hdr[1] != 0xD8) {
         int i = physToLogical[phys];
-        appendDiagLog("loadIndex: SOI fail slot %d phys %d\n", i, phys);
+        appendDiagLog("SD", "action=loadIndex result=soi-fail slot=%d phys=%d\n", i, phys);
         s_idx.jpegValid[i] = 0;
         s_idx.rawValid[i] = 0;
       }
@@ -7553,7 +7616,7 @@ static bool loadIndex() {
   s_timesLoaded = true;
   invalidateValidIdxCache();
 
-  appendDiagLog("loadIndex: count=%d head=%d valid=%d\n",
+  appendDiagLog("SD", "action=loadIndex count=%d head=%d valid=%d\n",
                 frameCount, (int)s_idx.head, validCount);
   return true;
 }
@@ -7565,7 +7628,7 @@ static void writeIndex() {
   SD.remove(INDEX_TMP_FILE);
   File f = SD.open(INDEX_TMP_FILE, FILE_WRITE);
   if (!f) {
-    appendDiagLog("writeIndex: open tmp fail\n");
+    appendDiagLog("SD", "action=writeIndex result=open-tmp-fail\n");
     return;
   }
   f.write((const uint8_t*)&s_idx, sizeof(s_idx));
@@ -7574,7 +7637,7 @@ static void writeIndex() {
 
   SD.remove(INDEX_BIN_FILE);
   if (!SD.rename(INDEX_TMP_FILE, INDEX_BIN_FILE)) {
-    appendDiagLog("writeIndex: rename fail\n");
+    appendDiagLog("SD", "action=writeIndex result=rename-fail\n");
   }
 
   // Sync compatibility arrays
@@ -7653,6 +7716,23 @@ static bool writeRawToSlot(int logicalIdx, const uint8_t* buf) {
 
 // Decode JPEG from s_dlBuf, validate all sprite checks, scale, write raw slot.
 // Returns true if raw slot was successfully written.
+extern bool decodeProgressiveJpegToSprite(const uint8_t* data, size_t len,
+                                          uint16_t* buf, int w, int h, bool swap);
+extern char g_stbLastError[64];
+
+// Scan JPEG data for SOF2 marker (progressive JPEG indicator).
+// Returns true if the JPEG is progressive and JPEGDEC can't handle it.
+static bool isProgressiveJpeg(const uint8_t* data, size_t len) {
+  for (size_t i = 0; i + 1 < len; i++) {
+    if (data[i] == 0xFF) {
+      if (data[i + 1] == 0xC2) return true;   // SOF2 = progressive
+      if (data[i + 1] == 0xC0) return false;   // SOF0 = baseline
+      if (data[i + 1] == 0xDA) return false;   // SOS = past all SOF markers
+    }
+  }
+  return false;
+}
+
 static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   if (!ensureSprite() || !s_frameDisplayBuf) return false;
 
@@ -7662,33 +7742,38 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   resetJpegDrawStats();
 
   bool ok = false;
-  if (jpeg.openRAM(s_dlBuf, (int)jpegLen, jpegDraw)) {
-    if (jpeg.getWidth() == DISP_W && jpeg.getHeight() == DISP_H) {
-      jpeg.setPixelType(RGB565_BIG_ENDIAN);
-      ok = jpeg.decode(0, 0, 0);
+  bool progressive = isProgressiveJpeg(s_dlBuf, jpegLen);
+  if (!progressive) {
+    if (jpeg.openRAM(s_dlBuf, (int)jpegLen, jpegDraw)) {
+      if (jpeg.getWidth() == DISP_W && jpeg.getHeight() == DISP_H) {
+        jpeg.setPixelType(RGB565_BIG_ENDIAN);
+        ok = jpeg.decode(0, 0, 0);
+      }
+      jpeg.close();
     }
-    jpeg.close();
+  }
+  if (!ok && progressive) {
+    uint16_t* px = (uint16_t*)sprite.getBuffer();
+    if (px) ok = decodeProgressiveJpegToSprite(s_dlBuf, jpegLen, px, DISP_W, DISP_H,
+                                                s_mainSpritePixelsByteSwapped);
   }
   g_drawTarget = prevTarget;
 
-  if (!ok || !jpegDrawLooksFullFrame()) { appendDiagLog("rawdec[%d]: decode-fail ok=%d\n", logicalIdx, ok); return false; }
-  if (spriteLooksCompletelyBlack()) { appendDiagLog("rawdec[%d]: black\n", logicalIdx); return false; }
-  if (spriteLooksPartialDecode()) { appendDiagLog("rawdec[%d]: partial\n", logicalIdx); return false; }
-  if (spriteLooksHorizontallyCorrupted()) { appendDiagLog("rawdec[%d]: horiz\n", logicalIdx); return false; }
-  if (spriteLooksVerticallyCorrupted()) { appendDiagLog("rawdec[%d]: vert\n", logicalIdx); return false; }
-  // Partial composite detection: re-decode as 8-bit grayscale and count all-black MCUs.
-  // At 8-bit, nighttime IR ocean pixels are 1-3 (never all-zero MCUs).
-  // Partial composites have true (0,0,0) swath gaps → all-zero MCUs.
-  {
+  if (!ok) { appendDiagLog("RAW", "slot=%d result=decode-fail prog=%d\n", logicalIdx, (int)progressive); return false; }
+  if (!progressive && !jpegDrawLooksFullFrame()) { appendDiagLog("RAW", "slot=%d result=not-full\n", logicalIdx); return false; }
+  if (spriteLooksCompletelyBlack()) { appendDiagLog("RAW", "slot=%d result=black\n", logicalIdx); return false; }
+  if (spriteLooksPartialDecode()) { appendDiagLog("RAW", "slot=%d result=partial\n", logicalIdx); return false; }
+  if (spriteLooksHorizontallyCorrupted()) { appendDiagLog("RAW", "slot=%d result=horiz\n", logicalIdx); return false; }
+  if (spriteLooksVerticallyCorrupted()) { appendDiagLog("RAW", "slot=%d result=vert\n", logicalIdx); return false; }
+  if (!progressive) {
     int blackMcus = countBlackMcusGrayscale(s_dlBuf, jpegLen);
     if (blackMcus > 0) {
-      appendDiagLog("rawdec[%d]: partial-composite blackMcus=%d\n", logicalIdx, blackMcus);
+      appendDiagLog("RAW", "slot=%d result=partial-composite blackMcus=%d\n", logicalIdx, blackMcus);
       return false;
     }
   }
-  if (spriteLooksCyanWhiteBlockCorrupted()) { appendDiagLog("rawdec[%d]: cyanwhite\n", logicalIdx); return false; }
-  if (spriteLooksBottomBandJunkCorrupted()) { appendDiagLog("rawdec[%d]: bottomband\n", logicalIdx); return false; }
-  // slab detector disabled — GOES-West disk edge triggers false positives for limb regions
+  if (spriteLooksCyanWhiteBlockCorrupted()) { appendDiagLog("RAW", "slot=%d result=cyanwhite\n", logicalIdx); return false; }
+  if (spriteLooksBottomBandJunkCorrupted()) { appendDiagLog("RAW", "slot=%d result=bottomband\n", logicalIdx); return false; }
 
   scaleSpriteTo410x360(s_frameDisplayBuf);
 
@@ -7761,7 +7846,7 @@ static bool installValidatedWeatherJpegToPath(const char* finalPath,
   }
   if (written != jpegLen) {
     SD.remove(tmpPath);
-    if (label) appendDiagLog("inst: %s SD-ERR wr=%u want=%u\n", label, (unsigned)written, (unsigned)jpegLen);
+    if (label) appendDiagLog("SD", "label=%s result=write-err written=%u want=%u\n", label, (unsigned)written, (unsigned)jpegLen);
     return false;
   }
 
@@ -7858,7 +7943,7 @@ static bool downloadFrameToPathAtBbox(HTTPClient& http,
         continue;
       }
       if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) {
-        appendDiagLog("BUG: decoder-corrupt s_dlBuf jpegLen=%u\n", (unsigned)jpegLen);
+        appendDiagLog("VLD", "result=decoder-corrupt jpegLen=%u\n", (unsigned)jpegLen);
         continue;
       }
       fetchedOk = true;
@@ -7881,75 +7966,121 @@ static bool downloadFrameToPathAtBbox(HTTPClient& http,
   return false;
 }
 
+// Scan cache for BSSID geolocation reuse
+struct ScanCacheEntry { uint8_t bssid[6]; int8_t rssi; uint8_t chan; };
+static ScanCacheEntry s_scanCache[16];
+static int s_scanCacheCount = 0;
+static uint32_t s_scanCacheMs = 0;
+
+// Try connecting to a specific WiFi slot; returns true on success
+static bool tryConnectSlot(int slot, const char* title, bool showStatus, int maxTries) {
+  if (showStatus) showMessage(title, s_wifiConfig[slot].ssid);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(WIFI_PORTAL_HOSTNAME);
+  esp_wifi_set_protocol(WIFI_IF_STA,
+    WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
+    WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
+  WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
+  int wtries = 0;
+  while (WiFi.status() != WL_CONNECTED && wtries++ < maxTries) {
+    delay(500);
+    if (syncProgressIsActive()) syncProgressTick(1);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    appendDiagLog("WIFI", "result=fail ssid=%s slot=%d\n", s_wifiConfig[slot].ssid, slot);
+    return false;
+  }
+  if (!wifiHasInternetConnectivity()) {
+    appendDiagLog("WIFI", "result=no-internet ssid=%s slot=%d\n", s_wifiConfig[slot].ssid, slot);
+    WiFi.disconnect(true);
+    return false;
+  }
+  appendDiagLog("WIFI", "result=ok ssid=%s ip=%s rssi=%d ch=%d\n",
+                s_wifiConfig[slot].ssid, WiFi.localIP().toString().c_str(),
+                WiFi.RSSI(), WiFi.channel());
+  refreshCachedWifiDisplayState();
+  return true;
+}
+
 static bool connectWifiForSync(bool required, const char* statusLine = "Connecting WiFi...") {
   (void)required;
-  setCpuFrequencyMhz(240);  // TLS handshake needs full CPU speed
+  setCpuFrequencyMhz(240);
   loadWifiPortalConfig();
   bool showStatus = (statusLine != nullptr);
   const char* title = statusLine ? statusLine : "Connecting WiFi...";
 
-  if (s_wifiPortalDnsRunning) {
-    s_wifiPortalDns.stop();
-    s_wifiPortalDnsRunning = false;
-  }
-  if (s_wifiPortalHttpRunning) {
-    s_wifiPortalServer.stop();
-    s_wifiPortalHttpRunning = false;
-  }
-  if (s_wifiPortalApActive) {
-    WiFi.softAPdisconnect(true);
-    s_wifiPortalApActive = false;
-  }
+  if (s_wifiPortalDnsRunning) { s_wifiPortalDns.stop(); s_wifiPortalDnsRunning = false; }
+  if (s_wifiPortalHttpRunning) { s_wifiPortalServer.stop(); s_wifiPortalHttpRunning = false; }
+  if (s_wifiPortalApActive) { WiFi.softAPdisconnect(true); s_wifiPortalApActive = false; }
   stopWifiPortalMdns();
 
-  for (int slot = 0; slot < WIFI_CONFIG_SLOTS; ++slot) {
-    if (s_wifiConfig[slot].ssid[0] == '\0') continue;
+  // Scan-first: find which configured networks are visible
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_protocol(WIFI_IF_STA,
+    WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
+    WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
+  int found = WiFi.scanNetworks(false, true, false, 300);
 
-    if (showStatus) showMessage(title, s_wifiConfig[slot].ssid);
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_STA);
-    WiFi.setHostname(WIFI_PORTAL_HOSTNAME);
-    esp_wifi_set_protocol(WIFI_IF_STA,
-      WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
-      WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
-    // BSSID/channel cache disabled — was causing WiFi connect failures after flash
-    WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
+  // Build priority list: configured slots found in scan, sorted by RSSI
+  struct SlotMatch { int slot; int32_t rssi; };
+  SlotMatch matches[WIFI_CONFIG_SLOTS];
+  int matchCount = 0;
+  bool slotSeen[WIFI_CONFIG_SLOTS] = {};
 
-    // Power-on/USB reset (after flash) needs longer for radio cold-start
-    esp_reset_reason_t rst = esp_reset_reason();
-    int maxTries = (rst == ESP_RST_POWERON || rst == ESP_RST_USB) ? 40 : 20;
-    int wtries = 0;
-    while (WiFi.status() != WL_CONNECTED && wtries++ < maxTries) {
-      delay(500);
-      Serial.print(".");
-      if (syncProgressIsActive()) syncProgressTick(1);
+  // Also cache BSSIDs for geolocation reuse
+  s_scanCacheCount = 0;
+  for (int i = 0; i < found; i++) {
+    if (s_scanCacheCount < 16) {
+      memcpy(s_scanCache[s_scanCacheCount].bssid, WiFi.BSSID(i), 6);
+      s_scanCache[s_scanCacheCount].rssi = (int8_t)WiFi.RSSI(i);
+      s_scanCache[s_scanCacheCount].chan = (uint8_t)WiFi.channel(i);
+      s_scanCacheCount++;
     }
-
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.printf("\nWiFi fail: %s\n", s_wifiConfig[slot].ssid);
-      appendDiagLog("wifi: fail ssid=%s slot=%d millis=%lu ms\n", s_wifiConfig[slot].ssid, slot, millis());
-      continue;
+    String scannedSsid = WiFi.SSID(i);
+    int32_t rssi = WiFi.RSSI(i);
+    for (int slot = 0; slot < WIFI_CONFIG_SLOTS; slot++) {
+      if (slotSeen[slot] || s_wifiConfig[slot].ssid[0] == '\0') continue;
+      if (scannedSsid == s_wifiConfig[slot].ssid) {
+        matches[matchCount++] = {slot, rssi};
+        slotSeen[slot] = true;
+        break;
+      }
     }
-    if (!wifiHasInternetConnectivity()) {
-      Serial.printf("WiFi no internet: %s\n", s_wifiConfig[slot].ssid);
-      appendDiagLog("wifi: no-internet ssid=%s slot=%d millis=%lu ms\n", s_wifiConfig[slot].ssid, slot, millis());
-      WiFi.disconnect(true);
-      continue;
-    }
+  }
+  s_scanCacheMs = millis();
+  WiFi.scanDelete();
 
-    Serial.printf("\nWiFi: %s (%s)\n",
-                  WiFi.localIP().toString().c_str(),
-                  s_wifiConfig[slot].ssid);
-    appendDiagLog("wifi: ok ssid=%s ip=%s rssi=%d ch=%d millis=%lu ms\n",
-                  s_wifiConfig[slot].ssid,
-                  WiFi.localIP().toString().c_str(),
-                  WiFi.RSSI(), WiFi.channel(), millis());
-    refreshCachedWifiDisplayState();
-    return true;
+  // Sort by RSSI (strongest first)
+  for (int i = 0; i < matchCount - 1; i++)
+    for (int j = i + 1; j < matchCount; j++)
+      if (matches[j].rssi > matches[i].rssi) { auto t = matches[i]; matches[i] = matches[j]; matches[j] = t; }
+
+  appendDiagLog("WIFI", "msg=scan found=%d matched=%d\n", found, matchCount);
+
+  esp_reset_reason_t rst = esp_reset_reason();
+  bool coldBoot = (rst == ESP_RST_POWERON || rst == ESP_RST_USB);
+
+  // Pass 1: Try scan-confirmed slots (shorter timeout — AP is provably present)
+  for (int mi = 0; mi < matchCount; mi++) {
+    int slot = matches[mi].slot;
+    appendDiagLog("WIFI", "msg=try ssid=%s rssi=%d via=scan\n", s_wifiConfig[slot].ssid, (int)matches[mi].rssi);
+    if (tryConnectSlot(slot, title, showStatus, 15)) return true;
+  }
+
+  // Pass 2: Blind fallback for hidden/unseen networks (original timeout)
+  int blindTries = coldBoot ? 40 : 20;
+  // Exception: if scan found 0 networks on cold boot, treat scan as suspect
+  if (found == 0 && coldBoot) blindTries = 40;
+  for (int slot = 0; slot < WIFI_CONFIG_SLOTS; slot++) {
+    if (slotSeen[slot] || s_wifiConfig[slot].ssid[0] == '\0') continue;
+    appendDiagLog("WIFI", "msg=try ssid=%s via=blind\n", s_wifiConfig[slot].ssid);
+    if (tryConnectSlot(slot, title, showStatus, blindTries)) return true;
   }
 
   Serial.println("\nWiFi failed");
-  appendDiagLog("wifi: all-slots-failed millis=%lu ms\n", millis());
+  appendDiagLog("WIFI", "result=all-slots-failed\n");
   return false;
 }
 
@@ -7965,9 +8096,9 @@ static bool syncClockFromNtpBestEffort(int maxTries = 10) {
   bool ok = (nowUtc > 1700000000);
   if (!ok) {
     Serial.println("ntp best-effort sync pending");
-    appendDiagLog("ntp: fail t=%lld millis=%lu ms\n", (long long)nowUtc, millis());
+    appendDiagLog("SYNC", "msg=ntp_fail t=%lld\n", (long long)nowUtc);
   } else {
-    appendDiagLog("ntp: ok utc=%lld millis=%lu ms\n", (long long)nowUtc, millis());
+    appendDiagLog("SYNC", "msg=ntp_ok utc=%lld\n", (long long)nowUtc);
     writePcf85063(nowUtc);
   }
   return ok;
@@ -8043,7 +8174,7 @@ static bool tryApplyPcf85063Time() {
   if (!readPcf85063(&t)) return false;
   struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
   settimeofday(&tv, nullptr);
-  appendDiagLog("rtc: pcf85063 t=%lld\n", (long long)t);
+  appendDiagLog("BOOT", "msg=rtc_pcf85063 t=%lld\n", (long long)t);
   return true;
 }
 
@@ -8119,7 +8250,10 @@ static bool loadGeoFromNvs(float* lat, float* lon) {
     *lat = prefs.getFloat("geolat", 0.0f);
     *lon = prefs.getFloat("geolon", 0.0f);
   }
+  s_geoManualOverride = prefs.getBool("geoman", false);
   prefs.end();
+  appendDiagLog("GEO", "src=nvs valid=%d lat=%.4f lon=%.4f manual=%d\n",
+                (int)valid, (double)*lat, (double)*lon, (int)s_geoManualOverride);
   return valid;
 }
 
@@ -8197,14 +8331,32 @@ static void topButtonPollTask(void*) {
 }
 
 static void disconnectWifiAfterSync() {
+  // If WiFi is still connected, keep it up and start the portal server
   if (WiFi.status() == WL_CONNECTED) {
+    appendDiagLog("WIFI", "msg=post-sync_portal_start ip=%s\n", WiFi.localIP().toString().c_str());
     startWifiPortalServer(false);
     return;
   }
-  if (s_wifiPortalDnsRunning) {
-    s_wifiPortalDns.stop();
-    s_wifiPortalDnsRunning = false;
+  // WiFi dropped during sync — try to reconnect for portal
+  appendDiagLog("WIFI", "msg=post-sync_wifi_lost reconnecting\n");
+  loadWifiPortalConfig();
+  for (int slot = 0; slot < WIFI_CONFIG_SLOTS; ++slot) {
+    if (s_wifiConfig[slot].ssid[0] == '\0') continue;
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
+    int tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries++ < 20) delay(500);
+    if (WiFi.status() == WL_CONNECTED) {
+      appendDiagLog("WIFI", "msg=reconnected ssid=%s ip=%s\n",
+                    s_wifiConfig[slot].ssid, WiFi.localIP().toString().c_str());
+      startWifiPortalServer(false);
+      return;
+    }
   }
+  // All reconnect attempts failed — give up
+  appendDiagLog("WIFI", "msg=reconnect_failed wifi_off\n");
+  if (s_wifiPortalDnsRunning) { s_wifiPortalDns.stop(); s_wifiPortalDnsRunning = false; }
   s_wifiPortalApActive = false;
   s_wifiPortalHttpRunning = false;
   stopWifiPortalMdns();
@@ -8296,7 +8448,7 @@ static bool showFrame(int idx, bool skipBottomBar = false) {
 
   if (!seekOk || got != SCALED_FRAME_BYTES) {
     invalidateStreamSlot(idx, "short-read");
-    appendDiagLog("showFrame: read-fail idx=%d got=%u seek=%d\n",
+    appendDiagLog("SD", "msg=showFrame_read-fail idx=%d got=%u seek=%d\n",
                   idx, (unsigned)got, (int)seekOk);
     return false;
   }
@@ -8309,7 +8461,7 @@ static bool showFrame(int idx, bool skipBottomBar = false) {
   s_showFramePresentUsTotal += (uint64_t)(t2 - t1);
   if (s_showFrameCount % 50 == 0) {
     #if 0  // verbose perf log disabled
-appendDiagLog("[PERF] showFrame x%u: sdRead avg=%lluus  present avg=%lluus\n",
+appendDiagLog("PERF", "msg=showFrame count=%u sdRead_avg=%lluus present_avg=%lluus\n",
       (unsigned)s_showFrameCount,
       s_showFrameSdUsTotal / s_showFrameCount,
       s_showFramePresentUsTotal / s_showFrameCount);
@@ -8336,51 +8488,60 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
   resetJpegDrawStats();
 
   bool ok = false;
-  if (jpeg.openRAM(s_dlBuf, (int)jpegLen, jpegDraw)) {
-    if (jpeg.getWidth() == DISP_W && jpeg.getHeight() == DISP_H) {
-      jpeg.setPixelType(RGB565_BIG_ENDIAN);
-      ok = jpeg.decode(0, 0, 0);
+  bool progressive = isProgressiveJpeg(s_dlBuf, jpegLen);
+  if (!progressive) {
+    if (jpeg.openRAM(s_dlBuf, (int)jpegLen, jpegDraw)) {
+      if (jpeg.getWidth() == DISP_W && jpeg.getHeight() == DISP_H) {
+        jpeg.setPixelType(RGB565_BIG_ENDIAN);
+        ok = jpeg.decode(0, 0, 0);
+      }
+      jpeg.close();
     }
-    jpeg.close();
+  }
+  if (!ok && progressive) {
+    uint16_t* px = (uint16_t*)sprite.getBuffer();
+    if (px) ok = decodeProgressiveJpegToSprite(s_dlBuf, jpegLen, px, DISP_W, DISP_H,
+                                                s_mainSpritePixelsByteSwapped);
+    if (label) appendDiagLog("VLD", "label=%s check=stb prog=%d ok=%d err=%s\n",
+                              label, (int)progressive, (int)ok, g_stbLastError);
   }
   g_drawTarget = prevTarget;
 
-  if (!ok || !jpegDrawLooksFullFrame()) {
-    if (label) { Serial.printf("%s DEC-VERIFY\n", label); appendDiagLog("vld: %s DEC-VERIFY\n", label); }
+  if (!ok) {
+    if (label) { Serial.printf("%s DEC-VERIFY\n", label); appendDiagLog("VLD", "label=%s result=DEC-VERIFY\n", label); }
+    return false;
+  }
+  if (!progressive && !jpegDrawLooksFullFrame()) {
+    if (label) { Serial.printf("%s DEC-VERIFY\n", label); appendDiagLog("VLD", "label=%s result=DEC-VERIFY\n", label); }
     return false;
   }
   if (spriteLooksCompletelyBlack()) {
-    if (label) { Serial.printf("%s SRC-BLACK\n", label); appendDiagLog("vld: %s SRC-BLACK\n", label); }
+    if (label) { Serial.printf("%s SRC-BLACK\n", label); appendDiagLog("VLD", "label=%s result=SRC-BLACK\n", label); }
     return false;
   }
   if (spriteLooksPartialDecode()) {
-    if (label) { Serial.printf("%s PARTIAL\n", label); appendDiagLog("vld: %s PARTIAL\n", label); }
+    if (label) { Serial.printf("%s PARTIAL\n", label); appendDiagLog("VLD", "label=%s result=PARTIAL\n", label); }
     return false;
   }
   if (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted()) {
-    if (label) { Serial.printf("%s LINE-CORR\n", label); appendDiagLog("vld: %s LINE-CORR\n", label); }
+    if (label) { Serial.printf("%s LINE-CORR\n", label); appendDiagLog("VLD", "label=%s result=LINE-CORR\n", label); }
     return false;
   }
   if (spriteLooksCyanWhiteBlockCorrupted()) {
-    if (label) appendDiagLog("vld: %s CYAN-WHITE\n", label);
+    if (label) appendDiagLog("VLD", "label=%s result=CYAN-WHITE\n", label);
     return false;
   }
   if (spriteLooksBottomBandJunkCorrupted()) {
-    if (label) appendDiagLog("vld: %s BOTTOM-BAND\n", label);
+    if (label) appendDiagLog("VLD", "label=%s result=BOTTOM-BAND\n", label);
     return false;
   }
-  // Partial composite: any all-black 8x8 MCUs at 8-bit grayscale = missing swath data.
-  // Nighttime IR always has non-zero dim values at 8-bit — zero MCUs = 0.
-  {
+  // Partial composite + color-shift — GIBS-only checks (skip for progressive/EUMETView)
+  if (!progressive) {
     int blackMcus = countBlackMcusGrayscale(s_dlBuf, jpegLen);
     if (blackMcus > 0) {
-      if (label) appendDiagLog("vld: %s PARTIAL-COMPOSITE blackMcus=%d\n", label, blackMcus);
+      if (label) appendDiagLog("VLD", "label=%s result=PARTIAL-COMPOSITE blackMcus=%d\n", label, blackMcus);
       return false;
     }
-  }
-  // GIBS color-shift: wrong colormap produces solid yellow/orange frames.
-  // Normal frames have blue ocean. Reject if avg color is warm with no blue.
-  {
     const uint16_t* px = (const uint16_t*)sprite.getBuffer();
     if (px) {
       uint32_t rSum = 0, gSum = 0, bSum = 0, count = 0;
@@ -8397,7 +8558,7 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
         uint32_t gAvg = gSum * 255 / (count * 63);
         uint32_t bAvg = bSum * 255 / (count * 31);
         if (bAvg > 0 && rAvg > 120 && (rAvg * 100 / bAvg) > 180) {
-          if (label) appendDiagLog("vld: %s COLOR-SHIFT r=%u g=%u b=%u\n", label,
+          if (label) appendDiagLog("VLD", "label=%s result=COLOR-SHIFT r=%u g=%u b=%u\n", label,
                                     (unsigned)rAvg, (unsigned)gAvg, (unsigned)bAvg);
           return false;
         }
@@ -8625,7 +8786,7 @@ static bool fetchGibsAvailableTimes(WiFiClientSecure& /*unused*/, time_t rangeSt
   }
 
   Serial.printf("GIBS avail: %d times\n", s_gibsAvailCount);
-  appendDiagLog("gibs: describeDomains count=%d\n", s_gibsAvailCount);
+  appendDiagLog("SYNC", "msg=gibs_describeDomains count=%d\n", s_gibsAvailCount);
   return s_gibsAvailCount > 0;
 }
 
@@ -8635,12 +8796,12 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
 
   File f = SD.open(path, FILE_READ);
   if (!f) {
-    appendDiagLog("dec-fail: %s no-file\n", path);
+    appendDiagLog("SD", "msg=dec-fail path=%s reason=no-file\n", path);
     return false;
   }
   size_t size = f.size();
   if (size == 0 || size > MAX_JPEG_BYTES) {
-    appendDiagLog("dec-fail: %s sz=%u\n", path, (unsigned)size);
+    appendDiagLog("SD", "msg=dec-fail path=%s sz=%u\n", path, (unsigned)size);
     Serial.printf("jpeg skip %s %u>%u\n",
                   path, (unsigned)size, (unsigned)MAX_JPEG_BYTES);
     f.close();
@@ -8650,7 +8811,7 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
   size_t got = f.readBytes((char*)s_dlBuf, size);
   f.close();
   if (got < size) {
-    appendDiagLog("dec-fail: %s short=%u/%u\n", path, (unsigned)got, (unsigned)size);
+    appendDiagLog("SD", "msg=dec-fail path=%s reason=short read=%u/%u\n", path, (unsigned)got, (unsigned)size);
     return false;
   }
   size_t jpegLen = jpegEffectiveLength(s_dlBuf, got);
@@ -8660,7 +8821,7 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
     if (s_noEoiDiagCount < 10) {
       uint8_t tail[2] = {0, 0};
       if (got >= 2) { tail[0] = s_dlBuf[got-2]; tail[1] = s_dlBuf[got-1]; }
-      appendDiagLog("dec-fail: %s no-eoi sz=%u got=%u hdr=%02x%02x tail=%02x%02x\n",
+      appendDiagLog("SD", "msg=dec-fail path=%s reason=no-eoi sz=%u got=%u hdr=%02x%02x tail=%02x%02x\n",
         path, (unsigned)size, (unsigned)got,
         (unsigned)s_dlBuf[0], (unsigned)s_dlBuf[1],
         (unsigned)tail[0], (unsigned)tail[1]);
@@ -8672,7 +8833,7 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
         size_t csz = chk.size();
         if (csz >= 2) { chk.seek(csz - 2); chk.read(t2, 2); }
         chk.close();
-        appendDiagLog("dec-reread: %s sz=%u hdr=%02x%02x tail=%02x%02x\n",
+        appendDiagLog("SD", "msg=dec-reread path=%s sz=%u hdr=%02x%02x tail=%02x%02x\n",
           path, (unsigned)csz, h2[0], h2[1], t2[0], t2[1]);
       }
       s_noEoiDiagCount++;
@@ -8712,9 +8873,9 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
     if (decodeOpt >= 0) {
       jpeg.setPixelType(RGB565_BIG_ENDIAN);
       ok = jpeg.decode(0, 0, decodeOpt);
-      if (!ok) appendDiagLog("dec-fail: %s decode\n", path);
+      if (!ok) appendDiagLog("SD", "msg=dec-fail path=%s reason=decode\n", path);
     } else {
-      appendDiagLog("dec-fail: %s dim=%dx%d\n", path, jw, jh);
+      appendDiagLog("SD", "msg=dec-fail path=%s reason=dim dim=%dx%d\n", path, jw, jh);
     }
     jpeg.close();
   }
@@ -8735,7 +8896,7 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
       }
     } else {
       ok = jpegDrawLooksFullFrame();
-      if (!ok) appendDiagLog("dec-fail: %s not-full\n", path);
+      if (!ok) appendDiagLog("SD", "msg=dec-fail path=%s reason=not-full\n", path);
     }
   }
   return ok;
@@ -9414,19 +9575,19 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
 
   if (!(dayAvailable || nightAvailable)) {
     Serial.printf("terrain unavailable d=%d n=%d\n", (int)dayOk, (int)nightOk);
-    appendDiagLog("terrain: unavailable d=%d n=%d keep=%d/%d\n",
+    appendDiagLog("ZOOM", "msg=terrain_unavailable day=%d night=%d keep=%d/%d\n",
                   (int)dayOk, (int)nightOk,
                   (int)haveExistingDay, (int)haveExistingNight);
     return false;
   }
 
   if (!dayAvailable || !nightAvailable) {
-    appendDiagLog("terrain: partial d=%d n=%d keep=%d/%d\n",
+    appendDiagLog("ZOOM", "msg=terrain_partial day=%d night=%d keep=%d/%d\n",
                   (int)dayAvailable, (int)nightAvailable,
                   (int)haveExistingDay, (int)haveExistingNight);
   } else {
     Serial.println("terrain pair ok");
-    appendDiagLog("terrain: ok d=%d n=%d\n", (int)dayAvailable, (int)nightAvailable);
+    appendDiagLog("ZOOM", "msg=terrain_ok day=%d night=%d\n", (int)dayAvailable, (int)nightAvailable);
   }
 
   // Deep terrain zoom stages (S2 cloudless at tighter bboxes)
@@ -9462,7 +9623,7 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
         (double)tw, (double)ts2, (double)te, (double)tn,
         TERRAIN_FETCH_W, TERRAIN_FETCH_H);
       downloadJpegUrlToPath(terrainUrl, tzPaths[tz], "Terrain zoom", nullptr);
-      appendDiagLog("terrain-zoom[%d]: %.0fx%.0f km\n", tz, (double)tzW[tz], (double)tzH[tz]);
+      appendDiagLog("ZOOM", "msg=terrain-zoom level=%d size=%.0fx%.0fkm\n", tz, (double)tzW[tz], (double)tzH[tz]);
     }
   }
 
@@ -9573,7 +9734,7 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
       s_lastRadarCheckUtc = time(nullptr);
       SD.remove(ZOOM_TERRAIN_RADAR_FILE);
       clearRadarMeta();
-      appendDiagLog("radar: was stale, now clear\n");
+      appendDiagLog("ZOOM", "msg=radar_stale_cleared\n");
     } else if (anyDownloadSucceeded) {
       // Download reached the service and got a valid JPEG, but no precipitation detected.
       s_radarNoSignatures = true;
@@ -9718,7 +9879,7 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
       return true;
     }
     Serial.printf("zoom decode-fail %s\n", path);
-    appendDiagLog("zoom: decode-fail %s\n", path);
+    appendDiagLog("ZOOM", "msg=decode-fail path=%s\n", path);
     return false;
   }
   // If decoded zoom has partial composite artifacts, fall through to synthetic zoom.
@@ -9733,10 +9894,10 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
         jf.close();
         if (blackMcus > 0) {
           if (presentSyntheticZoomStage(path, newestIdx)) {
-            appendDiagLog("zoom: synth-fallback %s blackMcus=%d\n", path, blackMcus);
+            appendDiagLog("ZOOM", "msg=synth-fallback path=%s blackMcus=%d\n", path, blackMcus);
             return true;
           }
-          appendDiagLog("zoom: partial-composite %s blackMcus=%d\n", path, blackMcus);
+          appendDiagLog("ZOOM", "msg=partial-composite path=%s blackMcus=%d\n", path, blackMcus);
           return false;
         }
       } else {
@@ -10215,7 +10376,7 @@ static void refreshZoomSnapshotsForLatestFrame() {
         }
         if (!stageOk) {
           Serial.printf("zoom z%d fail b=%d\n", i + 1, back);
-          appendDiagLog("zoom: z%d fail back=%d\n", i + 1, back);
+          appendDiagLog("ZOOM", "stage=z%d result=fail back=%d\n", i + 1, back);
           thisCandidateOk = false;
           break;
         }
@@ -10225,13 +10386,13 @@ static void refreshZoomSnapshotsForLatestFrame() {
         installed = true;
         if (back > 0) {
           Serial.printf("zoom ts fallback b=%d cad=%d\n", back, (int)activeCadenceMin());
-          appendDiagLog("zoom: ts-fallback back=%d cad=%d\n", back, (int)activeCadenceMin());
+          appendDiagLog("ZOOM", "msg=ts-fallback back=%d cad=%d\n", back, (int)activeCadenceMin());
         }
       }
     }
     zoomsRefreshedOk = installed;
     if (refreshWeatherZooms) {
-      appendDiagLog("zoom: weather %s millis=%lu ms\n", zoomsRefreshedOk ? "ok" : "fail", millis());
+      appendDiagLog("ZOOM", "msg=weather result=%s\n", zoomsRefreshedOk ? "ok" : "fail");
     }
   }
   if (refreshWeatherZooms && zoomsRefreshedOk) {
@@ -10261,7 +10422,7 @@ static void refreshZoomSnapshotsForLatestFrame() {
     float tw, ts, te, tn;
     computeBboxFromCenterKm(centerLat, centerLon, finalWKm, finalHKm, &tw, &ts, &te, &tn);
     bool terrainSnapOk = downloadTerrainSnapshotToPathAtBbox(http, client, newestUtc, tw, ts, te, tn);
-    appendDiagLog("terrain-snap: %s millis=%lu ms\n", terrainSnapOk ? "ok" : "fail", millis());
+    appendDiagLog("ZOOM", "msg=terrain-snap result=%s\n", terrainSnapOk ? "ok" : "fail");
     if (terrainSnapOk) {
       SD.remove(ZOOM_TERRAIN_DAY_RAW);    // invalidate raws; rebuild at playback
       SD.remove(ZOOM_TERRAIN_NIGHT_RAW);
@@ -10866,7 +11027,7 @@ static void fetchForecastData() {
   if (s_forecast.valid && s_forecast.lastSyncUtc > 0) {
     time_t age = time(nullptr) - s_forecast.lastSyncUtc;
     if (age >= 0 && age < 1800) {
-      appendDiagLog("forecast: cached age=%llds, skip\n", (long long)age);
+      appendDiagLog("FORECAST", "msg=cached_skip age=%llds\n", (long long)age);
       if (syncProgressIsActive()) syncProgressTick(10);
       return;
     }
@@ -10910,7 +11071,7 @@ static void fetchForecastData() {
   s_forecast.valid = (s_forecast.hourlyCount > 0 || s_forecast.dailyCount > 0 ||
                       s_forecast.nowcastCount > 0);
   s_forecast.lastSyncUtc = time(nullptr);
-  appendDiagLog("forecast: nc=%d hr=%d dy=%d nws=%d eta=%d±%d\n",
+  appendDiagLog("FORECAST", "nc=%d hr=%d dy=%d nws=%d eta=%d±%d\n",
                 s_forecast.nowcastCount, s_forecast.hourlyCount,
                 s_forecast.dailyCount, s_forecast.nwsAvailable ? 1 : 0,
                 s_forecast.rainEtaMinutes, s_forecast.rainUncertaintyMin);
@@ -10930,7 +11091,7 @@ static void syncWeatherFrames() {
   memset(s_sourceBlackLogged, 0, sizeof(s_sourceBlackLogged));
   if (!syncProgressIsActive()) showMessage("Syncing time...", "pool.ntp.org");
   if (syncProgressIsActive()) syncProgressBeginPhase("ntp", 5U);
-  appendDiagLog("[SYNC] ntp start ms=%lu\n", millis());
+  appendDiagLog("SYNC", "msg=ntp_start\n");
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   struct tm ti;
   int tries = 0;
@@ -10938,20 +11099,20 @@ static void syncWeatherFrames() {
     if (syncProgressIsActive()) syncProgressTick(1);
   }
   time_t now = time(nullptr);
-  appendDiagLog("[SYNC] ntp done tries=%d ms=%lu\n", tries, millis());
-  appendDiagLog("sync: ntp utc=%lld millis=%lu ms\n", (long long)now, millis());
+  appendDiagLog("SYNC", "msg=ntp_done tries=%d\n", tries);
+  appendDiagLog("SYNC", "ntp_utc=%lld\n", (long long)now);
   if (syncProgressIsActive()) syncProgressCompletePhase();
 
   if (syncProgressIsActive()) syncProgressBeginPhase("geo", 10U);
-  appendDiagLog("[SYNC] refreshGeo start ms=%lu\n", millis());
+  appendDiagLog("GEO", "msg=refreshGeo_start\n");
   refreshDisplayLocationTimeFromIpInfo();
-  appendDiagLog("[SYNC] refreshGeo done valid=%d lat=%.4f lon=%.4f ms=%lu\n",
-                (int)s_weatherGeoValid, (double)s_weatherCenterLat, (double)s_weatherCenterLon, millis());
+  appendDiagLog("GEO", "msg=refreshGeo_done valid=%d lat=%.4f lon=%.4f\n",
+                (int)s_weatherGeoValid, (double)s_weatherCenterLat, (double)s_weatherCenterLon);
   if (syncProgressIsActive()) syncProgressCompletePhase();
 
   // Don't download frames if we don't know where we are
   if (!s_weatherGeoValid) {
-    appendDiagLog("[SYNC] abort: no valid location\n");
+    appendDiagLog("SYNC", "msg=abort_no_valid_location\n");
     showMessage("Location unknown", "Connect WiFi near known APs");
     return;
   }
@@ -10978,7 +11139,7 @@ static void syncWeatherFrames() {
   bool fullRefresh = false;
   if (!viewMatches && s_idx.count > 0) {
     fullRefresh = true;
-    appendDiagLog("sync: full-refresh reason=view\n");
+    appendDiagLog("SYNC", "msg=full-refresh reason=view\n");
   } else if (s_idx.count > 0 && s_idx.times[0] != 0) {
     time_t delta = fetchStart - s_idx.times[0];
     if (delta > 0 && cadenceSec > 0 && (delta % cadenceSec) == 0) {
@@ -11070,13 +11231,13 @@ static void syncWeatherFrames() {
     }
   }
 
-  appendDiagLog("sync: totalFrames=%d shift=%d downloadCount=%d oldCount=%d\n",
+  appendDiagLog("SYNC", "totalFrames=%d shift=%d downloadCount=%d oldCount=%d\n",
                 totalFrames, shift, downloadCount, oldCount);
-  appendDiagLog("[SYNC] plan: total=%d shift=%d dl=%d old=%d ms=%lu\n",
-              totalFrames, shift, downloadCount, oldCount, millis());
+  appendDiagLog("SYNC", "msg=plan total=%d shift=%d dl=%d old=%d\n",
+              totalFrames, shift, downloadCount, oldCount);
 
   if (downloadCount == 0) {
-    appendDiagLog("[SYNC] downloadCount=0 fast path ms=%lu\n", millis());
+    appendDiagLog("SYNC", "msg=downloadCount_0_fast_path\n");
     // Check if raw is all built
     bool allRawValid = true;
     for (int i = 0; i < (int)s_idx.count; i++) {
@@ -11096,7 +11257,7 @@ static void syncWeatherFrames() {
       }
       showMessage("Cache current", "No downloads needed");
       delay(700);
-      appendDiagLog("sync: cache current, no downloads\n");
+      appendDiagLog("SYNC", "msg=cache_current_no_downloads\n");
       return;
     }
     // Need raw rebuild
@@ -11105,23 +11266,29 @@ static void syncWeatherFrames() {
       syncProgressCompletePhase();
     }
     rebuildRawFromStored();
-    appendDiagLog("sync: cache current, rebuilt raw\n");
+    appendDiagLog("SYNC", "msg=cache_current_rebuilt_raw\n");
     return;
   }
 
-  // Fetch GIBS available times
-  appendDiagLog("[SYNC] fetchGibs start ms=%lu\n", millis());
+  // Fetch GIBS available times (skip for EUMETView — no DescribeDomains endpoint)
+  appendDiagLog("SYNC", "msg=fetchGibs_start\n");
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.setReuse(true);
-  fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
-  appendDiagLog("[SYNC] fetchGibs done ms=%lu\n", millis());
+  if (!s_activeSourceIsEumetview) {
+    fetchGibsAvailableTimes(client, fetchStart, fetchEnd);
+  }
+  appendDiagLog("SYNC", "msg=fetchGibs_done\n");
 
   // Download frames
-  if (!syncProgressIsActive()) showMessage("Updating cache...", "NASA GIBS");
+  if (!syncProgressIsActive()) showMessage("Updating cache...",
+    s_activeSourceIsEumetview ? "EUMETView" : "NASA GIBS");
   if (syncProgressIsActive()) syncProgressBeginPhase("cache", (uint32_t)totalFrames);
-  appendDiagLog("[SYNC] download loop start dl=%d total=%d ms=%lu\n", downloadCount, totalFrames, millis());
+  appendDiagLog("SYNC", "msg=download_loop_start dl=%d total=%d\n", downloadCount, totalFrames);
+
+  // F3: Clear stale GIBS times when source is EUMETView
+  if (s_activeSourceIsEumetview) s_gibsAvailCount = 0;
 
   float bboxWest, bboxSouth, bboxEast, bboxNorth;
   getActiveWeatherBbox(&bboxWest, &bboxSouth, &bboxEast, &bboxNorth);
@@ -11137,6 +11304,23 @@ static void syncWeatherFrames() {
   for (int i = 0; i < (int)s_idx.count; i++) {
     showProgress(i + 1, (int)s_idx.count, "cache");
     yield();
+
+    // Step 1: Heap monitoring every 10 frames
+    if ((i % 10) == 0) {
+      appendDiagLog("MEM", "slot=%d int=%u intblk=%u psram=%u reuse=%d\n", i,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+        (int)client.connected());
+    }
+    // Step 4: Low-memory early abort
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 40 * 1024 ||
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) < 16 * 1024) {
+      appendDiagLog("SYNC", "msg=abort_low_internal slot=%d\n", i);
+      break;
+    }
+    // Step 3: EUMETView inter-request delay
+    if (s_activeSourceIsEumetview && needsDownload[i]) vTaskDelay(pdMS_TO_TICKS(150));
 
     if (!needsDownload[i]) {
       saved++;
@@ -11167,7 +11351,7 @@ static void syncWeatherFrames() {
       skipped++;
       consecutiveSkips++;
       if (anyDownloadSucceeded && consecutiveSkips >= 4) {
-        appendDiagLog("sync: early-exit after %d consecutive skips at slot %d\n", consecutiveSkips, i);
+        appendDiagLog("SYNC", "msg=early-exit consecutive_skips=%d slot=%d\n", consecutiveSkips, i);
         break;
       }
       continue;
@@ -11189,19 +11373,19 @@ static void syncWeatherFrames() {
         int code = http.GET();
         if (code != HTTP_CODE_OK) {
           http.end();
-          if (attempt == 1) appendDiagLog("dl[%d]: http=%d\n", i, code);
+          if (attempt == 1) appendDiagLog("DL", "slot=%d result=http code=%d\n", i, code);
           continue;
         }
         if (!readHttpJpegBodyToDlBuf(http, "SYNC", &jpegLen)) {
-          if (attempt == 1) appendDiagLog("dl[%d]: body-fail len=%u\n", i, (unsigned)jpegLen);
+          if (attempt == 1) appendDiagLog("DL", "slot=%d result=body-fail len=%u\n", i, (unsigned)jpegLen);
           continue;
         }
         if (!validateBufferedWeatherFrameJpeg(jpegLen, "SYNC")) {
-          if (attempt == 1) appendDiagLog("dl[%d]: vld-fail len=%u\n", i, (unsigned)jpegLen);
+          if (attempt == 1) appendDiagLog("DL", "slot=%d result=vld-fail len=%u\n", i, (unsigned)jpegLen);
           continue;
         }
         if (jpegEffectiveLength(s_dlBuf, jpegLen) == 0) {
-          if (attempt == 1) appendDiagLog("dl[%d]: eoi-fail len=%u\n", i, (unsigned)jpegLen);
+          if (attempt == 1) appendDiagLog("DL", "slot=%d result=eoi-fail len=%u\n", i, (unsigned)jpegLen);
           continue;
         }
         fetchedOk = true;
@@ -11213,7 +11397,7 @@ static void syncWeatherFrames() {
       dlFail++;
       consecutiveSkips++;
       if (anyDownloadSucceeded && consecutiveSkips >= 4) {
-        appendDiagLog("sync: early-exit after %d consecutive fails at slot %d\n", consecutiveSkips, i);
+        appendDiagLog("SYNC", "msg=early-exit consecutive_fails=%d slot=%d\n", consecutiveSkips, i);
         break;
       }
       continue;
@@ -11323,7 +11507,7 @@ static void syncWeatherFrames() {
             if (semanticReject) {
               Serial.printf("SYNC sem-outlier i=%d cA=%d cB=%d rr=%d cj=%d rm=%d\n",
                             i, candA, candB, refAB, candColorJump, refMotion);
-              appendDiagLog("sync: sem-outlier i=%d\n", i);
+              appendDiagLog("SYNC", "msg=sem-outlier slot=%d\n", i);
             }
           }
         }
@@ -11410,8 +11594,8 @@ static void syncWeatherFrames() {
   }
 
   Serial.printf("sync done saved=%d skip=%d fail=%d fill=%d\n", saved, skipped, dlFail, filled);
-  appendDiagLog("sync: done saved=%d skip=%d fail=%d fill=%d total=%d millis=%lu ms\n",
-                saved, skipped, dlFail, filled, (int)s_idx.count, millis());
+  appendDiagLog("SYNC", "msg=done saved=%d skip=%d fail=%d fill=%d total=%d\n",
+                saved, skipped, dlFail, filled, (int)s_idx.count);
 }
 
 static void rebuildRawFromStored() {
@@ -11481,7 +11665,7 @@ static void rebuildRawFromStored() {
   rebuildFilteredZoomRawsFromCache();
 
   Serial.printf("raw-rebuild: built=%d dec=%d fill=%d\n", built, decFail, filled);
-  appendDiagLog("raw-rebuild: built=%d dec=%d fill=%d count=%d\n",
+  appendDiagLog("SD", "msg=raw-rebuild built=%d dec=%d fill=%d count=%d\n",
                 built, decFail, filled, (int)s_idx.count);
 }
 
@@ -11490,7 +11674,7 @@ static void rebuildRawFromStored() {
 // ─────────────────────────────────────────────────────────────
 static void bgSyncPhase1Task(void* param) {
   (void)param;
-  appendDiagLog("[BG-P1] start ms=%lu\n", millis());
+  appendDiagLog("SYNC", "msg=bg-p1_start\n");
   bool wifiOk = connectWifiForSync(false, nullptr);  // nullptr = suppress showMessage
   s_bgPhase1WifiOk = wifiOk;
   if (wifiOk) {
@@ -11500,7 +11684,7 @@ static void bgSyncPhase1Task(void* param) {
     s_tickerWidth = 0;  // force ticker re-render on next loop
   }
   s_bgPhase1Done = true;
-  appendDiagLog("[BG-P1] done wifi=%d ms=%lu\n", (int)wifiOk, millis());
+  appendDiagLog("SYNC", "msg=bg-p1_done wifi=%d\n", (int)wifiOk);
   s_bgSyncTaskHandle = nullptr;
   vTaskDelete(nullptr);
 }
@@ -11512,7 +11696,7 @@ static void bgFullSyncTask(void* param) {
   (void)param;
   s_bgFullSyncRunning = true;
   s_syncSuppressUi = true;
-  appendDiagLog("[BG-FULL] start ms=%lu\n", millis());
+  appendDiagLog("SYNC", "msg=bg-full_start\n");
 
   bool wifiOk = connectWifiForSync(false, nullptr);
   if (wifiOk) {
@@ -11542,13 +11726,13 @@ static void bgFullSyncTask(void* param) {
     noteSuccessfulScanNow();
     disconnectWifiAfterSync();
   } else {
-    appendDiagLog("[BG-FULL] wifi failed\n");
+    appendDiagLog("SYNC", "msg=bg-full_wifi_failed\n");
   }
 
   s_syncSuppressUi = false;
   s_bgFullSyncRunning = false;
   s_bgFullSyncDone = true;
-  appendDiagLog("[BG-FULL] done wifi=%d ms=%lu\n", (int)wifiOk, millis());
+  appendDiagLog("SYNC", "msg=bg-full_done wifi=%d\n", (int)wifiOk);
   s_bgFullSyncTaskHandle = nullptr;
   vTaskDelete(nullptr);
 }
@@ -11556,6 +11740,47 @@ static void bgFullSyncTask(void* param) {
 // ─────────────────────────────────────────────────────────────
 //  Enter sleep (deep sleep if BOOT pin supports it; light sleep fallback on C6)
 // ─────────────────────────────────────────────────────────────
+// Compose-then-reveal: push complete frame to GRAM while display is OFF
+static void presentFirstWakeFrame() {
+  if (!s_amoledOut || !s_frameDisplayBuf) return;
+  const int outY = (AMOLED_HEIGHT - SCALED_H) / 2;
+  // 1. Main frame — full height push (display is off, so no visible flicker)
+  amoledLock();
+  for (int cy = 0; cy < SCALED_H; cy += 60) {
+    int rows = min(60, SCALED_H - cy);
+    s_amoledOut->draw16bitRGBBitmap(0, outY + cy,
+        s_frameDisplayBuf + (size_t)cy * SCALED_W, SCALED_W, rows);
+  }
+  amoledUnlock();
+  // 2. Bottom bar
+  if (s_botBarBuf) {
+    const int barY = outY + (SCALED_H - SCALED_BAR_H);
+    amoledLock();
+    s_amoledOut->draw16bitRGBBitmap(0, barY, (const uint16_t*)s_botBarBuf,
+                                    SCALED_W, SCALED_BAR_H);
+    amoledUnlock();
+  }
+  // 3. Overlays — drawing to GRAM while DISPOFF is fine
+  s_moonDrawn = false;
+  drawMoonComplication();
+  if (s_hurricaneMode && !isCleanMode()) drawHurricaneRebootHint(nullptr);
+}
+
+static void panelPowerOn() {
+  pinMode(LCD_PWR, OUTPUT);
+  digitalWrite(LCD_PWR, HIGH);
+  delay(30);  // boost soft-start before any QSPI traffic
+}
+
+// C4: Let external pull-ups define idle state (not internal pulldown which
+// fights them and can wedge the card). Applied after every SD_MMC.end() in sleep.
+static void sdmmcPinsForSleep() {
+  for (int pin : {SDMMC_CMD, SDMMC_CLK, SDMMC_D0}) {
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+    gpio_set_pull_mode((gpio_num_t)pin, GPIO_FLOATING);
+  }
+}
+
 static void goToSleep(bool buttonOnly = false) {
   Serial.printf("Sleeping %d h...\n", SLEEP_HOURS);
   // Kill bg sync task if running (SD/WiFi will be torn down)
@@ -11590,8 +11815,18 @@ static void goToSleep(bool buttonOnly = false) {
   // on the next cue after wake.
   if (s_audioReady) {
     es8311_voice_mute(s_audioCodec, true);
-    digitalWrite(46, LOW);
+    digitalWrite(46, LOW);  // PA amp off
+    // Power down ES8311 codec (~5-8mA savings)
+    Wire.beginTransmission(0x18);
+    Wire.write(0x0D);  // SYSTEM_REG0D
+    Wire.write(0x00);  // Power down analog circuitry
+    Wire.endTransmission();
+    Wire.beginTransmission(0x18);
+    Wire.write(0x00);  // RESET_REG00
+    Wire.write(0x1F);  // Reset all digital blocks
+    Wire.endTransmission();
     s_audioPathPrimed = false;
+    s_audioReady = false;  // force full re-init on wake
   }
 
   // Dim backlight before sleep
@@ -11625,8 +11860,20 @@ static void goToSleep(bool buttonOnly = false) {
     Wire.endTransmission();
   }
 
+  // QMI8658: deepest standby (sensors default-off; disable 2MHz osc)
+  Wire.beginTransmission(0x6B);
+  Wire.write(0x02);  // CTRL1
+  Wire.write(0x01);  // bit0 SensorDisable = 1
+  Wire.endTransmission();
+
+  // C6: Capture battery state for breadcrumb before I2C goes away
+  s_bcBatPctAtSleep = (uint8_t)max(0, (int)readAxp2101BatPct());
+  if (s_bcMagic != 0xB007B007UL) {
+    s_bcMagic = 0xB007B007; s_bcWakeGpio = 0; s_bcWakeTimer = 0;
+    s_bcSdRemountFail = 0; s_bcSleepErr = 0; s_bcLastWakeCause = 0;
+  }
+
   // Release I2C bus — disables internal pullups on SDA/SCL (~150µA saved).
-  // External board pullups maintain bus integrity for connected devices.
   Wire.end();
 #else
   tft.fillScreen(TFT_BLACK);
@@ -11637,13 +11884,13 @@ static void goToSleep(bool buttonOnly = false) {
 
   if (s_autoUpdateInSleep) {
     int sleepSec = secondsUntilNextUpdate();
-    appendDiagLog("sleep-timer: ausl=1 sleepSec=%d interval=%d mode=%d\n",
+    appendDiagLog("SLEEP", "ausl=1 sleepSec=%d interval=%d mode=%d\n",
                   sleepSec, (int)s_autoUpdateIntervalMin, (int)s_updateMode);
     if (sleepSec > 0) {
       esp_sleep_enable_timer_wakeup((uint64_t)sleepSec * 1000000ULL);
     }
   } else {
-    appendDiagLog("sleep-timer: ausl=0 (no timer)\n");
+    appendDiagLog("SLEEP", "ausl=0 msg=no_timer\n");
   }
 
 #if BOARD_IS_AMOLED_206
@@ -11656,9 +11903,11 @@ static void goToSleep(bool buttonOnly = false) {
   esp_sleep_enable_gpio_wakeup();
 
   // Flush and unmount SD before the SDMMC clock stops during light sleep.
-  // Stopping the clock with the filesystem still mounted can leave the FAT
-  // dirty, causing large runs of files to return wrong sector data on wake.
   SD_MMC.end();
+  sdmmcPinsForSleep();
+
+  // Cut AMOLED power rail last (after all I2C/SD done, ~30-50mA savings)
+  digitalWrite(LCD_PWR, LOW);
 
   // Outer loop: timer wakes sync silently and re-sleep; button wakes break out.
   esp_sleep_wakeup_cause_t wake;
@@ -11670,10 +11919,12 @@ static void goToSleep(bool buttonOnly = false) {
     do {
       esp_err_t sleepErr = esp_light_sleep_start();
       if (sleepErr != ESP_OK) {
-        Serial.printf("Light sleep failed (%d)\n", (int)sleepErr);
+        s_bcSleepErr++;
       }
       wake = esp_sleep_get_wakeup_cause();
-      Serial.printf("Wake cause: %d\n", (int)wake);
+      s_bcLastWakeCause = (uint8_t)wake;
+      if (wake == ESP_SLEEP_WAKEUP_GPIO) s_bcWakeGpio++;
+      else if (wake == ESP_SLEEP_WAKEUP_TIMER) s_bcWakeTimer++;
 
       // Button bounce guard: if GPIO woke us within 500ms of sleep entry
       // and the boot button is still LOW, it's bounce from the press that
@@ -11693,6 +11944,7 @@ static void goToSleep(bool buttonOnly = false) {
 
     // ── Timer wake: silent background sync, then re-sleep ──
     if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
+      s_syncSuppressUi = true;  // C3: prevent QSPI writes to unpowered panel
       // Free PSRAM cache for sync (needs memory for downloads)
       if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; }
       // Silent background sync — mount SD, sync, unmount, re-sleep
@@ -11709,7 +11961,7 @@ static void goToSleep(bool buttonOnly = false) {
         }
       }
       if (sdOk) {
-        appendDiagLog("timer-wake: sd=ok syncing millis=%lu\n", millis());
+        appendDiagLog("SLEEP", "msg=timer-wake sd=ok\n");
         if (s_hurricaneMode && s_hurricaneWatchEnabled) {
           hurricaneRecheckAndUpdate();
         }
@@ -11732,19 +11984,25 @@ static void goToSleep(bool buttonOnly = false) {
           maybeRefreshPendingZoomSnapshots();
           noteSuccessfulScanNow();
         }
-        disconnectWifiAfterSync();
+        // C1: Full WiFi teardown before re-sleeping (not disconnectWifiAfterSync
+        // which keeps WiFi+portal alive — violates ESP-IDF light sleep requirement)
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        appendDiagLog("SLEEP", "msg=timer-wake_wifi_off\n");
         // Re-arm timer before unmounting SD so diag log can write.
         {
           int nextSec = secondsUntilNextUpdate();
-          appendDiagLog("timer-wake: sync done nextSec=%d millis=%lu\n", nextSec, millis());
+          appendDiagLog("SLEEP", "msg=timer-wake_sync_done nextSec=%d\n", nextSec);
           if (nextSec > 0) esp_sleep_enable_timer_wakeup((uint64_t)nextSec * 1000000ULL);
         }
         SD_MMC.end();
+        sdmmcPinsForSleep();
       } else {
         // SD mount failed — just re-arm and re-sleep
         int nextSec = secondsUntilNextUpdate();
         if (nextSec > 0) esp_sleep_enable_timer_wakeup((uint64_t)nextSec * 1000000ULL);
       }
+      s_syncSuppressUi = false;
       continue;  // re-enter outer loop → sleep again
     }
 
@@ -11763,9 +12021,8 @@ static void goToSleep(bool buttonOnly = false) {
     if (staleIrq > 0) writeAxp2101Register(0x49, (uint8_t)staleIrq);
   }
 
-  // Restore AMOLED_PWR_EN strong output driver (released for QMI8658 INT1 sharing).
-  pinMode(LCD_PWR, OUTPUT);
-  digitalWrite(LCD_PWR, HIGH);
+  // Restore AMOLED power rail with soft-start delay
+  panelPowerOn();
 
   // Remount SD for playback.
   {
@@ -11782,19 +12039,25 @@ static void goToSleep(bool buttonOnly = false) {
       }
     }
     if (!sdOk) {
-      Serial.println("SD remount failed after 5 attempts — re-sleeping");
+      // C2: Never re-sleep silently — show error screen instead of recursive goToSleep
+      s_bcSdRemountFail++;
+      delay(30);  // boost soft-start
+      if (s_amoledOut) { s_amoledOut->displayOn(); s_amoledOut->setBrightness(s_displayBrightness); }
+      showMessage("SD card error", "Power cycle to retry");
+      delay(10000);
       goToSleep();
       return;
     }
   }
   resetTopButtonStateAfterWake(buttonOnly);
 
+  // TODO: presentFirstWakeFrame() disabled pending debug — crashes on wake
+  // presentFirstWakeFrame();
   if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(s_displayBrightness);
   s_touchInitialized = false;   // force touch re-init (was hibernated before sleep)
   s_serviceButtonsWakeReset = true;
   s_buttonSleepTransition = false;
-  s_moonDrawn = false;          // border was cleared — redraw moon
   return;
 #endif
 
@@ -12001,7 +12264,7 @@ static void printMemDiag(const char* label) {
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
     (unsigned)ESP.getMaxAllocHeap());
-  appendDiagLog("[MEM %s] PSRAM: %u/%u  Heap: %u/%u  MaxAlloc: %u\n",
+  appendDiagLog("MEM", "label=%s psram_free=%u psram_total=%u heap_free=%u heap_total=%u max_alloc=%u\n",
     label,
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getPsramSize(),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getHeapSize(),
@@ -12063,7 +12326,7 @@ void setup() {
 
 #if INDEPENDENT_TICKER
   s_amoledMutex = xSemaphoreCreateMutex();
-  appendDiagLog("[INIT] ticker mutex created\n");
+  appendDiagLog("TICKER", "msg=mutex_created\n");
 #endif
 
 #if BOARD_IS_AMOLED_206 || BOARD_HAS_PHYSICAL_BOOT_WAKE
@@ -12136,7 +12399,7 @@ void setup() {
 
   // ── Allocate pre-scaled display PSRAM buffers ─────────────────────────────
   Serial.println("[INIT] PSRAM alloc");
-  appendDiagLog("[INIT] PSRAM alloc ms=%lu\n", millis());
+  appendDiagLog("BOOT", "msg=psram_alloc\n");
   printMemDiag("PRE-ALLOC");
   if (!s_frameDisplayBuf) {
     s_frameDisplayBuf  = (uint16_t*)heap_caps_malloc(SCALED_FRAME_BYTES, MALLOC_CAP_SPIRAM);
@@ -12177,6 +12440,24 @@ void setup() {
         s_weatherGeoValid = true;
       } else {
         s_weatherGeoValid = false;
+      }
+      // Crash streak counter: skip sync after 3+ consecutive crashes (safe-boot)
+      {
+        Preferences cp;
+        if (cp.begin("satwatch", false)) {
+          esp_reset_reason_t rst = esp_reset_reason();
+          bool crashed = (rst == ESP_RST_PANIC || rst == ESP_RST_WDT ||
+                          rst == ESP_RST_INT_WDT || rst == ESP_RST_TASK_WDT);
+          uint8_t streak = cp.getUInt("crashstreak", 0);
+          streak = crashed ? (uint8_t)(streak + 1) : 0;
+          cp.putUInt("crashstreak", streak);
+          if (streak >= 3) {
+            cp.putBool("safeboot", true);
+            appendDiagLog("BOOT", "msg=safeboot_sync_disabled streak=%d\n", streak);
+          }
+          cp.end();
+          appendDiagLog("BOOT", "crashstreak=%d rst=%d\n", streak, (int)rst);
+        }
       }
     }
     selectSatelliteForLon(s_weatherCenterLon, true);
@@ -12233,35 +12514,49 @@ void setup() {
   loadIndex();
   if (frameCount > 0) {
     Serial.printf("SD index: %d frames\n", frameCount);
-    if (hardBoot) {
+    if (hardBoot && !s_geoManualOverride) {
       loadWeatherViewCenterFromCache();
     }
   }
 
 
-  // ── Diagnostic log to SD (persistent across boots, 8MB cap) ─────────────
+  // ── Diagnostic log init ─────────────────────────────────────
   {
-    // Check size and reset if over 8MB
-    File diagCheck = SD.open(SD_ROOT "/diag.txt", FILE_READ);
-    bool needsTruncate = false;
+    // Increment NVS boot counter
+    Preferences diagPrefs;
+    if (diagPrefs.begin("satwatch", false)) {
+      s_diagBootNum = diagPrefs.getUInt("bootcnt", 0) + 1;
+      diagPrefs.putUInt("bootcnt", s_diagBootNum);
+      diagPrefs.end();
+    }
+    // Rotate persistent log if over 128KB
+    File diagCheck = SD.open(SD_ROOT "/diag.log", FILE_READ);
     if (diagCheck) {
-      if (diagCheck.size() > 8UL * 1024UL * 1024UL) needsTruncate = true;
-      diagCheck.close();
+      if (diagCheck.size() > 128UL * 1024UL) { diagCheck.close(); SD.remove(SD_ROOT "/diag.log"); }
+      else diagCheck.close();
     }
-    File diagF = SD.open(SD_ROOT "/diag.txt", needsTruncate ? FILE_WRITE : FILE_APPEND);
-    if (diagF) {
-      diagF.printf("\n════════════════════════════════════════\n");
-      int8_t batPct = readAxp2101BatPct();
-      int chargeState = readAxp2101ChargeState();
-      diagF.printf("LogID=%lu date=pending millis=%lu ms\n", (unsigned long)esp_random(), millis());
-      diagF.printf("boot: millis=%lu ms\n", millis());
-      diagF.printf("idxCount=%d framesReady=%d frameCount=%d\n", (int)s_idx.count, (int)framesReady, frameCount);
-      diagF.printf("bat=%d%% chargeState=0x%02X resetReason=%d\n",
-                   (int)batPct, (unsigned)(chargeState < 0 ? 0xFF : chargeState),
-                   (int)esp_reset_reason());
-      diagF.printf("hurricaneWatch=%d\n", (int)s_hurricaneWatchEnabled);
-      diagF.close();
+    // Truncate current-boot log
+    { File fc = SD.open(SD_ROOT "/diag-current.log", FILE_WRITE); if (fc) fc.close(); }
+    // One-time migration: remove old diag.txt
+    SD.remove(SD_ROOT "/diag.txt");
+    // Boot header
+    int8_t batPct = readAxp2101BatPct();
+    int chargeState = readAxp2101ChargeState();
+    appendDiagLog("BOOT", "rst=%d fw=%d bat=%d chg=0x%02X idx=%d ready=%d frames=%d hw=%d\n",
+                  (int)esp_reset_reason(), FIRMWARE_VERSION,
+                  (int)batPct, (unsigned)(chargeState < 0 ? 0xFF : chargeState),
+                  (int)s_idx.count, (int)framesReady, frameCount,
+                  (int)s_hurricaneWatchEnabled);
+    // C6: Dump sleep breadcrumbs from previous session
+    if (s_bcMagic == 0xB007B007UL) {
+      appendDiagLog("SLEEPBC", "gpio=%u timer=%u sdFail=%u sleepErr=%u lastWake=%u batAtSleep=%u\n",
+                    (unsigned)s_bcWakeGpio, (unsigned)s_bcWakeTimer,
+                    (unsigned)s_bcSdRemountFail, (unsigned)s_bcSleepErr,
+                    (unsigned)s_bcLastWakeCause, (unsigned)s_bcBatPctAtSleep);
     }
+    // Reset breadcrumbs on hard boot
+    s_bcMagic = 0; s_bcWakeGpio = 0; s_bcWakeTimer = 0;
+    s_bcSdRemountFail = 0; s_bcSleepErr = 0;
   }
 
   // Apply RTC time early so hot-boot freshness check has valid time(nullptr)
@@ -12276,24 +12571,22 @@ void setup() {
     bool cleanReset = (rst == ESP_RST_POWERON || rst == ESP_RST_SW || rst == ESP_RST_USB);
     if (cleanReset && s_fastBootEnabled && framesReady && frameCount > 0 && cacheIsFreshEnough()) {
       hotBootEligible = true;
-      appendDiagLog("[BOOT] hot-boot eligible rst=%d age=%llds\n",
+      appendDiagLog("BOOT", "msg=hot-boot_eligible rst=%d age=%llds\n",
                     (int)rst, (long long)(time(nullptr) - s_lastSuccessfulSyncUtc));
     } else {
       hardBootSyncDue = true;
     }
   }
+  // Safe-boot: skip sync if crash streak ≥ 3 (geo override stays intact)
+  bool safeBootNoSync = false;
+  { Preferences sp; if (sp.begin("satwatch", true)) { safeBootNoSync = sp.getBool("safeboot", false); sp.end(); } }
+  if (safeBootNoSync) { hardBootSyncDue = false; appendDiagLog("BOOT", "msg=safeboot_active sync_skipped\n"); }
   bool needSync = (hardBootSyncDue || timerWake || !framesReady || frameCount == 0);
-  {
-    File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-    if (diagF) {
-      diagF.printf("hardBoot=%d timerWake=%d framesReady=%d frameCount=%d skipOnce=%d needSync=%d hotBoot=%d\n",
-                   (int)hardBoot, (int)timerWake, (int)framesReady, frameCount,
-                   (int)skipNextSyncOnce, (int)needSync, (int)hotBootEligible);
-      diagF.close();
-    }
-  }
+  appendDiagLog("BOOT", "hard=%d timer=%d ready=%d frames=%d skip=%d sync=%d hot=%d\n",
+                (int)hardBoot, (int)timerWake, (int)framesReady, frameCount,
+                (int)skipNextSyncOnce, (int)needSync, (int)hotBootEligible);
   if (hotBootEligible) {
-    appendDiagLog("[BOOT] hot-boot path ms=%lu\n", millis());
+    appendDiagLog("BOOT", "msg=hot-boot_path\n");
     s_startCuePending = true;
     s_bgPhase1Done = false;
     s_bgPhase1WifiOk = false;
@@ -12301,7 +12594,7 @@ void setup() {
     // Skip sync — fall through to stream open + animation
   } else if (skipNextSyncOnce && framesReady && frameCount > 0) {
     bool wifiOk = connectWifiForSync(false);
-    { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("skip-sync wifiOk=%d\n", (int)wifiOk); diagF.close(); } }
+    appendDiagLog("BOOT", "msg=skip-sync wifiOk=%d\n", (int)wifiOk);
     if (!wifiOk) {
       tryApplyPcf85063Time();
       runWifiConfigPortal(framesReady && frameCount > 0);
@@ -12323,9 +12616,9 @@ void setup() {
       syncProgressBeginPhase("wifi", 20U);
     }
     bool wifiOk = connectWifiForSync(false);
-    appendDiagLog("[BOOT] wifi done ok=%d ms=%lu\n", (int)wifiOk, millis());
+    appendDiagLog("WIFI", "ok=%d\n", (int)wifiOk);
     if (syncProgressIsActive()) syncProgressCompletePhase();
-    { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("wifiOk=%d\n", (int)wifiOk); diagF.close(); } }
+    appendDiagLog("WIFI", "ok=%d\n", (int)wifiOk);
     if (wifiOk) {
       // Hurricane watch: check NOAA before sync so bbox is storm-centered if needed
       if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
@@ -12347,20 +12640,20 @@ void setup() {
         syncProgressCompletePhase();
       }
 
-      appendDiagLog("[BOOT] syncWeatherFrames start ms=%lu\n", millis());
+      appendDiagLog("BOOT", "msg=syncWeatherFrames_start\n");
       syncWeatherFrames();
-      appendDiagLog("[BOOT] syncWeatherFrames done ms=%lu\n", millis());
+      appendDiagLog("BOOT", "msg=syncWeatherFrames_done\n");
       if (syncProgressIsActive()) syncProgressBeginPhase("forecast", 15U);
-      appendDiagLog("[BOOT] fetchForecastData start ms=%lu\n", millis());
+      appendDiagLog("BOOT", "msg=fetchForecastData_start\n");
       fetchForecastData();
-      appendDiagLog("[BOOT] fetchForecastData done ms=%lu\n", millis());
+      appendDiagLog("BOOT", "msg=fetchForecastData_done\n");
       s_tickerWidth = 0;  // invalidate ticker so it re-renders with fresh forecast
       if (syncProgressIsActive()) syncProgressCompletePhase();
-      { File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND); if (diagF) { diagF.printf("syncWeatherFrames done fc=%d rdy=%d\n", frameCount, (int)framesReady); diagF.close(); } }
-      appendDiagLog("[BOOT] downloadMoon start ms=%lu\n", millis());
+      appendDiagLog("SYNC", "msg=done fc=%d rdy=%d\n", frameCount, (int)framesReady);
+      appendDiagLog("BOOT", "msg=downloadMoon_start\n");
       downloadMoonFramesIfMissing();
-      appendDiagLog("[BOOT] downloadMoon done ms=%lu\n", millis());
-      appendDiagLog("[BOOT] zoomSnapshots start ms=%lu\n", millis());
+      appendDiagLog("BOOT", "msg=downloadMoon_done\n");
+      appendDiagLog("BOOT", "msg=zoomSnapshots_start\n");
       maybeRefreshPendingZoomSnapshots();
       noteSuccessfulScanNow();
       disconnectWifiAfterSync();
@@ -12369,27 +12662,15 @@ void setup() {
       tryApplyPcf85063Time();
       runWifiConfigPortal(framesReady && frameCount > 0);
     }
-    {
-      File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-      if (diagF) {
-        diagF.printf("post-sync: framesReady=%d frameCount=%d\n", (int)framesReady, frameCount);
-        diagF.printf("geo: lat=%.4f lon=%.4f valid=%d label=%s\n",
-                     (double)s_weatherCenterLat, (double)s_weatherCenterLon,
-                     (int)s_weatherGeoValid, s_displayLocationLabel);
-        diagF.close();
-      }
-    }
+    appendDiagLog("BOOT", "post-sync ready=%d frames=%d\n", (int)framesReady, frameCount);
+    appendDiagLog("GEO", "lat=%.4f lon=%.4f valid=%d label=%s\n",
+                  (double)s_weatherCenterLat, (double)s_weatherCenterLon,
+                  (int)s_weatherGeoValid, s_displayLocationLabel);
   }
 
   if (!needSync && !hotBootEligible && hardBoot && framesReady && frameCount > 0) {
     bool wifiOk = connectWifiForSync(false);
-    {
-      File diagF = SD.open(SD_ROOT "/diag.txt", FILE_APPEND);
-      if (diagF) {
-        diagF.printf("boot-lite wifiOk=%d\n", (int)wifiOk);
-        diagF.close();
-      }
-    }
+    appendDiagLog("BOOT", "msg=boot-lite wifiOk=%d\n", (int)wifiOk);
     if (wifiOk) {
       (void)syncClockFromNtpBestEffort(8);
       refreshDisplayLocationTimeFromIpInfo();
@@ -12409,11 +12690,11 @@ void setup() {
   if (framesReady && frameCount > 0) {
     ensureStreamOpen();
     if (!s_streamReady || !s_streamFile) {
-      appendDiagLog("setup: stream open failed -> rebuild raw\n");
+      appendDiagLog("SD", "msg=stream_open_failed_rebuild_raw\n");
       showMessage("Building...", "Preparing frames");
       rebuildRawFromStored();
       ensureStreamOpen();
-      appendDiagLog("setup: stream ready after rebuild=%d\n",
+      appendDiagLog("SD", "msg=stream_ready_after_rebuild ready=%d\n",
                     (int)(s_streamReady && (bool)s_streamFile));
     }
   }
@@ -13072,11 +13353,11 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   if (syncProgressIsActive()) syncProgressTick(2);
 
   // Apply geo position — skip in hurricane mode to preserve storm-centered bbox
+  appendDiagLog("GEO", "bssid=%d manual=%d hurr=%d\n", (int)gotGeo, (int)s_geoManualOverride, (int)s_hurricaneMode);
   if (s_hurricaneMode) {
     // Still extract timezone offset above, but don't override center/satellite
-  } else if (gotGeo) {
-    // BSSID is high-confidence — always accept it.
-    // NVS is just a fallback for when BSSID fails, not a lock.
+  } else if (gotGeo && !s_geoManualOverride) {
+    // BSSID is high-confidence — accept unless user set manual override.
     float stableLat = roundf(lat * 100.0f) * 0.01f;
     float stableLon = roundf(lon * 100.0f) * 0.01f;
     if (s_weatherGeoValid) {
@@ -13103,11 +13384,11 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   Serial.printf("wx src=%s layer=%s cad=%d lag=%d\n",
                 s_activeWeatherSource, s_activeGibsLayer,
                 activeCadenceMin(), activeLagHours());
-  appendDiagLog("geo: loc=%s lat=%.4f lon=%.4f src=%s cad=%d valid=%d bssid=%d millis=%lu ms\n",
+  appendDiagLog("GEO", "loc=%s lat=%.4f lon=%.4f src=%s cad=%d valid=%d bssid=%d\n",
                 s_displayLocationLabel,
                 (double)s_weatherCenterLat, (double)s_weatherCenterLon,
                 s_activeWeatherSource, activeCadenceMin(),
-                (int)s_weatherGeoValid, (int)gotGeo, millis());
+                (int)s_weatherGeoValid, (int)gotGeo);
 }
 
 static void formatDisplayLocalClockNow(char* out, size_t len) {
@@ -13827,7 +14108,7 @@ static bool spriteLooksBottomBandJunkCorrupted() {
     prevCls = cls;
   }
   if (transitions >= 2) {
-    appendDiagLog("botband: tr=%d\n", transitions);
+    appendDiagLog("VLD", "msg=botband transitions=%d\n", transitions);
     Serial.printf("botband transitions=%d\n", transitions);
     return true;
   }
@@ -13884,7 +14165,7 @@ static bool spriteLooksBlackSlabCorrupted() {
         if (suspect[br][bc]) darkTiles++;
     if (darkTiles * 100 / (ROWS * COLS) >= 20) {
       Serial.printf("slab skip: darkTiles=%d/%d\n", darkTiles, ROWS * COLS);
-      appendDiagLog("slab: skip darkTiles=%d/%d\n", darkTiles, ROWS * COLS);
+      appendDiagLog("VLD", "msg=slab_skip darkTiles=%d/%d\n", darkTiles, ROWS * COLS);
       return false;
     }
   }
@@ -13922,7 +14203,7 @@ static bool spriteLooksBlackSlabCorrupted() {
       }
       if (comp >= 50) {
         Serial.printf("slab comp=%d\n", comp);
-        appendDiagLog("slab: comp=%d\n", comp);
+        appendDiagLog("VLD", "msg=slab_comp comp=%d\n", comp);
         return true;
       }
     }
@@ -13961,10 +14242,10 @@ static bool spriteLooksBlackSlabCorrupted() {
   const int leftDark = regionDarkPct(0, DISP_W / 5, y0, y1);
   const int rightDark = regionDarkPct(DISP_W - (DISP_W / 5), DISP_W, y0, y1);
   const int midDark = regionDarkPct(DISP_W / 3, (DISP_W * 2) / 3, y0, y1);
-  appendDiagLog("slab: darkPct l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
+  appendDiagLog("VLD", "msg=slab_darkPct l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
   if ((leftDark >= 70 && midDark <= 18) || (rightDark >= 70 && midDark <= 18)) {
     Serial.printf("slab mass l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
-    appendDiagLog("slab: mass l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
+    appendDiagLog("VLD", "msg=slab_mass l=%d r=%d m=%d\n", leftDark, rightDark, midDark);
     return true;
   }
 
@@ -13989,10 +14270,10 @@ static bool spriteLooksBlackSlabCorrupted() {
   }
   int leftPct = (leftTotal > 0) ? (leftHits * 100 / leftTotal) : 0;
   int rightPct = (rightTotal > 0) ? (rightHits * 100 / rightTotal) : 0;
-  appendDiagLog("slab: edgePct l=%d r=%d\n", leftPct, rightPct);
+  appendDiagLog("VLD", "msg=slab_edgePct l=%d r=%d\n", leftPct, rightPct);
   if ((leftPct >= 75 && rightPct <= 15) || (rightPct >= 75 && leftPct <= 15)) {
     Serial.printf("slab edge l=%d r=%d\n", leftPct, rightPct);
-    appendDiagLog("slab: edge l=%d r=%d\n", leftPct, rightPct);
+    appendDiagLog("VLD", "msg=slab_edge l=%d r=%d\n", leftPct, rightPct);
     return true;
   }
 
@@ -14011,7 +14292,7 @@ static bool spriteLooksBlackSlabCorrupted() {
     }
     if (count >= 9 && bestRun >= 7) {
       Serial.printf("slab col=%d cnt=%d run=%d\n", bc, count, bestRun);
-      appendDiagLog("slab: col=%d cnt=%d run=%d\n", bc, count, bestRun);
+      appendDiagLog("VLD", "msg=slab_col col=%d cnt=%d run=%d\n", bc, count, bestRun);
       return true;
     }
   }
@@ -14031,7 +14312,7 @@ static bool spriteLooksBlackSlabCorrupted() {
     }
     if (count >= 12 && bestRun >= 8) {
       Serial.printf("slab row=%d cnt=%d run=%d\n", br, count, bestRun);
-      appendDiagLog("slab: row=%d cnt=%d run=%d\n", br, count, bestRun);
+      appendDiagLog("VLD", "msg=slab_row row=%d cnt=%d run=%d\n", br, count, bestRun);
       return true;
     }
   }
@@ -14104,7 +14385,7 @@ void loop() {
     s_bgPhase1Done = false;
     s_bgPhase1WifiOk = false;
     if (wifiOk) {
-      appendDiagLog("[BG-P2] splice start ms=%lu\n", millis());
+      appendDiagLog("SYNC", "msg=bg-p2_splice_start\n");
       if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
         HurricaneInfo hStorms[4]; int hCount = 0;
         if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
@@ -14126,16 +14407,16 @@ void loop() {
       ensureStreamOpen();
       s_validCount = -1;  // force validIdx rebuild
       decodeMoonPhase();
-      appendDiagLog("[BG-P2] splice done ms=%lu\n", millis());
+      appendDiagLog("SYNC", "msg=bg-p2_splice_done\n");
     } else {
-      appendDiagLog("[BG-P2] wifi failed, skipping\n");
+      appendDiagLog("SYNC", "msg=bg-p2_wifi_failed\n");
     }
   }
 
   // Background full sync splice — apply results from bg task
   if (s_bgFullSyncDone && !s_bgFullSyncRunning) {
     s_bgFullSyncDone = false;
-    appendDiagLog("[BG-FULL] splice start ms=%lu\n", millis());
+    appendDiagLog("SYNC", "msg=bg-full_splice_start\n");
     closeStream();
     loadIndex();
     ensureStreamOpen();
@@ -14144,7 +14425,7 @@ void loop() {
     decodeMoonPhase();
     // Invalidate PSRAM cache so next loop rebuilds from fresh stream.raw
     if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; }
-    appendDiagLog("[BG-FULL] splice done ms=%lu\n", millis());
+    appendDiagLog("SYNC", "msg=bg-full_splice_done\n");
   }
 
   // Auto-update: foreground reboot (bg sync crashes due to shared sprite/dlBuf)
@@ -14171,8 +14452,8 @@ void loop() {
   static bool s_animStartLogged = false;
   if (!s_animStartLogged) {
     s_animStartLogged = true;
-    appendDiagLog("anim-start: millis=%lu ms\n", millis());
-    appendDiagLog("anim: validCount=%d frameCount=%d newestIdx=%d\n",
+    appendDiagLog("ANIM", "msg=start\n");
+    appendDiagLog("ANIM", "validCount=%d frameCount=%d newestIdx=%d\n",
                   validCount, frameCount, newestIdx);
     // Dump valid/invalid map: 'V'=valid, '.'=invalid, in groups of 24
     for (int row = 0; row < frameCount; row += 24) {
@@ -14181,7 +14462,7 @@ void loop() {
       for (int j = row; j < end; j++) map[j - row] = s_streamValid[j] ? 'V' : '.';
       map[end - row] = '\0';
       #if 0  // verbose perf log disabled
-appendDiagLog("vmap[%03d]: %s\n", row, map);
+appendDiagLog("ANIM", "vmap[%03d]=%s\n", row, map);
 #endif
     }
     // Log jpegLen for all slots so we can see nighttime sizes
@@ -14194,7 +14475,7 @@ appendDiagLog("vmap[%03d]: %s\n", row, map);
                         (unsigned)s_idx.jpegLen[j], j < end - 1 ? "," : "");
       }
       #if 0  // verbose perf log disabled
-appendDiagLog("jlen[%03d]: %s\n", row, buf);
+appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
 #endif
     }
   }
@@ -14273,7 +14554,7 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
         if (syncProgressIsActive()) syncProgressTick(1);
       }
       if (syncProgressIsActive()) syncProgressCompletePhase();
-      appendDiagLog("[ANIM] psram cache: %d/%d frames %uKB\n",
+      appendDiagLog("ANIM", "msg=psram_cache frames=%d/%d size=%uKB\n",
                     s_animCacheCount, cacheCap, (unsigned)(cacheNeeded / 1024));
     }
   }
@@ -14283,9 +14564,18 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
   // Start ticker task AFTER progress bar ends (prevents ticker drawing over progress bar)
 #if INDEPENDENT_TICKER
   if (tickerReady && !s_tickerTaskHandle) {
+    s_tickerScrollPx = 0;  // reset scroll position for clean start
     s_tickerShouldRun = true;
     xTaskCreatePinnedToCore(tickerTask, "ticker", 4096, nullptr, 2, &s_tickerTaskHandle, 1);
-    appendDiagLog("[INIT] ticker task started handle=%p mode=%d\n", s_tickerTaskHandle, s_tickerMode);
+    appendDiagLog("TICKER", "msg=task_started handle=%p mode=%d\n", s_tickerTaskHandle, s_tickerMode);
+    // Push black bottom bar to clear stale AMOLED memory before ticker renders
+    if (s_botBarBuf && s_amoledOut) {
+      memset(s_botBarBuf, 0, SCALED_W * SCALED_BAR_H * 2);
+      const int barY = (AMOLED_HEIGHT - SCALED_H) / 2 + (SCALED_H - SCALED_BAR_H);
+      amoledLock();
+      s_amoledOut->draw16bitRGBBitmap(0, barY, (const uint16_t*)s_botBarBuf, SCALED_W, SCALED_BAR_H);
+      amoledUnlock();
+    }
   }
 #endif
 
@@ -14382,7 +14672,7 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
           if (currentScaledFreezeFrameLooksCorrupted()) {
             // Evict the corrupt frame from index so next sync re-downloads it.
             {
-              appendDiagLog("raw-evict: idx=%d freeze-corrupt\n", freezeFrameIdx);
+              appendDiagLog("SD", "msg=raw-evict idx=%d reason=freeze-corrupt\n", freezeFrameIdx);
               if (freezeFrameIdx < MAX_FRAMES) {
                 s_streamValid[freezeFrameIdx] = 0;
                 s_idx.rawValid[freezeFrameIdx] = 0;
@@ -14395,11 +14685,11 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
                 if (!currentScaledFreezeFrameLooksCorrupted()) {
                   lastDisplayedFrameIdx = backIdx;
                   foundClean = true;
-                  appendDiagLog("loop: freeze-back=%d idx=%d\n", back, backIdx);
+                  appendDiagLog("ANIM", "msg=freeze-back back=%d idx=%d\n", back, backIdx);
                   break;
                 }
                 // Also corrupt — evict this one too.
-                appendDiagLog("raw-evict: idx=%d freeze-corrupt\n", backIdx);
+                appendDiagLog("SD", "msg=raw-evict idx=%d reason=freeze-corrupt\n", backIdx);
                 if (backIdx < MAX_FRAMES) {
                   s_streamValid[backIdx] = 0;
                   s_idx.rawValid[backIdx] = 0;
@@ -14409,11 +14699,11 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
             if (!foundClean) {
               // No clean alternative — re-show the original freeze frame.
               showFrame(freezeFrameIdx, true);
-              appendDiagLog("loop: freeze-back-fail\n");
+              appendDiagLog("ANIM", "msg=freeze-back-fail\n");
             }
             // Write updated index so evicted slots get re-downloaded next sync
             writeIndex();
-            appendDiagLog("idx: updated after freeze-corrupt eviction\n");
+            appendDiagLog("SD", "msg=idx_updated_after_freeze-corrupt_eviction\n");
             // Force valid-frame index rebuild next loop so evicted frames
             // are excluded for the remainder of this session.
             invalidateValidIdxCache();
@@ -14497,7 +14787,7 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
           // Log any frame gap > 100ms (visible stutter)
           static int spikeLog = 0;
           if (dt > 100 && spikeLog < 10) {
-            appendDiagLog("[SPIKE] f%d dt=%lums slot=%d elapsed=%lums\n",
+            appendDiagLog("PERF", "msg=spike frame=%d dt=%lums slot=%d elapsed=%lums\n",
               animFramesPushed, (unsigned long)dt, cacheSlot, (unsigned long)elapsed);
             spikeLog++;
           }
@@ -14507,7 +14797,7 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
         // Advance fixed-interval tick
         if (useCache) nextFrameMs += framePaceMs;
       } else if (animFramesPushed < 3) {
-        appendDiagLog("showFrame-fail: idx=%d srcPos=%lu\n", frameToShow, srcPos);
+        appendDiagLog("SD", "msg=showFrame-fail idx=%d srcPos=%lu\n", frameToShow, srcPos);
       }
     }
   }
@@ -14518,21 +14808,21 @@ appendDiagLog("jlen[%03d]: %s\n", row, buf);
     uint32_t actualMs = millis() - loopStartMs;
     float fps = actualMs > 0 ? (float)animFramesPushed * 1000.0f / (float)actualMs : 0;
     #if 0  // verbose perf log disabled
-appendDiagLog("anim-loop[%d]: pushed=%d fps=%.1f min=%lums max=%lums vc=%d dur=%lu\n",
+appendDiagLog("PERF", "loop=%d pushed=%d fps=%.1f min=%lums max=%lums vc=%d dur=%lu\n",
                   s_animLoopNum, animFramesPushed, (double)fps,
                   (unsigned long)frameMinMs, (unsigned long)frameMaxMs,
                   validCount, animationDurationMs);
 #endif
     // Component peaks
     #if 0  // verbose perf log disabled
-appendDiagLog("anim-comp: upMax=%luus presMax=%luus\n",
+appendDiagLog("PERF", "msg=anim-comp upMax=%luus presMax=%luus\n",
                   (unsigned long)compUpMax, (unsigned long)compPresMax);
 #endif
     // Lag frames (exceeded budget)
     if (lagCount > 0) {
       for (int li = 0; li < lagCount; li++) {
         #if 0  // verbose perf log disabled
-appendDiagLog("anim-lag: f%d up=%.1fms pres=%.1fms total=%.1fms\n",
+appendDiagLog("PERF", "msg=anim-lag frame=%d up=%.1fms pres=%.1fms total=%.1fms\n",
           (int)lagFrames[li].frameNum,
           lagFrames[li].upUs / 10.0, lagFrames[li].presUs / 10.0,
           lagFrames[li].totalUs / 10.0);
@@ -14540,7 +14830,7 @@ appendDiagLog("anim-lag: f%d up=%.1fms pres=%.1fms total=%.1fms\n",
       }
     } else {
       #if 0  // verbose perf log disabled
-appendDiagLog("anim-lag: none (all frames within budget)\n");
+appendDiagLog("PERF", "msg=anim-lag_none\n");
 #endif
     }
     // Dump shown/skipped map: S=shown, .=skipped
@@ -14551,7 +14841,7 @@ appendDiagLog("anim-lag: none (all frames within budget)\n");
         map[j - row] = (shownMap[j / 8] & (1 << (j % 8))) ? 'S' : '.';
       map[end - row] = '\0';
       #if 0  // verbose perf log disabled
-appendDiagLog("fmap[%03d]: %s\n", row, map);
+appendDiagLog("ANIM", "fmap[%03d]=%s\n", row, map);
 #endif
     }
   }
@@ -14595,7 +14885,7 @@ appendDiagLog("fmap[%03d]: %s\n", row, map);
             bool _wOk = runTerrainCrossfadeSegment(newestIdx, true);
 #if INDEPENDENT_TICKER
             #if 0  // verbose perf log disabled
-appendDiagLog("[TICKER-DURING-WIPE] push=%u skip=%u\n",
+appendDiagLog("TICKER", "msg=during-wipe push=%u skip=%u\n",
               (unsigned)(s_tickerPushCount - _wPush0), (unsigned)(s_tickerSkipCount - _wSkip0));
 #endif
 #endif
@@ -14604,7 +14894,7 @@ appendDiagLog("[TICKER-DURING-WIPE] push=%u skip=%u\n",
             baseForClockOverlay = terrainShownForClock;
             // Deep terrain zoom stages (S2 cloudless, daytime only)
             if (s_deepTerrainZoomEnabled && !terrainUsesNightLayerForUtc(time(nullptr))) {
-              appendDiagLog("[DEEP-ZOOM] start ms=%lu\n", millis());
+              appendDiagLog("ZOOM", "msg=deep-zoom_start\n");
               delayWithInputPoll(1000);
               // Compute geometric-mean zoom levels (same formula as download)
               float baseWKm = ZOOM3_FINAL_W_KM, baseHKm = ZOOM3_FINAL_H_KM;
@@ -14625,14 +14915,14 @@ appendDiagLog("[TICKER-DURING-WIPE] push=%u skip=%u\n",
               for (int tz = 0; tz <= finalTzLevel; tz++) {
                 uint32_t tzStart = millis();
                 bool tzOk = showZoomSnapshotFrame(tzPaths[tz], newestIdx);
-                appendDiagLog("[DEEP-ZOOM] tz%d %s ms=%lu\n", tz, tzOk ? "ok" : "FAIL", millis());
+                appendDiagLog("ZOOM", "msg=deep-zoom level=%d result=%s\n", tz, tzOk ? "ok" : "FAIL");
                 if (!tzOk) break;
                 int32_t tzRemain = 1000 - (int32_t)(millis() - tzStart);
                 if (tzRemain > 0) delayWithInputPoll((uint32_t)tzRemain);
               }
             }
           } else {
-            appendDiagLog("[TERRAIN] crossfade failed, fallback\n");
+            appendDiagLog("ZOOM", "msg=terrain_crossfade_failed_fallback\n");
             if (showZoomSnapshotFrame(activeTerrainJpegPath(), newestIdx)) {
               terrainShownForClock = true;
               delayWithInputPoll(terrainTransitionMs);
@@ -14695,7 +14985,7 @@ appendDiagLog("[TICKER-DURING-WIPE] push=%u skip=%u\n",
                 validCount, loopElapsedMs, loopExpectedMs, loopDriftMs);
   float animFps = (animationDurationMs > 0) ? (float)animFramesPushed * 1000.0f / (float)animationDurationMs : 0.0f;
   #if 0  // verbose perf log disabled
-appendDiagLog("loop: %d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d fps=%.1f (%d frames/%ums)\n",
+appendDiagLog("PERF", "loop=%d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d fps=%.1f frames=%d dur=%ums\n",
                 loopsDone, s_loopsBeforeSleep, validCount, frameCount, newestIdx,
                 loopElapsedMs, loopExpectedMs, loopDriftMs,
                 (double)animFps, animFramesPushed, animationDurationMs);
