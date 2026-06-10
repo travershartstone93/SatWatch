@@ -46,6 +46,8 @@
 #include <esp_wifi.h>      // esp_wifi_set_protocol()
 #include <WiFiUdp.h>       // Workstream A: UDP live log
 #include <HTTPUpdate.h>    // OTA firmware update
+#include <Update.h>        // Manual OTA flow with MD5
+#include <esp_ota_ops.h>   // OTA partition API for rollback
 // FT3168 touch IC accessed via direct I2C (addr 0x38)
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
 #define ESP32QSPI_MAX_PIXELS_AT_ONCE 4096  // reduce SPI transaction overhead (default 1024)
@@ -93,7 +95,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    11
+#define FIRMWARE_VERSION    12
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -251,6 +253,11 @@ static bool s_activeSourceIsEumetview = false;
 // D2: URL override for mock satellite server testing
 static char s_urlOverrideGibs[128] = {};
 static char s_urlOverrideEumet[128] = {};
+
+// F4: Portal auth token (6 hex chars, generated on first boot, stored in NVS)
+static char s_portalToken[8] = {};
+static uint8_t s_portalAuthFails = 0;
+static uint32_t s_portalLockoutMs = 0;
 
 // ─────────────────────────────────────────────────────────────
 //  LovyanGFX display configuration
@@ -1614,9 +1621,13 @@ static void sendWifiPortalPage() {
             "<div class='card' style='margin-top:14px;border:1px solid #dc2626;'>"
               "<h2 style='color:#f87171;margin-bottom:8px;'>Maintenance</h2>"
               "<div class='hint' style='margin-bottom:10px;'>Deletes all cached satellite frames and forces a full re-download on reboot. Use after moving locations or if frames look corrupted.</div>"
-              "<form method='POST' action='/clearframes' onsubmit=\"return confirm('Delete all cached frames and reboot?');\">"
-                "<button type='submit' style='background:#dc2626;'>Clear Frames &amp; Reboot</button>"
-              "</form>"
+              "<button type='button' onclick=\"if(confirm('Delete all cached frames and reboot?')){var tk=document.getElementById('tkfield');fetch('/clearframes?k='+(tk?tk.value:''),{method:'POST'}).then(function(r){return r.text();}).then(function(t){document.body.innerHTML=t;});}\" style='background:#dc2626;width:100%;padding:12px;border:0;border-radius:10px;color:white;font-size:16px;font-weight:700;'>Clear Frames &amp; Reboot</button>"
+            "</div>"
+            "<div class='card' style='margin-top:14px;'>"
+              "<h2 style='margin-bottom:8px;'>Auth Token</h2>"
+              "<div class='hint'>Required for updates, location, and settings changes. Shown on watch diag at boot.</div>"
+              "<input type='text' id='tkfield' placeholder='6-hex token' maxlength='6' "
+              "style='width:120px;font-family:monospace;' value=''>"
             "</div>"
             "<div class='card' style='margin-top:14px;border:1px solid #2563eb;'>"
               "<h2 style='color:#60a5fa;margin-bottom:8px;'>Firmware Update</h2>"
@@ -1645,7 +1656,8 @@ static void sendWifiPortalPage() {
             "function doUpdate(){"
               "var st=document.getElementById('otastatus');"
               "st.innerHTML='<b>Updating... do not power off.</b>';"
-              "fetch('/doupdate').then(function(r){return r.text();}).then(function(t){"
+              "var tk=document.getElementById('tkfield');var k=tk?tk.value:'';"
+              "fetch('/doupdate?k='+k).then(function(r){return r.text();}).then(function(t){"
                 "st.innerText=t;"
               "}).catch(function(e){st.innerText='Update failed: '+e;});"
             "}"
@@ -1861,6 +1873,7 @@ static void handleClearHurricaneSuppression() {
 }
 
 static void handleClearFrames() {
+  if (!portalTokenValid()) return;
   // Delete all files in the frames directory, then remove index/meta files.
   File dir = SD.open(FRAMES_DIR);
   if (dir && dir.isDirectory()) {
@@ -2079,6 +2092,7 @@ document.getElementById('detail').textContent=t+' (push #'+pushCount+')';
 }
 
 static void handleSetLocation() {
+  if (!portalTokenValid()) return;
   if (!s_wifiPortalServer.hasArg("lat") || !s_wifiPortalServer.hasArg("lon")) {
     s_wifiPortalServer.send(400, "text/plain", "missing lat or lon");
     return;
@@ -2120,9 +2134,40 @@ static void handleSetLocation() {
 }
 
 // ── OTA update handlers ──
+// F4: Constant-time token compare + lockout
+static bool portalTokenValid() {
+  if (s_portalToken[0] == '\0') return true;  // no token configured
+  if (s_portalLockoutMs > 0 && millis() < s_portalLockoutMs) {
+    s_wifiPortalServer.send(403, "text/plain", "Locked out");
+    return false;
+  }
+  String k = s_wifiPortalServer.arg("k");
+  if (k.length() == 0) k = s_wifiPortalServer.header("X-Token");
+  // Constant-time compare
+  bool match = (k.length() == strlen(s_portalToken));
+  for (size_t i = 0; i < strlen(s_portalToken); i++) {
+    if (i < k.length()) match &= (k[i] == s_portalToken[i]);
+    else match = false;
+  }
+  if (!match) {
+    s_portalAuthFails++;
+    appendDiagLog("AUTH", "msg=bad_token ip=%s fails=%d\n",
+                  s_wifiPortalServer.client().remoteIP().toString().c_str(), s_portalAuthFails);
+    if (s_portalAuthFails >= 5) { s_portalLockoutMs = millis() + 60000; s_portalAuthFails = 0; }
+    s_wifiPortalServer.send(403, "text/plain", "Invalid token");
+    return false;
+  }
+  s_portalAuthFails = 0;
+  return true;
+}
+
+// F2: Parse MD5 from version.json manifest
+static String s_otaRemoteMd5;
+static int    s_otaRemoteSize = 0;
+
 static void handleCheckUpdate() {
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setInsecure();  // TODO F1: setCACertBundle when bundle is available  // F1: TLS validation
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.begin(client, OTA_VERSION_URL);
@@ -2136,40 +2181,98 @@ static void handleCheckUpdate() {
   }
   String body = http.getString();
   http.end();
-  // Parse {"version": N, ...} — minimal JSON parse
+  // Parse {"version": N, "size": N, "md5": "..."}
   int remoteVersion = FIRMWARE_VERSION;
   int vi = body.indexOf("\"version\"");
-  if (vi >= 0) {
-    int ci = body.indexOf(':', vi);
-    if (ci >= 0) remoteVersion = body.substring(ci + 1).toInt();
+  if (vi >= 0) { int ci = body.indexOf(':', vi); if (ci >= 0) remoteVersion = body.substring(ci + 1).toInt(); }
+  // Parse md5
+  s_otaRemoteMd5 = "";
+  int mi = body.indexOf("\"md5\"");
+  if (mi >= 0) {
+    int q1 = body.indexOf('"', mi + 5); if (q1 >= 0) { int q2 = body.indexOf('"', q1 + 1);
+    if (q2 > q1) s_otaRemoteMd5 = body.substring(q1 + 1, q2); }
   }
+  // Parse size
+  s_otaRemoteSize = 0;
+  int si = body.indexOf("\"size\"");
+  if (si >= 0) { int ci = body.indexOf(':', si); if (ci >= 0) s_otaRemoteSize = body.substring(ci + 1).toInt(); }
+
   bool hasUpdate = remoteVersion > FIRMWARE_VERSION;
   String resp = "{\"update\":" + String(hasUpdate ? "true" : "false") +
                 ",\"current\":" + String(FIRMWARE_VERSION) +
-                ",\"remote\":" + String(remoteVersion) + "}";
+                ",\"remote\":" + String(remoteVersion) +
+                ",\"md5\":\"" + s_otaRemoteMd5 + "\"}";
   s_wifiPortalServer.send(200, "application/json", resp);
 }
 
 static void handleDoUpdate() {
-  WiFiClientSecure client;
-  client.setInsecure();
-  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  httpUpdate.setLedPin(-1);
-  t_httpUpdate_return ret = httpUpdate.update(client, OTA_FIRMWARE_URL);
-  switch (ret) {
-    case HTTP_UPDATE_OK:
-      s_wifiPortalServer.send(200, "text/plain", "Update OK, rebooting...");
-      delay(500);
-      ESP.restart();
-      break;
-    case HTTP_UPDATE_FAILED:
-      s_wifiPortalServer.send(200, "text/plain",
-        "Update failed: " + httpUpdate.getLastErrorString());
-      break;
-    case HTTP_UPDATE_NO_UPDATES:
-      s_wifiPortalServer.send(200, "text/plain", "No update needed");
-      break;
+  if (!portalTokenValid()) return;  // F4: require token
+
+  if (s_otaRemoteSize <= 0) {
+    s_wifiPortalServer.send(200, "text/plain", "Run Check first");
+    return;
   }
+
+  // F2: Manual update flow with MD5 verification
+  WiFiClientSecure client;
+  client.setInsecure();  // TODO F1: setCACertBundle when bundle is available  // F1: TLS validation
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(client, OTA_FIRMWARE_URL);
+  http.setTimeout(30000);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    s_wifiPortalServer.send(200, "text/plain", "Download failed: HTTP " + String(code));
+    return;
+  }
+
+  int contentLen = http.getSize();
+  if (contentLen <= 0) contentLen = s_otaRemoteSize;
+
+  if (!Update.begin(contentLen)) {
+    http.end();
+    s_wifiPortalServer.send(200, "text/plain", "Update.begin failed: " + String(Update.errorString()));
+    return;
+  }
+  if (s_otaRemoteMd5.length() == 32) {
+    Update.setMD5(s_otaRemoteMd5.c_str());  // F2: MD5 verification on end()
+  }
+
+  // F3: Mark OTA pending for rollback
+  { Preferences p; if (p.begin("satwatch", false)) { p.putBool("otapending", true); p.end(); } }
+
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = 0;
+  uint8_t buf[4096];
+  while (written < (size_t)contentLen) {
+    size_t avail = stream->available();
+    if (avail == 0) {
+      if (!stream->connected()) break;
+      delay(1);
+      continue;
+    }
+    size_t toRead = min(avail, sizeof(buf));
+    size_t got = stream->readBytes(buf, toRead);
+    if (got == 0) break;
+    size_t w = Update.write(buf, got);
+    if (w != got) break;
+    written += got;
+  }
+  http.end();
+
+  if (!Update.end(true)) {
+    appendDiagLog("OTA", "msg=failed err=%s md5=%s\n", Update.errorString(), s_otaRemoteMd5.c_str());
+    s_wifiPortalServer.send(200, "text/plain", "Update failed: " + String(Update.errorString()));
+    { Preferences p; if (p.begin("satwatch", false)) { p.putBool("otapending", false); p.end(); } }
+    return;
+  }
+
+  appendDiagLog("OTA", "msg=flashed ver_remote=%d md5=%s size=%u\n",
+                s_otaRemoteSize, s_otaRemoteMd5.c_str(), (unsigned)written);
+  s_wifiPortalServer.send(200, "text/plain", "Update OK, rebooting...");
+  delay(500);
+  ESP.restart();
 }
 
 static void ensureWifiPortalHandlers() {
@@ -2193,6 +2296,7 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/doupdate", HTTP_GET, handleDoUpdate);
 
   s_wifiPortalServer.on("/seturl", HTTP_GET, []() {
+    if (!portalTokenValid()) return;
     String gibs = s_wifiPortalServer.arg("gibs");
     String eumet = s_wifiPortalServer.arg("eumet");
     Preferences p; if (p.begin("satwatch", false)) {
@@ -2212,6 +2316,7 @@ static void ensureWifiPortalHandlers() {
     s_wifiPortalServer.send(200, "text/plain", resp);
   });
   s_wifiPortalServer.on("/netlog", HTTP_GET, []() {
+    if (!portalTokenValid()) return;
     bool on = s_wifiPortalServer.arg("on") == "1";
     s_netlogEnabled = on;
     Preferences p; if (p.begin("satwatch", false)) { p.putBool("netlog", on); p.end(); }
@@ -12562,8 +12667,34 @@ void setup() {
             cp.putBool("safeboot", true);
             appendDiagLog("BOOT", "msg=safeboot_sync_disabled streak=%d\n", streak);
           }
+          // F3: OTA rollback — if OTA pending and 2+ crashes, revert
+          bool otaPending = cp.getBool("otapending", false);
+          if (otaPending && streak >= 2) {
+            const esp_partition_t* prev = esp_ota_get_last_invalid_partition();
+            if (!prev) prev = esp_ota_get_next_update_partition(nullptr);
+            if (prev) {
+              appendDiagLog("OTA", "msg=rollback streak=%d part=%s\n", streak, prev->label);
+              esp_ota_set_boot_partition(prev);
+              cp.putBool("otapending", false);
+              cp.end();
+              delay(200);
+              ESP.restart();
+            }
+          } else if (otaPending && !crashed) {
+            // Healthy boot after OTA — confirm
+            cp.putBool("otapending", false);
+            appendDiagLog("OTA", "msg=confirmed\n");
+          }
+
+          // F4: Generate or load portal token
+          cp.getString("token", s_portalToken, sizeof(s_portalToken));
+          if (s_portalToken[0] == '\0') {
+            uint32_t r = esp_random();
+            snprintf(s_portalToken, sizeof(s_portalToken), "%06x", r & 0xFFFFFF);
+            cp.putString("token", s_portalToken);
+          }
           cp.end();
-          appendDiagLog("BOOT", "crashstreak=%d rst=%d\n", streak, (int)rst);
+          appendDiagLog("BOOT", "crashstreak=%d rst=%d token=%s\n", streak, (int)rst, s_portalToken);
         }
       }
     }

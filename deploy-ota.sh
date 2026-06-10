@@ -27,7 +27,9 @@ fi
 SIZE=$(stat -c%s "$BIN")
 echo "=== Binary size: $SIZE bytes ==="
 
-echo '{"version": '"$VERSION"', "size": '"$SIZE"'}' > /tmp/version.json
+MD5=$(md5sum "$BIN" | cut -d' ' -f1)
+echo '{"version": '"$VERSION"', "size": '"$SIZE"', "md5": "'"$MD5"'"}' > /tmp/version.json
+echo "=== MD5: $MD5 ==="
 cp "$BIN" /tmp/firmware.bin
 
 echo "=== Creating GitHub release $TAG ==="
