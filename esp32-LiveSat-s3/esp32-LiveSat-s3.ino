@@ -775,7 +775,7 @@ static bool s_audioCueReady = false;
 static char s_audioCueLoadedPath[START_CUE_PATH_MAX] = "";
 #endif
 static bool s_buttonSleepTransition = false;
-static bool s_wakeTransition = false;       // suppress overlays on first frame after wake
+static bool s_wakeNeedsWifiReconnect = false;  // set on wake, cleared after reconnect
 static bool s_serviceButtonsWakeReset = false;
 static void serviceUserButtons();
 
@@ -12014,7 +12014,11 @@ static void goToSleep(bool buttonOnly = false) {
   s_buttonSleepTransition = true;
   closeStream();
 
-  // Shut down WiFi before sleep (saves ~60-100mA during pre-sleep fade)
+  // Full WiFi + portal teardown before sleep
+  if (s_wifiPortalDnsRunning) { s_wifiPortalDns.stop(); s_wifiPortalDnsRunning = false; }
+  if (s_wifiPortalHttpRunning) { s_wifiPortalServer.stop(); s_wifiPortalHttpRunning = false; }
+  if (s_wifiPortalApActive) { WiFi.softAPdisconnect(true); s_wifiPortalApActive = false; }
+  stopWifiPortalMdns();
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
 
@@ -12263,13 +12267,14 @@ static void goToSleep(bool buttonOnly = false) {
   }
   resetTopButtonStateAfterWake(buttonOnly);
 
-  // TODO: presentFirstWakeFrame() disabled pending debug — crashes on wake
-  // presentFirstWakeFrame();
   if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(s_displayBrightness);
+  // Force moon/overlays to redraw on the first frame
+  s_moonDrawn = false;
   s_touchInitialized = false;   // force touch re-init (was hibernated before sleep)
   s_serviceButtonsWakeReset = true;
   s_buttonSleepTransition = false;
+  s_wakeNeedsWifiReconnect = true;  // reconnect in animation loop (non-blocking)
   return;
 #endif
 
@@ -14605,6 +14610,29 @@ static bool spriteLooksBlackSlabCorrupted() {
 // ─────────────────────────────────────────────────────────────
 void loop() {
   setCpuFrequencyMhz(160);  // memory-bound playback doesn't need 240MHz (saves ~20-30mA)
+
+  // Non-blocking WiFi reconnect after wake from sleep
+  if (s_wakeNeedsWifiReconnect) {
+    s_wakeNeedsWifiReconnect = false;
+    loadWifiPortalConfig();
+    WiFi.mode(WIFI_STA);
+    for (int slot = 0; slot < WIFI_CONFIG_SLOTS; ++slot) {
+      if (s_wifiConfig[slot].ssid[0] == '\0') continue;
+      WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
+      for (int t = 0; t < 15 && WiFi.status() != WL_CONNECTED; t++) delay(500);
+      if (WiFi.status() == WL_CONNECTED) {
+        startWifiPortalServer(false);
+        appendDiagLog("WIFI", "msg=wake_reconnect ssid=%s ip=%s\n",
+                      s_wifiConfig[slot].ssid, WiFi.localIP().toString().c_str());
+        break;
+      }
+    }
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF);
+    }
+  }
+
   serviceWifiPortalServer();
   serviceUserButtons();
   if (!framesReady || frameCount == 0) {
