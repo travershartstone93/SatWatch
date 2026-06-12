@@ -95,7 +95,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    12
+#define FIRMWARE_VERSION    23
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -635,6 +635,10 @@ static volatile bool s_bgFullSyncRunning = false;
 static TaskHandle_t  s_bgFullSyncTaskHandle = nullptr;
 static volatile bool s_syncSuppressUi = false;
 
+// PMU polling task — reads AXP2101 IRQ registers via I2C, no I2C in serviceUserButtons
+static volatile uint32_t s_pmuPendingIrq = 0;
+static TaskHandle_t s_pmuTaskHandle = nullptr;
+
 // PSRAM animation cache (file-scope for bg sync splice access)
 static uint16_t* s_animCache = nullptr;
 static int       s_animCacheCount = 0;
@@ -834,7 +838,9 @@ static void portalFriendlyDelay(uint32_t ms) {
   }
 }
 
-#define delay(ms) portalFriendlyDelay((uint32_t)(ms))
+// delay() is now plain vTaskDelay — safe from any task context.
+// Use portalFriendlyDelay() explicitly in loopTask sites that need portal servicing.
+#define delay(ms) vTaskDelay(pdMS_TO_TICKS((uint32_t)(ms)))
 
 // Read battery SOC from AXP2101 PMIC (I2C 0x34, register 0xA4, bits[6:0] = 0..100 %).
 // Returns -1 if the PMIC doesn't respond (no battery / device not present).
@@ -987,6 +993,7 @@ static void loadWifiPortalConfig() {
       if (s_tickerMode > TICKER_NONE) s_tickerMode = TICKER_SCROLL;
       prefs.getString("nwsgu", s_nwsGridUrl, sizeof(s_nwsGridUrl));
       s_nwsGridUrlValid = (s_nwsGridUrl[0] != '\0');
+      if (s_nwsGridUrlValid) s_forecast.nwsAvailable = true;  // Issue C fix
     }
     prefs.end();
   }
@@ -2205,74 +2212,92 @@ static void handleCheckUpdate() {
   s_wifiPortalServer.send(200, "application/json", resp);
 }
 
+static volatile bool s_otaInProgress = false;
+
 static void handleDoUpdate() {
-  if (!portalTokenValid()) return;  // F4: require token
+  if (!portalTokenValid()) return;
+  if (s_otaInProgress) { s_wifiPortalServer.send(200, "text/plain", "Update already in progress"); return; }
+  if (s_otaRemoteSize <= 0) { s_wifiPortalServer.send(200, "text/plain", "Run Check first"); return; }
 
-  if (s_otaRemoteSize <= 0) {
-    s_wifiPortalServer.send(200, "text/plain", "Run Check first");
-    return;
-  }
+  s_otaInProgress = true;
+  if (Update.isRunning()) Update.abort();
 
-  // F2: Manual update flow with MD5 verification
   WiFiClientSecure client;
-  client.setInsecure();  // TODO F1: setCACertBundle when bundle is available  // F1: TLS validation
+  client.setInsecure();
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.begin(client, OTA_FIRMWARE_URL);
   http.setTimeout(30000);
   int code = http.GET();
   if (code != 200) {
-    http.end();
+    http.end(); s_otaInProgress = false;
     s_wifiPortalServer.send(200, "text/plain", "Download failed: HTTP " + String(code));
     return;
   }
 
   int contentLen = http.getSize();
   if (contentLen <= 0) contentLen = s_otaRemoteSize;
+  if (contentLen <= 0) contentLen = UPDATE_SIZE_UNKNOWN;
 
   if (!Update.begin(contentLen)) {
-    http.end();
+    http.end(); s_otaInProgress = false;
     s_wifiPortalServer.send(200, "text/plain", "Update.begin failed: " + String(Update.errorString()));
     return;
   }
-  if (s_otaRemoteMd5.length() == 32) {
-    Update.setMD5(s_otaRemoteMd5.c_str());  // F2: MD5 verification on end()
-  }
+  if (s_otaRemoteMd5.length() == 32) Update.setMD5(s_otaRemoteMd5.c_str());
 
   // F3: Mark OTA pending for rollback
   { Preferences p; if (p.begin("satwatch", false)) { p.putBool("otapending", true); p.end(); } }
 
-  WiFiClient* stream = http.getStreamPtr();
-  size_t written = 0;
-  uint8_t buf[4096];
-  while (written < (size_t)contentLen) {
-    size_t avail = stream->available();
-    if (avail == 0) {
-      if (!stream->connected()) break;
-      delay(1);
-      continue;
-    }
-    size_t toRead = min(avail, sizeof(buf));
-    size_t got = stream->readBytes(buf, toRead);
-    if (got == 0) break;
-    size_t w = Update.write(buf, got);
-    if (w != got) break;
-    written += got;
-  }
+  // Use HTTPUpdate which handles chunked encoding + redirects correctly
+  Update.abort();  // clean slate
   http.end();
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  httpUpdate.setLedPin(-1);
+  t_httpUpdate_return ret = httpUpdate.update(client, OTA_FIRMWARE_URL);
 
-  if (!Update.end(true)) {
-    appendDiagLog("OTA", "msg=failed err=%s md5=%s\n", Update.errorString(), s_otaRemoteMd5.c_str());
-    s_wifiPortalServer.send(200, "text/plain", "Update failed: " + String(Update.errorString()));
+  if (ret == HTTP_UPDATE_OK) {
+    // Verify written partition against manifest MD5
+    bool md5ok = true;
+    if (s_otaRemoteMd5.length() == 32 && s_otaRemoteSize > 0) {
+      const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
+      if (next) {
+        MD5Builder md5;
+        md5.begin();
+        uint8_t vbuf[4096];
+        int remaining = s_otaRemoteSize;
+        int offset = 0;
+        while (remaining > 0) {
+          int chunk = (remaining > (int)sizeof(vbuf)) ? (int)sizeof(vbuf) : remaining;
+          if (esp_partition_read(next, offset, vbuf, chunk) == ESP_OK) {
+            md5.add(vbuf, chunk);
+          }
+          offset += chunk; remaining -= chunk;
+        }
+        md5.calculate();
+        String computed = md5.toString();
+        md5ok = (computed == s_otaRemoteMd5);
+        if (!md5ok) {
+          appendDiagLog("OTA", "msg=md5_MISMATCH expected=%s got=%s\n",
+                        s_otaRemoteMd5.c_str(), computed.c_str());
+          esp_ota_set_boot_partition(esp_ota_get_running_partition());
+          s_wifiPortalServer.send(200, "text/plain", "MD5 mismatch — update rejected");
+          { Preferences p; if (p.begin("satwatch", false)) { p.putBool("otapending", false); p.end(); } }
+          s_otaInProgress = false;
+          return;
+        }
+      }
+    }
+    appendDiagLog("OTA", "msg=flashed md5_verified=%d\n", (int)md5ok);
+    s_wifiPortalServer.send(200, "text/plain", "Update OK, rebooting...");
+    vTaskDelay(pdMS_TO_TICKS(500));
+    ESP.restart();
+  } else {
+    appendDiagLog("OTA", "msg=failed err=%s\n", httpUpdate.getLastErrorString().c_str());
+    s_wifiPortalServer.send(200, "text/plain", "Update failed: " + httpUpdate.getLastErrorString());
     { Preferences p; if (p.begin("satwatch", false)) { p.putBool("otapending", false); p.end(); } }
-    return;
   }
-
-  appendDiagLog("OTA", "msg=flashed ver_remote=%d md5=%s size=%u\n",
-                s_otaRemoteSize, s_otaRemoteMd5.c_str(), (unsigned)written);
-  s_wifiPortalServer.send(200, "text/plain", "Update OK, rebooting...");
-  delay(500);
-  ESP.restart();
+  s_otaInProgress = false;
 }
 
 static void ensureWifiPortalHandlers() {
@@ -2627,7 +2652,27 @@ static void configureAxp2101PowerKey() {
     inten2 |= 0x0F;  // pkey positive/negative/long/short
     writeAxp2101Register(0x41, (uint8_t)inten2);
   }
-  writeAxp2101Register(0x49, 0xFF);  // clear stale INTSTS2
+  // Clear ALL three IRQ status registers
+  writeAxp2101Register(0x48, 0xFF);
+  writeAxp2101Register(0x49, 0xFF);
+  writeAxp2101Register(0x4A, 0xFF);
+
+  // Launch PMU polling task — reads IRQ registers via I2C from a safe task context
+  if (!s_pmuTaskHandle) {
+    xTaskCreatePinnedToCore([](void*) {
+      for (;;) {
+        int s1 = readAxp2101Register(0x48);
+        int s2 = readAxp2101Register(0x49);
+        int s3 = readAxp2101Register(0x4A);
+        uint32_t combined = 0;
+        if (s1 > 0) { writeAxp2101Register(0x48, (uint8_t)s1); combined |= (uint32_t)s1; }
+        if (s2 > 0) { writeAxp2101Register(0x49, (uint8_t)s2); combined |= (uint32_t)s2 << 8; }
+        if (s3 > 0) { writeAxp2101Register(0x4A, (uint8_t)s3); combined |= (uint32_t)s3 << 16; }
+        if (combined) s_pmuPendingIrq |= combined;
+        vTaskDelay(pdMS_TO_TICKS(150));
+      }
+    }, "pmu", 2048, nullptr, 1, &s_pmuTaskHandle, 0);
+  }
 #endif
 }
 
@@ -4278,7 +4323,7 @@ static int renderForecastTicker() {
     char dayName[8];
     fmtDayName(s_forecast.daily[i].date, dayName, sizeof(dayName));
     if (entryTm.tm_mday == nowTm.tm_mday && entryTm.tm_mon == nowTm.tm_mon)
-      snprintf(dayLabel, sizeof(dayLabel), "%d%s %s(Today)", dom, suf, dayName);
+      snprintf(dayLabel, sizeof(dayLabel), "%d%s %s(Now)", dom, suf, dayName);
     else
       snprintf(dayLabel, sizeof(dayLabel), "%d%s %s", dom, suf, dayName);
 
@@ -6476,6 +6521,7 @@ static void delayWithInputPoll(uint32_t ms) {
   uint32_t lastPush = millis();
 #endif
   while (millis() - start < ms) {
+    serviceWifiPortalServer();
     serviceUserButtons();
     pollCleanModeToggle();
 #if !INDEPENDENT_TICKER
@@ -8470,12 +8516,10 @@ static bool loadGeoFromNvs(float* lat, float* lon) {
 // Used in the dismissible portal loop only — does NOT call serviceUserButtons().
 static bool pollPortalSkip() {
   // Touch IC INT pin (GPIO 38) goes low when a touch is detected.
-  // This works even when the IC is in auto-sleep — touch wakes it and asserts INT.
   if (digitalRead(38) == LOW) return true;
-  // AXP2101 PKEY short-press interrupt (reg 0x49 bit 2) — intercept before restart
-  uint8_t intSts = readAxp2101Register(0x49);
-  if (intSts & 0x04) {
-    writeAxp2101Register(0x49, intSts);  // clear
+  // PKEY short-press from PMU task (0x4A bit 3 = bit 19 of combined mask)
+  if (s_pmuPendingIrq & (0x08UL << 16)) {
+    s_pmuPendingIrq &= ~(0x08UL << 16);
     return true;
   }
   return false;
@@ -11257,23 +11301,28 @@ static void fetchForecastData() {
   // Tier 1: Nowcast via radar
   if (syncProgressIsActive()) syncProgressTick(1);
   fetchAndAnalyzeNowcastRadar(client, http);
+  http.end(); client.stop();  // isolate tier — prevent wedged connection poisoning
   if (syncProgressIsActive()) syncProgressTick(3);
 
   // Tier 2+3: NWS → Open-Meteo fallback
   if (!s_nwsGridUrlValid) {
     fetchNwsGridUrl(client, http);
+    http.end(); client.stop();
     if (syncProgressIsActive()) syncProgressTick(2);
   }
   if (s_forecast.nwsAvailable) {
     fetchNwsHourlyForecast(client, http);
+    http.end(); client.stop();
     if (syncProgressIsActive()) syncProgressTick(2);
     fetchNwsDailyForecast(client, http);
+    http.end(); client.stop();
     if (syncProgressIsActive()) syncProgressTick(2);
   }
   // Fallback to Open-Meteo if NWS unavailable or returned no data
   if (!s_forecast.nwsAvailable ||
       (s_forecast.hourlyCount == 0 && s_forecast.dailyCount == 0)) {
     fetchOpenMeteoFallback(client, http);
+    http.end(); client.stop();
     if (syncProgressIsActive()) syncProgressTick(3);
   }
 
@@ -12065,11 +12114,11 @@ static void goToSleep(bool buttonOnly = false) {
   if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
   if (s_amoledOut) s_amoledOut->displayOff();
 
-  // Put touch IC in hibernate (~2-3mA saved)
+  // Put touch IC in monitor mode (asserts GPIO38 on touch for tap-to-wake)
   if (s_touchInitialized && s_ftPresent) {
     Wire.beginTransmission(0x38);
     Wire.write(0xA5);
-    Wire.write(0x03);  // FT3168 HIBERNATE
+    Wire.write(0x01);  // FT3168 MONITOR (not 0x03 hibernate — monitor still scans)
     Wire.endTransmission();
   }
 
@@ -12088,7 +12137,14 @@ static void goToSleep(bool buttonOnly = false) {
     s_bcSdRemountFail = 0; s_bcSleepErr = 0; s_bcLastWakeCause = 0;
   }
 
-  // Release I2C bus — disables internal pullups on SDA/SCL (~150µA saved).
+  // Suspend PMU task + clear all IRQ status to prevent stale PKEY insta-resleep
+  if (s_pmuTaskHandle) vTaskSuspend(s_pmuTaskHandle);
+  writeAxp2101Register(0x48, 0xFF);
+  writeAxp2101Register(0x49, 0xFF);
+  writeAxp2101Register(0x4A, 0xFF);
+  s_pmuPendingIrq = 0;
+
+  // Release I2C bus
   Wire.end();
 #else
   tft.fillScreen(TFT_BLACK);
@@ -12115,6 +12171,8 @@ static void goToSleep(bool buttonOnly = false) {
   gpio_pullup_en(bootPin);
   gpio_pulldown_dis(bootPin);
   gpio_wakeup_enable(bootPin, GPIO_INTR_LOW_LEVEL);
+  // Touch-to-wake: FT3168 asserts GPIO38 LOW on touch in monitor mode
+  gpio_wakeup_enable(GPIO_NUM_38, GPIO_INTR_LOW_LEVEL);
   esp_sleep_enable_gpio_wakeup();
 
   // Flush and unmount SD before the SDMMC clock stops during light sleep.
@@ -12230,12 +12288,16 @@ static void goToSleep(bool buttonOnly = false) {
   Wire.begin(SDA, SCL);
   logBatterySample("wake");
 
-  // Clear any PKEY IRQs that accumulated during sleep to prevent
-  // stale short-press bits from triggering ESP.restart() on first poll.
-  {
-    int staleIrq = readAxp2101Register(0x49);
-    if (staleIrq > 0) writeAxp2101Register(0x49, (uint8_t)staleIrq);
-  }
+  // Clear ALL stale IRQs + zero mask before resuming PMU task (prevents insta-resleep)
+  writeAxp2101Register(0x48, 0xFF);
+  writeAxp2101Register(0x49, 0xFF);
+  writeAxp2101Register(0x4A, 0xFF);
+  s_pmuPendingIrq = 0;
+  if (s_pmuTaskHandle) vTaskResume(s_pmuTaskHandle);
+
+  // Log which GPIO actually woke us
+  appendDiagLog("SLEEP", "wake gpio0=%d gpio38=%d\n",
+                gpio_get_level(GPIO_NUM_0), gpio_get_level(GPIO_NUM_38));
 
   // Restore AMOLED power rail with soft-start delay
   panelPowerOn();
@@ -12353,22 +12415,20 @@ static void serviceUserButtons() {
   bool allowAction = ((int32_t)(now - suppressUntilMs) >= 0);
 
 #if BOARD_IS_AMOLED_206
-  // Poll AXP2101 PKEY interrupts.  PKEY short-press (bit 3 of INTSTS2) fires
-  // on button release when held < ~1s.  Use it as the reboot trigger, but
-  // suppress for 2s after a GPIO long-press to avoid the race where a long
-  // press release also fires PKEY short-press.
-  static uint32_t lastPekPollMs = 0;
-  if ((uint32_t)(now - lastPekPollMs) >= 80U) {
-    lastPekPollMs = now;
-    int irq2 = readAxp2101Register(0x49);  // INTSTS2
-    if (irq2 > 0) {
-      if ((irq2 & 0x08) && allowAction && !topButtonPressed() &&
+  // Consume PMU IRQ from the dedicated polling task (no I2C here)
+  // PKEY short-press = bit 3 of INTSTS3 (0x4A) = bit 19 of combined
+  {
+    uint32_t pmu = s_pmuPendingIrq;
+    if (pmu) {
+      s_pmuPendingIrq = 0;
+      if (pmu != 0) appendDiagLog("BTN", "pmu_raw=0x%06X\n", (unsigned)pmu);
+      bool pkeyShort = (pmu & (0x08 << 16));  // 0x4A bit 3
+      if (pkeyShort && allowAction &&
           (lastLongPressMs == 0 || (uint32_t)(now - lastLongPressMs) > 2000U)) {
-        writeAxp2101Register(0x49, (uint8_t)irq2);
-        SD_MMC.end();
-        ESP.restart();
+        appendDiagLog("BTN", "msg=pkey_short_press action=sleep\n");
+        goToSleep(true);
+        return;
       }
-      writeAxp2101Register(0x49, (uint8_t)irq2);  // acknowledge all
     }
   }
 #endif
@@ -12671,6 +12731,10 @@ void setup() {
           if (streak >= 3) {
             cp.putBool("safeboot", true);
             appendDiagLog("BOOT", "msg=safeboot_sync_disabled streak=%d\n", streak);
+          } else if (!crashed && cp.getBool("safeboot", false)) {
+            // Clean boot clears safeboot so sync resumes
+            cp.putBool("safeboot", false);
+            appendDiagLog("BOOT", "msg=safeboot_cleared streak=%d\n", streak);
           }
           // F3: OTA rollback — if OTA pending and 2+ crashes, revert
           bool otaPending = cp.getBool("otapending", false);
@@ -14611,25 +14675,37 @@ static bool spriteLooksBlackSlabCorrupted() {
 void loop() {
   setCpuFrequencyMhz(160);  // memory-bound playback doesn't need 240MHz (saves ~20-30mA)
 
-  // Non-blocking WiFi reconnect after wake from sleep
-  if (s_wakeNeedsWifiReconnect) {
-    s_wakeNeedsWifiReconnect = false;
-    loadWifiPortalConfig();
-    WiFi.mode(WIFI_STA);
-    for (int slot = 0; slot < WIFI_CONFIG_SLOTS; ++slot) {
-      if (s_wifiConfig[slot].ssid[0] == '\0') continue;
-      WiFi.begin(s_wifiConfig[slot].ssid, s_wifiConfig[slot].pass);
-      for (int t = 0; t < 15 && WiFi.status() != WL_CONNECTED; t++) delay(500);
+  // Non-blocking WiFi reconnect state machine (no blocking delays)
+  {
+    static int wifiReconSlot = -1;
+    static uint32_t wifiReconDeadline = 0;
+    if (s_wakeNeedsWifiReconnect) {
+      s_wakeNeedsWifiReconnect = false;
+      loadWifiPortalConfig();
+      WiFi.mode(WIFI_STA);
+      wifiReconSlot = 0;
+      wifiReconDeadline = 0;
+    }
+    if (wifiReconSlot >= 0) {
       if (WiFi.status() == WL_CONNECTED) {
         startWifiPortalServer(false);
         appendDiagLog("WIFI", "msg=wake_reconnect ssid=%s ip=%s\n",
-                      s_wifiConfig[slot].ssid, WiFi.localIP().toString().c_str());
-        break;
+                      s_wifiConfig[wifiReconSlot].ssid, WiFi.localIP().toString().c_str());
+        wifiReconSlot = -1;
+      } else if (wifiReconDeadline == 0 || millis() >= wifiReconDeadline) {
+        // Advance to next non-empty slot
+        while (wifiReconSlot < WIFI_CONFIG_SLOTS && s_wifiConfig[wifiReconSlot].ssid[0] == '\0')
+          wifiReconSlot++;
+        if (wifiReconSlot >= WIFI_CONFIG_SLOTS) {
+          WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+          wifiReconSlot = -1;
+        } else {
+          WiFi.disconnect(true); WiFi.mode(WIFI_STA);
+          WiFi.begin(s_wifiConfig[wifiReconSlot].ssid, s_wifiConfig[wifiReconSlot].pass);
+          wifiReconDeadline = millis() + 7500;  // 7.5s per slot
+          wifiReconSlot++;  // next slot on timeout
+        }
       }
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect(true);
-      WiFi.mode(WIFI_OFF);
     }
   }
 
@@ -14931,8 +15007,9 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
     if (elapsed >= animationDurationMs) break;
     // Pace: wait until the next frame tick
     if (useCache) {
-      // Poll buttons during pacing slack
+      // Poll buttons + portal during pacing slack
       while ((int32_t)(nextFrameMs - millis()) > 3) {
+        serviceWifiPortalServer();
         serviceUserButtons();
         pollCleanModeToggle();
         if (s_fullscreenPending) {
