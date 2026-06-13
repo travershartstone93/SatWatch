@@ -8029,6 +8029,7 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   }
   if (spriteLooksCyanWhiteBlockCorrupted()) { appendDiagLog("RAW", "slot=%d result=cyanwhite\n", logicalIdx); return false; }
   if (spriteLooksBottomBandJunkCorrupted()) { appendDiagLog("RAW", "slot=%d result=bottomband\n", logicalIdx); return false; }
+  if (spriteLooksTopBandWhite()) { appendDiagLog("RAW", "slot=%d result=topband_white\n", logicalIdx); return false; }
 
   scaleSpriteTo410x360(s_frameDisplayBuf);
 
@@ -8786,6 +8787,10 @@ static bool validateBufferedWeatherFrameJpeg(size_t jpegLen, const char* label) 
   }
   if (spriteLooksBottomBandJunkCorrupted()) {
     if (label) appendDiagLog("VLD", "label=%s result=BOTTOM-BAND\n", label);
+    return false;
+  }
+  if (spriteLooksTopBandWhite()) {
+    if (label) appendDiagLog("VLD", "label=%s result=TOP-BAND-WHITE\n", label);
     return false;
   }
   // Partial composite + color-shift — GIBS-only checks (skip for progressive/EUMETView)
@@ -10924,9 +10929,9 @@ static bool fetchNwsGridUrl(WiFiClientSecure& client, HTTPClient& http) {
   http.addHeader("User-Agent", "LiveSat/1.0");
   http.addHeader("Accept", "application/geo+json");
   int code = http.GET();
+  appendDiagLog("FORECAST", "nws_grid code=%d\n", code);
   if (code == 404) {
     http.end();
-    Serial.println("nws: 404 not US territory");
     s_forecast.nwsAvailable = false;
     s_nwsGridUrlValid = false;
     return false;
@@ -10969,9 +10974,9 @@ static bool fetchNwsHourlyForecast(WiFiClientSecure& client, HTTPClient& http) {
   http.addHeader("User-Agent", "LiveSat/1.0");
   http.addHeader("Accept", "application/geo+json");
   int code = http.GET();
+  appendDiagLog("FORECAST", "nws_hourly code=%d\n", code);
   if (code != HTTP_CODE_OK) {
     http.end();
-    Serial.printf("nws: hourly HTTP %d\n", code);
     return false;
   }
   String body = http.getString();
@@ -11045,9 +11050,9 @@ static bool fetchNwsDailyForecast(WiFiClientSecure& client, HTTPClient& http) {
   http.addHeader("User-Agent", "LiveSat/1.0");
   http.addHeader("Accept", "application/geo+json");
   int code = http.GET();
+  appendDiagLog("FORECAST", "nws_daily code=%d\n", code);
   if (code != HTTP_CODE_OK) {
     http.end();
-    Serial.printf("nws: daily HTTP %d\n", code);
     return false;
   }
   String body = http.getString();
@@ -11128,9 +11133,9 @@ static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
   http.begin(client, url);
   http.setTimeout(10000);
   int code = http.GET();
+  appendDiagLog("FORECAST", "openmeteo code=%d\n", code);
   if (code != HTTP_CODE_OK) {
     http.end();
-    Serial.printf("openmeteo: HTTP %d\n", code);
     return false;
   }
   String body = http.getString();
@@ -14422,6 +14427,39 @@ static void runCurrentTimeSweepOverlaySegment(int newestIdx, bool baseAlreadySho
 // ─────────────────────────────────────────────────────────────
 //  Bottom-band / black-slab corruption detectors
 // ─────────────────────────────────────────────────────────────
+// Detect GIBS partial composites with white/bright band at top (missing swath data)
+static bool spriteLooksTopBandWhite() {
+  const uint16_t* px = (const uint16_t*)sprite.getBuffer();
+  if (!px) return false;
+  bool swapped = s_mainSpritePixelsByteSwapped;
+  // Sample top 20% of rows
+  int topRows = DISP_H / 5;
+  uint32_t topLum = 0, botLum = 0;
+  int topCount = 0, botCount = 0;
+  for (int y = 0; y < topRows; y += 2) {
+    for (int x = 0; x < DISP_W; x += 4) {
+      uint16_t c = px[y * DISP_W + x];
+      if (swapped) c = __builtin_bswap16(c);
+      topLum += ((c >> 11) & 0x1F) * 8 + ((c >> 5) & 0x3F) * 4 + (c & 0x1F) * 8;
+      topCount++;
+    }
+  }
+  // Sample bottom 50%
+  for (int y = DISP_H / 2; y < DISP_H; y += 4) {
+    for (int x = 0; x < DISP_W; x += 8) {
+      uint16_t c = px[y * DISP_W + x];
+      if (swapped) c = __builtin_bswap16(c);
+      botLum += ((c >> 11) & 0x1F) * 8 + ((c >> 5) & 0x3F) * 4 + (c & 0x1F) * 8;
+      botCount++;
+    }
+  }
+  if (topCount == 0 || botCount == 0) return false;
+  uint32_t topAvg = topLum / topCount;
+  uint32_t botAvg = botLum / botCount;
+  // White top band: top avg > 400 (out of ~500 max) AND much brighter than bottom
+  return (topAvg > 400 && botAvg < 300 && topAvg > botAvg * 2);
+}
+
 static bool spriteLooksBottomBandJunkCorrupted() {
   const uint16_t* px = (const uint16_t*)sprite.getBuffer();
   if (!px) return false;
@@ -14904,9 +14942,9 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
 
   bool useCache = false;
   if (!s_animCache && validCount > 0 && s_streamReady && s_streamFile) {
-    // Show feedback during cache rebuild (e.g. after timer-wake freed the cache)
-    if (!syncProgressIsActive()) {
-      showMessage("Loading...", nullptr);
+    // Show last frame immediately instead of "Loading..." (s_frameDisplayBuf survives sleep)
+    if (!syncProgressIsActive() && s_frameDisplayBuf) {
+      presentScaledBuf(s_frameDisplayBuf);
     }
     int cacheCap = min(validCount, CACHE_TARGET_FRAMES);
     size_t cacheNeeded = (size_t)cacheCap * CACHE_FRAME_BYTES;
