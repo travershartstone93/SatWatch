@@ -14711,7 +14711,7 @@ static bool spriteLooksBlackSlabCorrupted() {
 //  loop() — animate frames, sleep after LOOPS_BEFORE_SLEEP
 // ─────────────────────────────────────────────────────────────
 void loop() {
-  setCpuFrequencyMhz(160);  // memory-bound playback doesn't need 240MHz (saves ~20-30mA)
+  setCpuFrequencyMhz(240);  // 240MHz needed for smooth animation upscale
 
   // Non-blocking WiFi reconnect state machine (no blocking delays)
   {
@@ -15195,18 +15195,12 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
         lastDisplayedFrameIdx = frameToShow;
         lastCacheSlot = cacheSlot;
         shownMap[srcPos / 8] |= (1 << (srcPos % 8));
-        // Pre-upscale next frame immediately after present
-        if (useCache && cacheSlot + 1 < s_animCacheCount) {
-          upscaleCachedFrame(cacheSlot + 1);
-          preUpscaledSlot = cacheSlot + 1;
-        } else {
-          preUpscaledSlot = -1;
-        }
+        preUpscaledSlot = -1;  // no pre-upscale — consistent 58ms/frame vs alternating 48/74ms
         uint32_t nowFm = millis();
         uint32_t dt = nowFm - lastFrameMs;
         lastFrameMs = nowFm;
         if (animFramesPushed > 1) {
-          // Log any frame gap > 85ms (target is ~70ms = 14fps)
+          // (per-frame FT logging is inside the cache block above)
           static int spikeLog = 0;
           if (dt > 85 && spikeLog < 50) {
             appendDiagLog("PERF", "msg=spike frame=%d dt=%lums slot=%d elapsed=%lums\n",
