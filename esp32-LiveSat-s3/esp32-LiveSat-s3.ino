@@ -15045,9 +15045,8 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
     if (elapsed >= animationDurationMs) break;
     // Pace: wait until the next frame tick
     if (useCache) {
-      // Poll buttons + portal during pacing slack
+      // Poll buttons during pacing slack (portal serviced at loop() top only)
       while ((int32_t)(nextFrameMs - millis()) > 3) {
-        serviceWifiPortalServer();
         serviceUserButtons();
         pollCleanModeToggle();
         if (s_fullscreenPending) {
@@ -15207,9 +15206,9 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
         uint32_t dt = nowFm - lastFrameMs;
         lastFrameMs = nowFm;
         if (animFramesPushed > 1) {
-          // Log any frame gap > 100ms (visible stutter)
+          // Log any frame gap > 85ms (target is ~70ms = 14fps)
           static int spikeLog = 0;
-          if (dt > 100 && spikeLog < 10) {
+          if (dt > 85 && spikeLog < 50) {
             appendDiagLog("PERF", "msg=spike frame=%d dt=%lums slot=%d elapsed=%lums\n",
               animFramesPushed, (unsigned long)dt, cacheSlot, (unsigned long)elapsed);
             spikeLog++;
