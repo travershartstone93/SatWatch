@@ -95,7 +95,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    23
+#define FIRMWARE_VERSION    24
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -6750,11 +6750,6 @@ static void presentScaledBuf(uint16_t* src) {
     int rows = CHUNK_ROWS;
     if (cy + rows > pushH) rows = pushH - cy;
     s_amoledOut->draw16bitRGBBitmap(outX, outY + cy, src + cy * outW, outW, rows);
-    // Poll buttons between chunk pushes (~6.5ms apart, 6 opportunities per frame)
-    if (cy + CHUNK_ROWS < pushH) {
-      serviceUserButtons();
-      pollCleanModeToggle();
-    }
   }
   amoledUnlock();
 #else
@@ -11366,6 +11361,12 @@ static void syncWeatherFrames() {
   appendDiagLog("SYNC", "ntp_utc=%lld\n", (long long)now);
   if (syncProgressIsActive()) syncProgressCompletePhase();
 
+  if (now < 1700000000) {
+    appendDiagLog("SYNC", "msg=abort_ntp_fail keeping_existing_frames\n");
+    if (syncProgressIsActive()) syncProgressEnd();
+    return;
+  }
+
   if (syncProgressIsActive()) syncProgressBeginPhase("geo", 10U);
   appendDiagLog("GEO", "msg=refreshGeo_start\n");
   refreshDisplayLocationTimeFromIpInfo();
@@ -12334,8 +12335,21 @@ static void goToSleep(bool buttonOnly = false) {
   }
   resetTopButtonStateAfterWake(buttonOnly);
 
+  // Clear GRAM before displayOn — GRAM contents are undefined after power cycle
+  if (s_amoledOut) s_amoledOut->fillScreen(0x0000);
   if (s_amoledOut) s_amoledOut->displayOn();
   if (s_amoledOut) s_amoledOut->setBrightness(s_displayBrightness);
+  // Push last frame if available (instant wake instead of black)
+  if (s_amoledOut && s_frameDisplayBuf) {
+    const int outY = (AMOLED_HEIGHT - SCALED_H) / 2;
+    amoledLock();
+    for (int cy = 0; cy < SCALED_H; cy += 60) {
+      int rows = min(60, SCALED_H - cy);
+      s_amoledOut->draw16bitRGBBitmap(0, outY + cy,
+          s_frameDisplayBuf + (size_t)cy * SCALED_W, SCALED_W, rows);
+    }
+    amoledUnlock();
+  }
   // Force moon/overlays to redraw on the first frame
   s_moonDrawn = false;
   s_touchInitialized = false;   // force touch re-init (was hibernated before sleep)
@@ -15033,6 +15047,11 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
   int lastDisplayedFrameIdx = -1;
   int animFramesPushed = 0;
   uint32_t frameMinMs = 9999, frameMaxMs = 0;
+  uint8_t ftBuf[144], ftUp[144], ftPres[144], ftWait[144];
+  memset(ftBuf, 0, sizeof(ftBuf));
+  memset(ftUp, 0, sizeof(ftUp));
+  memset(ftPres, 0, sizeof(ftPres));
+  memset(ftWait, 0, sizeof(ftWait));
   uint32_t lastFrameMs = loopStartMs;
   uint8_t shownMap[(MAX_FRAMES + 7) / 8] = {};
   int preUpscaledSlot = -1;  // cache slot already upscaled into s_frameDisplayBuf
@@ -15044,6 +15063,7 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
     uint32_t elapsed = millis() - loopStartMs;
     if (elapsed >= animationDurationMs) break;
     // Pace: wait until the next frame tick
+    uint32_t paceStart = millis();
     if (useCache) {
       // Poll buttons during pacing slack (portal serviced at loop() top only)
       while ((int32_t)(nextFrameMs - millis()) > 3) {
@@ -15175,6 +15195,12 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
         ok = true;
         uint32_t upUs = (uint32_t)(tB - tA), presUs = (uint32_t)(tC - tB);
         uint32_t totalUs = upUs + presUs;
+        uint32_t waitElapsed = (uint32_t)(paceStart > 0 ? (millis() - paceStart - (totalUs / 1000)) : 0);
+        if (animFramesPushed < 144) {
+          ftUp[animFramesPushed] = (uint8_t)min(upUs / 1000, (uint32_t)255);
+          ftPres[animFramesPushed] = (uint8_t)min(presUs / 1000, (uint32_t)255);
+          ftWait[animFramesPushed] = (uint8_t)min(waitElapsed, (uint32_t)255);
+        }
         if (upUs > compUpMax) compUpMax = upUs;
         if (presUs > compPresMax) compPresMax = presUs;
         if (totalUs > framePaceMs * 1000 && lagCount < 16) {
@@ -15200,11 +15226,10 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
         uint32_t dt = nowFm - lastFrameMs;
         lastFrameMs = nowFm;
         if (animFramesPushed > 1) {
-          // (per-frame FT logging is inside the cache block above)
+          if (animFramesPushed - 2 < 144)
+            ftBuf[animFramesPushed - 2] = (uint8_t)min(dt, (uint32_t)255);
           static int spikeLog = 0;
           if (dt > 85 && spikeLog < 50) {
-            appendDiagLog("PERF", "msg=spike frame=%d dt=%lums slot=%d elapsed=%lums\n",
-              animFramesPushed, (unsigned long)dt, cacheSlot, (unsigned long)elapsed);
             spikeLog++;
           }
           if (dt < frameMinMs) frameMinMs = dt;
@@ -15223,42 +15248,59 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
   if (s_animLoopNum <= 3) {
     uint32_t actualMs = millis() - loopStartMs;
     float fps = actualMs > 0 ? (float)animFramesPushed * 1000.0f / (float)actualMs : 0;
-    #if 0  // verbose perf log disabled
-appendDiagLog("PERF", "loop=%d pushed=%d fps=%.1f min=%lums max=%lums vc=%d dur=%lu\n",
+    appendDiagLog("PERF", "loop=%d pushed=%d fps=%.1f min=%lums max=%lums vc=%d dur=%lu\n",
                   s_animLoopNum, animFramesPushed, (double)fps,
                   (unsigned long)frameMinMs, (unsigned long)frameMaxMs,
                   validCount, animationDurationMs);
-#endif
-    // Component peaks
-    #if 0  // verbose perf log disabled
-appendDiagLog("PERF", "msg=anim-comp upMax=%luus presMax=%luus\n",
+    appendDiagLog("PERF", "msg=anim-comp upMax=%luus presMax=%luus\n",
                   (unsigned long)compUpMax, (unsigned long)compPresMax);
-#endif
-    // Lag frames (exceeded budget)
     if (lagCount > 0) {
       for (int li = 0; li < lagCount; li++) {
-        #if 0  // verbose perf log disabled
-appendDiagLog("PERF", "msg=anim-lag frame=%d up=%.1fms pres=%.1fms total=%.1fms\n",
+        appendDiagLog("PERF", "msg=anim-lag frame=%d up=%.1fms pres=%.1fms total=%.1fms\n",
           (int)lagFrames[li].frameNum,
           lagFrames[li].upUs / 10.0, lagFrames[li].presUs / 10.0,
           lagFrames[li].totalUs / 10.0);
-#endif
       }
     } else {
-      #if 0  // verbose perf log disabled
-appendDiagLog("PERF", "msg=anim-lag_none\n");
-#endif
+      appendDiagLog("PERF", "msg=anim-lag_none\n");
     }
-    // Dump shown/skipped map: S=shown, .=skipped
     for (int row = 0; row < validCount; row += 24) {
       char map[32];
       int end = min(row + 24, validCount);
       for (int j = row; j < end; j++)
         map[j - row] = (shownMap[j / 8] & (1 << (j % 8))) ? 'S' : '.';
       map[end - row] = '\0';
-      #if 0  // verbose perf log disabled
-appendDiagLog("ANIM", "fmap[%03d]=%s\n", row, map);
-#endif
+      appendDiagLog("ANIM", "fmap[%03d]=%s\n", row, map);
+    }
+    int ftCount = min(animFramesPushed - 1, 144);
+    for (int row = 0; row < ftCount; row += 24) {
+      char line[200]; int pos = 0;
+      int end = min(row + 24, ftCount);
+      for (int j = row; j < end; j++)
+        pos += snprintf(line + pos, sizeof(line) - pos, "%s%u", j > row ? "," : "", ftBuf[j]);
+      appendDiagLog("FT", "dt[%03d]=%s\n", row, line);
+    }
+    int ftCount2 = min(animFramesPushed, 144);
+    for (int row = 0; row < ftCount2; row += 24) {
+      char line[200]; int pos = 0;
+      int end = min(row + 24, ftCount2);
+      for (int j = row; j < end; j++)
+        pos += snprintf(line + pos, sizeof(line) - pos, "%s%u", j > row ? "," : "", ftUp[j]);
+      appendDiagLog("FT", "up[%03d]=%s\n", row, line);
+    }
+    for (int row = 0; row < ftCount2; row += 24) {
+      char line[200]; int pos = 0;
+      int end = min(row + 24, ftCount2);
+      for (int j = row; j < end; j++)
+        pos += snprintf(line + pos, sizeof(line) - pos, "%s%u", j > row ? "," : "", ftPres[j]);
+      appendDiagLog("FT", "pr[%03d]=%s\n", row, line);
+    }
+    for (int row = 0; row < ftCount2; row += 24) {
+      char line[200]; int pos = 0;
+      int end = min(row + 24, ftCount2);
+      for (int j = row; j < end; j++)
+        pos += snprintf(line + pos, sizeof(line) - pos, "%s%u", j > row ? "," : "", ftWait[j]);
+      appendDiagLog("FT", "wt[%03d]=%s\n", row, line);
     }
   }
 
@@ -15400,12 +15442,10 @@ appendDiagLog("TICKER", "msg=during-wipe push=%u skip=%u\n",
                 loopsDone, s_loopsBeforeSleep,
                 validCount, loopElapsedMs, loopExpectedMs, loopDriftMs);
   float animFps = (animationDurationMs > 0) ? (float)animFramesPushed * 1000.0f / (float)animationDurationMs : 0.0f;
-  #if 0  // verbose perf log disabled
-appendDiagLog("PERF", "loop=%d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d fps=%.1f frames=%d dur=%ums\n",
+  appendDiagLog("PERF", "loop=%d/%d valid=%d fc=%d newest=%d elapsed=%u expected=%u drift=%d fps=%.1f frames=%d dur=%ums\n",
                 loopsDone, s_loopsBeforeSleep, validCount, frameCount, newestIdx,
                 loopElapsedMs, loopExpectedMs, loopDriftMs,
                 (double)animFps, animFramesPushed, animationDurationMs);
-#endif
 
   // Prevent sleep during hurricane mode
   if (s_sleepModeEnabled && !s_hurricaneMode && loopsDone >= s_loopsBeforeSleep) {
