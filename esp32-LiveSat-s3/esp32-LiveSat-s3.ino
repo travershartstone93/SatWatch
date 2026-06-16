@@ -9099,26 +9099,26 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
   resetJpegDrawStats();
 
   bool ok = false;
-  int jpegActualH = 0;  // non-zero when a shorter-than-DISP_H decode was accepted
+  bool progressive = isProgressiveJpeg(s_dlBuf, jpegLen);
+  int jpegActualH = 0;
   bool padShortBottomRows = false;
-  if (jpeg.openRAM(s_dlBuf, (int)jpegLen, jpegDraw)) {
+
+  if (progressive) {
+    uint16_t* px = (uint16_t*)sprite.getBuffer();
+    if (px) ok = decodeProgressiveJpegToSprite(s_dlBuf, jpegLen, px, DISP_W, DISP_H,
+                                                s_mainSpritePixelsByteSwapped);
+  } else if (jpeg.openRAM(s_dlBuf, (int)jpegLen, jpegDraw)) {
     int jw = jpeg.getWidth();
     int jh = jpeg.getHeight();
     int decodeOpt = -1;
     if (jw == DISP_W && jh == DISP_H) {
       decodeOpt = 0;
     } else if (relaxedHeight && jw == DISP_W && jh >= DISP_H - 8 && jh < DISP_H) {
-      // NOAA Esri service returns slightly shorter JPEG due to Web Mercator reprojection
-      // rounding (e.g. 320×172 when 320×176 was requested). Accept it — the bottom
-      // rows of the sprite stay black (from fillScreen above), which is correct for radar.
       decodeOpt = 0;
       jpegActualH = jh;
     } else if (jw == (DISP_W * 2) && jh == (DISP_H * 2)) {
       decodeOpt = JPEG_SCALE_HALF;
     } else if (jw == (DISP_W * 2) && jh >= ((DISP_H - 8) * 2) && jh < (DISP_H * 2)) {
-      // Supersampled zoom snapshots may come back a few rows shorter than the
-      // logical 176px buffer height. Accept them at half-scale and pad the
-      // missing bottom rows from the last decoded row.
       decodeOpt = JPEG_SCALE_HALF;
       jpegActualH = jh >> 1;
       padShortBottomRows = true;
@@ -9132,10 +9132,8 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
     }
     jpeg.close();
   }
-  if (ok) {
+  if (ok && !progressive) {
     if (jpegActualH > 0) {
-      // Accept any full-width decode that didn't go out of bounds.
-      // No s_jpegMaxY constraint — short JPEG ends before DISP_H and that's fine.
       ok = (s_jpegDrawCalls > 0 && !s_jpegDrawOutOfBounds &&
             s_jpegMinX == 0 && s_jpegMinY == 0 &&
             s_jpegMaxX == DISP_W);
@@ -9439,7 +9437,8 @@ static bool installValidatedZoomSnapshotAtBbox(HTTPClient& http,
   if (valid && spriteLooksPartialDecode()) valid = false;
   if (valid && (spriteLooksHorizontallyCorrupted() || spriteLooksVerticallyCorrupted())) valid = false;
   // Reject partial composites (GIBS swath gaps) via 8-bit grayscale MCU check
-  if (valid && tmpBytes > 0 && tmpBytes <= DL_BUF_BYTES) {
+  // Skip for progressive JPEG (EUMETView) — JPEGDEC grayscale can't parse SOF2
+  if (valid && tmpBytes > 0 && tmpBytes <= DL_BUF_BYTES && !s_activeSourceIsEumetview) {
     File tf = SD.open(tmpPath, FILE_READ);
     if (tf) {
       size_t rd = tf.read(s_dlBuf, tmpBytes);
@@ -10137,7 +10136,8 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
   }
   // If decoded zoom has partial composite artifacts, fall through to synthetic zoom.
   // Use grayscale MCU check (not holdblock — that false-positives on nighttime IR dark ocean).
-  if (!isTerrainStage) {
+  // Skip for EUMETView — JPEGDEC grayscale can't parse progressive JPEG
+  if (!isTerrainStage && !s_activeSourceIsEumetview) {
     File jf = SD.open(path, FILE_READ);
     if (jf) {
       size_t jLen = jf.size();
