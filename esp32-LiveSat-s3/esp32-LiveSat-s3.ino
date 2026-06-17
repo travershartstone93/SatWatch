@@ -226,6 +226,7 @@ static NullSerialSink s_nullSerial;
 #define TERRAIN_Z1_RADAR SD_ROOT "/frames/tz1_radar.jpg"
 #define TERRAIN_Z2_RADAR SD_ROOT "/frames/tz2_radar.jpg"
 #define TERRAIN_Z3_RADAR SD_ROOT "/frames/tz3_radar.jpg"
+#define RAINVIEWER_RADAR_RAW SD_ROOT "/frames/.rv_radar.raw"
 #define CACHE_VALIDATE_VERSION 2
 #define ZOOM_META_VERSION 6
 #define WIFI_CONFIG_SLOTS 5
@@ -7968,6 +7969,8 @@ static bool writeRawToSlot(int logicalIdx, const uint8_t* buf) {
 // Returns true if raw slot was successfully written.
 extern bool decodeProgressiveJpegToSprite(const uint8_t* data, size_t len,
                                           uint16_t* buf, int w, int h, bool swap);
+extern uint8_t* decodePngToRgba(const uint8_t* data, size_t len, int* outW, int* outH);
+extern void freeRgba(uint8_t* p);
 extern char g_stbLastError[64];
 
 // Scan JPEG data for SOF2 marker (progressive JPEG indicator).
@@ -9204,6 +9207,57 @@ static uint32_t countRadarSignalPixelsInSprite(int minSaturation) {
 }
 
 static bool decodeTerrainCompositeToSprite() {
+  // RainViewer RGBA overlay for international sources
+  if (s_activeSourceIsEumetview) {
+    bool nightLayer = terrainUsesNightLayerForUtc(time(nullptr));
+    const char* primaryTerrain = nightLayer ? ZOOM_TERRAIN_NIGHT_FILE : ZOOM_TERRAIN_DAY_FILE;
+    const char* fallbackTerrain = nightLayer ? ZOOM_TERRAIN_DAY_FILE : ZOOM_TERRAIN_NIGHT_FILE;
+    bool decodedBase = decodeJpegPathToSprite(primaryTerrain);
+    if (!decodedBase) decodedBase = decodeJpegPathToSprite(fallbackTerrain);
+    if (!decodedBase) return false;
+
+    if (!fileExistsNonEmpty(RAINVIEWER_RADAR_RAW)) {
+      Serial.println("rv miss -> base");
+      return true;
+    }
+
+    const size_t rvRawBytes = (size_t)DISP_W * DISP_H * 4;
+    File rf = SD.open(RAINVIEWER_RADAR_RAW, FILE_READ);
+    if (!rf || (size_t)rf.size() != rvRawBytes) {
+      if (rf) rf.close();
+      return true;
+    }
+
+    uint16_t* dst = (uint16_t*)sprite.getBuffer();
+    if (!dst) { rf.close(); return true; }
+
+    uint8_t rvRow[DISP_W * 4];
+    uint32_t blended = 0;
+    for (int y = 0; y < DISP_H; y++) {
+      if (rf.read(rvRow, sizeof(rvRow)) != sizeof(rvRow)) break;
+      uint16_t* dstRow = dst + (size_t)y * DISP_W;
+      for (int x = 0; x < DISP_W; x++) {
+        uint8_t a = rvRow[x * 4 + 3];
+        if (a < 20) continue;
+        uint8_t r = rvRow[x * 4 + 0];
+        uint8_t g = rvRow[x * 4 + 1];
+        uint8_t b = rvRow[x * 4 + 2];
+        uint16_t fg = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        if (a >= 240) {
+          dstRow[x] = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(fg) : fg;
+        } else {
+          uint16_t bg = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(dstRow[x]) : dstRow[x];
+          uint16_t blendC = blend565(bg, fg, a);
+          dstRow[x] = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(blendC) : blendC;
+        }
+        blended++;
+      }
+    }
+    rf.close();
+    Serial.printf("rv blend %u px\n", (unsigned)blended);
+    return true;
+  }
+
   // Radar is optional and must never blank the terrain stage.
   bool radarRawReady = false;
   uint32_t radarSignalPixels = 0U;
@@ -9697,6 +9751,164 @@ static const char* activeTerrainRawPath() {
   return terrainUsesNightLayerForUtc(time(nullptr)) ? ZOOM_TERRAIN_NIGHT_RAW : ZOOM_TERRAIN_DAY_RAW;
 }
 
+// RainViewer global radar — fetches a single 256x256 PNG tile, decodes to RGBA,
+// maps to the terrain bbox, writes RGBA raw file for the composite to overlay.
+static bool downloadRainViewerRadar(HTTPClient& http, WiFiClientSecure& client,
+                                     float bboxW, float bboxS,
+                                     float bboxE, float bboxN) {
+  appendDiagLog("ZOOM", "msg=rv_start\n");
+  http.begin(client, "https://api.rainviewer.com/public/weather-maps.json");
+  http.setTimeout(6000);
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    appendDiagLog("ZOOM", "msg=rv_api_fail code=%d\n", code);
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+
+  // Parse "host" value
+  int hostIdx = body.indexOf("\"host\"");
+  if (hostIdx < 0) { appendDiagLog("ZOOM", "msg=rv_no_host\n"); return false; }
+  int hostQ1 = body.indexOf('"', body.indexOf(':', hostIdx) + 1);
+  int hostQ2 = body.indexOf('"', hostQ1 + 1);
+  if (hostQ1 < 0 || hostQ2 < 0) return false;
+  String rvHost = body.substring(hostQ1 + 1, hostQ2);
+
+  // Find last "path" in the "past" array (most recent radar frame)
+  int pastIdx = body.indexOf("\"past\"");
+  if (pastIdx < 0) return false;
+  int pastEnd = body.indexOf(']', pastIdx);
+  if (pastEnd < 0) return false;
+  String pastBlock = body.substring(pastIdx, pastEnd);
+  int lastPath = -1, searchFrom = 0;
+  while (true) {
+    int p = pastBlock.indexOf("\"path\"", searchFrom);
+    if (p < 0) break;
+    lastPath = p;
+    searchFrom = p + 6;
+  }
+  if (lastPath < 0) return false;
+  int pQ1 = pastBlock.indexOf('"', pastBlock.indexOf(':', lastPath) + 1);
+  int pQ2 = pastBlock.indexOf('"', pQ1 + 1);
+  if (pQ1 < 0 || pQ2 < 0) return false;
+  String rvPath = pastBlock.substring(pQ1 + 1, pQ2);
+
+  // Tile coordinates at z=6 for the bbox center
+  const int rvZ = 6;
+  float centerLat = (bboxN + bboxS) * 0.5f;
+  float centerLon = (bboxE + bboxW) * 0.5f;
+  int n = 1 << rvZ;
+  int tileX = (int)((centerLon + 180.0f) / 360.0f * n);
+  float latRad = centerLat * 0.01745329252f;
+  int tileY = (int)((1.0f - logf(tanf(latRad) + 1.0f / cosf(latRad)) / 3.14159265f) * 0.5f * n);
+  if (tileX < 0) tileX = 0; if (tileX >= n) tileX = n - 1;
+  if (tileY < 0) tileY = 0; if (tileY >= n) tileY = n - 1;
+
+  // Tile geographic bounds (Web Mercator)
+  float tileLonMin = tileX * 360.0f / n - 180.0f;
+  float tileLonMax = (tileX + 1) * 360.0f / n - 180.0f;
+  float tileMercYTop = 3.14159265f * (1.0f - 2.0f * tileY / (float)n);
+  float tileMercYBot = 3.14159265f * (1.0f - 2.0f * (tileY + 1) / (float)n);
+  float tileLatMax = atanf(sinhf(tileMercYTop)) * 57.29577951f;
+  float tileLatMin = atanf(sinhf(tileMercYBot)) * 57.29577951f;
+
+  Serial.printf("rv tile z=%d x=%d y=%d lon=%.2f..%.2f lat=%.2f..%.2f\n",
+                rvZ, tileX, tileY,
+                (double)tileLonMin, (double)tileLonMax,
+                (double)tileLatMin, (double)tileLatMax);
+
+  // Download PNG tile: {host}{path}/256/{z}/{x}/{y}/2/1_1.png
+  char tileUrl[384];
+  snprintf(tileUrl, sizeof(tileUrl), "%s%s/256/%d/%d/%d/2/1_1.png",
+           rvHost.c_str(), rvPath.c_str(), rvZ, tileX, tileY);
+
+  http.begin(client, tileUrl);
+  http.setTimeout(8000);
+  code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    appendDiagLog("ZOOM", "msg=rv_tile_fail code=%d\n", code);
+    return false;
+  }
+
+  FixedBufferWriteStream sink(s_dlBuf, DL_BUF_BYTES);
+  int wrote = http.writeToStream(&sink);
+  http.end();
+  if (wrote <= 0 || sink.overflowed()) {
+    appendDiagLog("ZOOM", "msg=rv_dl_fail wrote=%d\n", wrote);
+    return false;
+  }
+  size_t pngLen = (size_t)wrote;
+
+  // Decode PNG to RGBA
+  int imgW = 0, imgH = 0;
+  uint8_t* rgba = decodePngToRgba(s_dlBuf, pngLen, &imgW, &imgH);
+  if (!rgba || imgW < 1 || imgH < 1) {
+    appendDiagLog("ZOOM", "msg=rv_png_fail w=%d h=%d\n", imgW, imgH);
+    if (rgba) freeRgba(rgba);
+    return false;
+  }
+
+  // Map tile RGBA to terrain bbox dimensions (TERRAIN_FETCH_W x TERRAIN_FETCH_H → DISP_W x DISP_H)
+  // Using Mercator y for correct latitude mapping
+  const size_t outW = DISP_W, outH = DISP_H;
+  const size_t rawBytes = outW * outH * 4;
+  uint8_t* mapped = (uint8_t*)heap_caps_malloc(rawBytes, MALLOC_CAP_SPIRAM);
+  if (!mapped) {
+    freeRgba(rgba);
+    return false;
+  }
+
+  uint32_t signalPx = 0;
+  for (int dy = 0; dy < (int)outH; dy++) {
+    // Display pixel latitude (equirectangular: linear in lat)
+    float lat = bboxN - (bboxN - bboxS) * dy / (float)outH;
+    // Convert to Mercator y, then to tile pixel
+    float mY = logf(tanf(lat * 0.01745329252f * 0.5f + 0.785398163f));
+    float ty = (tileMercYTop - mY) / (tileMercYTop - tileMercYBot) * imgH;
+    int srcY = (int)ty;
+    if (srcY < 0) srcY = 0;
+    if (srcY >= imgH) srcY = imgH - 1;
+
+    for (int dx = 0; dx < (int)outW; dx++) {
+      float lon = bboxW + (bboxE - bboxW) * dx / (float)outW;
+      float tx = (lon - tileLonMin) / (tileLonMax - tileLonMin) * imgW;
+      int srcX = (int)tx;
+      if (srcX < 0) srcX = 0;
+      if (srcX >= imgW) srcX = imgW - 1;
+
+      int srcIdx = (srcY * imgW + srcX) * 4;
+      int dstIdx = (dy * outW + dx) * 4;
+      mapped[dstIdx + 0] = rgba[srcIdx + 0]; // R
+      mapped[dstIdx + 1] = rgba[srcIdx + 1]; // G
+      mapped[dstIdx + 2] = rgba[srcIdx + 2]; // B
+      mapped[dstIdx + 3] = rgba[srcIdx + 3]; // A
+      if (rgba[srcIdx + 3] > 20) signalPx++;
+    }
+  }
+  freeRgba(rgba);
+
+  if (signalPx < 5) {
+    heap_caps_free(mapped);
+    appendDiagLog("ZOOM", "msg=rv_no_signal sig=%u\n", (unsigned)signalPx);
+    return false;
+  }
+
+  SD.remove(RAINVIEWER_RADAR_RAW);
+  File f = SD.open(RAINVIEWER_RADAR_RAW, FILE_WRITE);
+  bool ok = false;
+  if (f) {
+    ok = (f.write(mapped, rawBytes) == rawBytes);
+    f.close();
+  }
+  heap_caps_free(mapped);
+
+  appendDiagLog("ZOOM", "msg=rv_write ok=%d sig=%u\n", (int)ok, (unsigned)signalPx);
+  return ok;
+}
+
 // Downloads both day (BlueMarble) and night (Black Marble) terrain JPEGs for the
 // given bbox. Storing both allows live day/night switching without re-downloading.
 // Returns true only when BOTH textures are successfully refreshed.
@@ -9877,6 +10089,24 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
       downloadJpegUrlToPath(terrainUrl, tzPaths[tz], "Terrain zoom", nullptr);
       appendDiagLog("ZOOM", "msg=terrain-zoom level=%d size=%.0fx%.0fkm\n", tz, (double)tzW[tz], (double)tzH[tz]);
     }
+  }
+
+  // RainViewer for non-US locations (EUMETView / international sources)
+  if (s_activeSourceIsEumetview) {
+    SD.remove(RAINVIEWER_RADAR_RAW);
+    bool rvOk = downloadRainViewerRadar(http, client, bboxWest, bboxSouth, bboxEast, bboxNorth);
+    if (rvOk) {
+      s_radarNoSignatures = false;
+      s_radarDownloadFailed = false;
+      s_lastRadarCheckUtc = time(nullptr);
+      appendDiagLog("ZOOM", "msg=rv_radar_ok\n");
+    } else {
+      SD.remove(RAINVIEWER_RADAR_RAW);
+      s_radarNoSignatures = true;
+      s_radarDownloadFailed = false;
+      s_lastRadarCheckUtc = time(nullptr);
+    }
+    return true;
   }
 
   char radarUrl[640];
