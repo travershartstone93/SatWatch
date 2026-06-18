@@ -8245,7 +8245,7 @@ static bool spriteLooksGrayscale() {
   return sampled > 0 && chromatic < sampled / 10;
 }
 
-static void blendIrPixelsWithTerrain(uint16_t* px, const uint16_t* terrain, int pixelCount, bool byteSwap) {
+static void blendIrPixelsWithTerrain(uint16_t* px, const uint16_t* terrain, int pixelCount, bool byteSwap, bool invertedIr = false) {
   for (int i = 0; i < pixelCount; i++) {
     uint16_t irRaw = px[i];
     uint16_t ir = byteSwap ? __builtin_bswap16(irRaw) : irRaw;
@@ -8253,6 +8253,9 @@ static void blendIrPixelsWithTerrain(uint16_t* px, const uint16_t* terrain, int 
     int irG = ((ir >> 5) & 0x3F) >> 1;
     int irB = ir & 0x1F;
     int irLum = (irR + irG + irB) / 3;
+    int irMax = irR > irG ? (irR > irB ? irR : irB) : (irG > irB ? irG : irB);
+    int irMin = irR < irG ? (irR < irB ? irR : irB) : (irG < irB ? irG : irB);
+    int chroma = irMax - irMin;
 
     uint16_t terRaw = terrain[i];
     uint16_t ter = byteSwap ? __builtin_bswap16(terRaw) : terRaw;
@@ -8260,22 +8263,32 @@ static void blendIrPixelsWithTerrain(uint16_t* px, const uint16_t* terrain, int 
     int tG = ((ter >> 5) & 0x3F);
     int tB = ter & 0x1F;
 
-    int cloudAlpha = 0;
-    if (irLum > 14) {
-      cloudAlpha = (irLum - 14) * 4;
-      if (cloudAlpha > 16) cloudAlpha = 16;
-    }
-    int cR = 31, cG = 63, cB = 31;
-
     int oR, oG, oB;
-    if (cloudAlpha == 0) {
-      oR = tR; oG = tG; oB = tB;
-    } else if (cloudAlpha >= 16) {
-      oR = cR; oG = cG; oB = cB;
+    if (invertedIr) {
+      // EUMETView ir108: grayscale, dark=cold=cloud, bright=warm=clear
+      int cloudAlpha = 0;
+      if (irLum < 12 && irLum > 1) {
+        cloudAlpha = (12 - irLum) * 3;
+        if (cloudAlpha > 16) cloudAlpha = 16;
+      }
+      if (cloudAlpha == 0) { oR = tR; oG = tG; oB = tB; }
+      else if (cloudAlpha >= 16) { oR = 31; oG = 63; oB = 31; }
+      else { oR = (tR*(16-cloudAlpha)+31*cloudAlpha)>>4; oG = (tG*(16-cloudAlpha)+63*cloudAlpha)>>4; oB = (tB*(16-cloudAlpha)+31*cloudAlpha)>>4; }
+    } else if (chroma > 3) {
+      // Colored IR pixel — blend actual IR color over terrain
+      int alpha = 10 + (chroma > 10 ? 6 : chroma * 6 / 10);
+      if (alpha > 16) alpha = 16;
+      int irG6 = ((ir >> 5) & 0x3F);
+      oR = (tR*(16-alpha) + irR*alpha) >> 4;
+      oG = (tG*(16-alpha) + irG6*alpha) >> 4;
+      oB = (tB*(16-alpha) + irB*alpha) >> 4;
+    } else if (irLum > 23) {
+      // Very bright grayscale = thick white cloud
+      int alpha = (irLum - 23) * 4;
+      if (alpha > 16) alpha = 16;
+      oR = (tR*(16-alpha)+31*alpha)>>4; oG = (tG*(16-alpha)+63*alpha)>>4; oB = (tB*(16-alpha)+31*alpha)>>4;
     } else {
-      oR = (tR * (16 - cloudAlpha) + cR * cloudAlpha) >> 4;
-      oG = (tG * (16 - cloudAlpha) + cG * cloudAlpha) >> 4;
-      oB = (tB * (16 - cloudAlpha) + cB * cloudAlpha) >> 4;
+      oR = tR; oG = tG; oB = tB;
     }
     if (oR > 31) oR = 31;
     if (oG > 63) oG = 63;
@@ -8290,7 +8303,7 @@ static void blendIrWithTerrain() {
   if (!s_irTerrainBuf || !s_irTerrainLoaded) return;
   uint16_t* px = (uint16_t*)sprite.getBuffer();
   if (!px) return;
-  blendIrPixelsWithTerrain(px, s_irTerrainBuf, DISP_W * DISP_H, s_mainSpritePixelsByteSwapped);
+  blendIrPixelsWithTerrain(px, s_irTerrainBuf, DISP_W * DISP_H, s_mainSpritePixelsByteSwapped, s_activeSourceIsIodc);
 }
 
 static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
@@ -8336,7 +8349,7 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   if (spriteLooksBottomBandJunkCorrupted()) { appendDiagLog("RAW", "slot=%d result=bottomband\n", logicalIdx); return false; }
   if (spriteLooksTopBandWhite()) { appendDiagLog("RAW", "slot=%d result=topband_white\n", logicalIdx); return false; }
 
-  if (s_irTerrainLoaded) {
+  if (s_irTerrainLoaded && (!s_activeSourceIsIodc || spriteLooksGrayscale())) {
     blendIrWithTerrain();
   }
 
@@ -10208,8 +10221,146 @@ static bool downloadRainViewerRadar(HTTPClient& http, WiFiClientSecure& client,
   return ok;
 }
 
-// OpenWeatherMap global precipitation — fallback when RainViewer has sparse coverage.
-// Same tile math + Mercator mapping as RainViewer, different source URL.
+static bool isAustralianLocation(float lat, float lon) {
+  return (lat >= -45.0f && lat <= -10.0f && lon >= 110.0f && lon <= 155.0f);
+}
+
+// BOM (Bureau of Meteorology) ground radar for Australia.
+// WMTS tiles from api.bom.gov.au — rain rate layer, no auth required.
+static bool downloadBOMRadar(HTTPClient& http, WiFiClientSecure& client,
+                              float bboxW, float bboxS,
+                              float bboxE, float bboxN) {
+  appendDiagLog("ZOOM", "msg=bom_start\n");
+
+  // Timestamp: round to nearest 5min, subtract 5min lag
+  time_t now = time(nullptr);
+  now -= (now % 300) + 300;
+  struct tm tmBuf;
+  gmtime_r(&now, &tmBuf);
+  char timeBuf[32];
+  strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%dT%H:%M:00Z", &tmBuf);
+
+  // Same Mercator tile math as RainViewer (zoom 6)
+  const int bomZ = 6;
+  float centerLat = (bboxN + bboxS) * 0.5f;
+  float centerLon = (bboxE + bboxW) * 0.5f;
+  int n = 1 << bomZ;
+  int tileX = (int)((centerLon + 180.0f) / 360.0f * n);
+  float latRad = centerLat * 0.01745329252f;
+  int tileY = (int)((1.0f - logf(tanf(latRad) + 1.0f / cosf(latRad)) / 3.14159265f) * 0.5f * n);
+  if (tileX < 0) tileX = 0; if (tileX >= n) tileX = n - 1;
+  if (tileY < 0) tileY = 0; if (tileY >= n) tileY = n - 1;
+
+  // BOM tile matrix offset for GoogleMapsCompatible_BoM at z=6
+  // tlx=11584952, tly=-270476.778591, grid 11×9
+  const float HALF_EXT = 20037508.342789244f;
+  const float WORLD_EXT = HALF_EXT * 2.0f;
+  float tileSpan = WORLD_EXT / (float)n;
+  int xOffset = (int)roundf((11584952.0f + HALF_EXT) / tileSpan);
+  int yOffset = (int)roundf((HALF_EXT - (-270476.778591f)) / tileSpan);
+  int col = tileX - xOffset;
+  int row = tileY - yOffset;
+  if (col < 0 || col >= 11 || row < 0 || row >= 9) {
+    appendDiagLog("ZOOM", "msg=bom_out_of_bounds col=%d row=%d\n", col, row);
+    return false;
+  }
+
+  char tileUrl[512];
+  snprintf(tileUrl, sizeof(tileUrl),
+    "https://api.bom.gov.au/apikey/v1/mapping/timeseries/wmts"
+    "?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0"
+    "&LAYER=atm_surf_air_precip_rate_1hr_total_mm_h"
+    "&STYLE=default&FORMAT=image/png"
+    "&TILEMATRIXSET=GoogleMapsCompatible_BoM&TILEMATRIX=%d"
+    "&TILEROW=%d&TILECOL=%d&time=%s",
+    bomZ, row, col, timeBuf);
+
+  Serial.printf("bom tile z=%d col=%d row=%d time=%s\n", bomZ, col, row, timeBuf);
+
+  http.begin(client, tileUrl);
+  http.setTimeout(8000);
+  http.setUserAgent("Mozilla/5.0 (Linux; ESP32)");
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    appendDiagLog("ZOOM", "msg=bom_tile_fail http=%d\n", code);
+    return false;
+  }
+
+  FixedBufferWriteStream sink(s_dlBuf, DL_BUF_BYTES);
+  int wrote = http.writeToStream(&sink);
+  http.end();
+  if (wrote <= 0 || sink.overflowed()) {
+    appendDiagLog("ZOOM", "msg=bom_dl_fail wrote=%d\n", wrote);
+    return false;
+  }
+
+  int imgW = 0, imgH = 0;
+  uint8_t* rgba = decodePngToRgba(s_dlBuf, (size_t)wrote, &imgW, &imgH);
+  if (!rgba || imgW < 1 || imgH < 1) {
+    appendDiagLog("ZOOM", "msg=bom_png_fail w=%d h=%d\n", imgW, imgH);
+    if (rgba) freeRgba(rgba);
+    return false;
+  }
+
+  // Mercator-map tile to bbox — same as RainViewer
+  float tileLonMin = tileX * 360.0f / n - 180.0f;
+  float tileLonMax = (tileX + 1) * 360.0f / n - 180.0f;
+  float tileMercYTop = 3.14159265f * (1.0f - 2.0f * tileY / (float)n);
+  float tileMercYBot = 3.14159265f * (1.0f - 2.0f * (tileY + 1) / (float)n);
+
+  const size_t outW = DISP_W, outH = DISP_H;
+  const size_t rawBytes = outW * outH * 4;
+  uint8_t* mapped = (uint8_t*)heap_caps_calloc(rawBytes, 1, MALLOC_CAP_SPIRAM);
+  if (!mapped) {
+    freeRgba(rgba);
+    return false;
+  }
+
+  uint32_t signalPx = 0;
+  for (int dy = 0; dy < (int)outH; dy++) {
+    float lat = bboxN - (bboxN - bboxS) * dy / (float)outH;
+    float mY = logf(tanf(lat * 0.01745329252f * 0.5f + 0.785398163f));
+    float ty = (tileMercYTop - mY) / (tileMercYTop - tileMercYBot) * imgH;
+    int srcY = (int)ty;
+    if (srcY < 0 || srcY >= imgH) continue;
+
+    for (int dx = 0; dx < (int)outW; dx++) {
+      float lon = bboxW + (bboxE - bboxW) * dx / (float)outW;
+      float tx = (lon - tileLonMin) / (tileLonMax - tileLonMin) * imgW;
+      int srcX = (int)tx;
+      if (srcX < 0 || srcX >= imgW) continue;
+
+      int srcIdx = (srcY * imgW + srcX) * 4;
+      int dstIdx = (dy * outW + dx) * 4;
+      mapped[dstIdx + 0] = rgba[srcIdx + 0];
+      mapped[dstIdx + 1] = rgba[srcIdx + 1];
+      mapped[dstIdx + 2] = rgba[srcIdx + 2];
+      mapped[dstIdx + 3] = rgba[srcIdx + 3];
+      if (rgba[srcIdx + 3] > 20) signalPx++;
+    }
+  }
+  freeRgba(rgba);
+
+  if (signalPx < 5) {
+    heap_caps_free(mapped);
+    appendDiagLog("ZOOM", "msg=bom_no_signal sig=%u\n", (unsigned)signalPx);
+    return false;
+  }
+
+  SD.remove(RAINVIEWER_RADAR_RAW);
+  File f = SD.open(RAINVIEWER_RADAR_RAW, FILE_WRITE);
+  bool ok = false;
+  if (f) {
+    ok = (f.write(mapped, rawBytes) == rawBytes);
+    f.close();
+  }
+  heap_caps_free(mapped);
+
+  appendDiagLog("ZOOM", "msg=bom_write ok=%d sig=%u\n", (int)ok, (unsigned)signalPx);
+  return ok;
+}
+
 static bool downloadOWMPrecipRadar(HTTPClient& http, WiFiClientSecure& client,
                                     float bboxW, float bboxS,
                                     float bboxE, float bboxN) {
@@ -10494,33 +10645,44 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
     }
   }
 
-  // RainViewer for international locations (EUMETView, IODC, Himawari)
-  // Falls back to OpenWeatherMap when RainViewer coverage is too sparse.
+  // Radar for international locations (EUMETView, IODC, Himawari)
+  // Australia: BOM ground radar (best) → OWM fallback
+  // Other international: RainViewer → OWM fallback
   if (s_activeSourceIsEumetview || activeLayerIs(WEATHER_LAYER_HIMAWARI_IR)) {
     SD.remove(RAINVIEWER_RADAR_RAW);
-    uint32_t rvSignal = 0;
-    bool rvOk = downloadRainViewerRadar(http, client, bboxWest, bboxSouth, bboxEast, bboxNorth, &rvSignal);
-    if (rvOk && rvSignal >= OWM_PRECIP_MIN_RV_SIGNAL) {
-      s_radarNoSignatures = false;
-      s_radarDownloadFailed = false;
-      s_lastRadarCheckUtc = time(nullptr);
-      appendDiagLog("ZOOM", "msg=rv_radar_ok sig=%u\n", (unsigned)rvSignal);
-    } else {
-      appendDiagLog("ZOOM", "msg=rv_sparse sig=%u trying_owm=1\n", (unsigned)rvSignal);
-      SD.remove(RAINVIEWER_RADAR_RAW);
-      bool owmOk = downloadOWMPrecipRadar(http, client, bboxWest, bboxSouth, bboxEast, bboxNorth);
-      if (owmOk) {
-        s_radarNoSignatures = false;
-        s_radarDownloadFailed = false;
-        s_lastRadarCheckUtc = time(nullptr);
-        appendDiagLog("ZOOM", "msg=owm_radar_ok\n");
-      } else {
+    bool radarOk = false;
+
+    if (isAustralianLocation(s_weatherCenterLat, s_weatherCenterLon)) {
+      radarOk = downloadBOMRadar(http, client, bboxWest, bboxSouth, bboxEast, bboxNorth);
+      if (!radarOk) {
+        appendDiagLog("ZOOM", "msg=bom_fail trying_owm=1\n");
         SD.remove(RAINVIEWER_RADAR_RAW);
-        s_radarNoSignatures = true;
-        s_radarDownloadFailed = false;
-        s_lastRadarCheckUtc = time(nullptr);
+        radarOk = downloadOWMPrecipRadar(http, client, bboxWest, bboxSouth, bboxEast, bboxNorth);
+        if (radarOk) appendDiagLog("ZOOM", "msg=owm_radar_ok\n");
+      }
+    } else {
+      uint32_t rvSignal = 0;
+      bool rvOk = downloadRainViewerRadar(http, client, bboxWest, bboxSouth, bboxEast, bboxNorth, &rvSignal);
+      if (rvOk && rvSignal >= OWM_PRECIP_MIN_RV_SIGNAL) {
+        radarOk = true;
+        appendDiagLog("ZOOM", "msg=rv_radar_ok sig=%u\n", (unsigned)rvSignal);
+      } else {
+        appendDiagLog("ZOOM", "msg=rv_sparse sig=%u trying_owm=1\n", (unsigned)rvSignal);
+        SD.remove(RAINVIEWER_RADAR_RAW);
+        radarOk = downloadOWMPrecipRadar(http, client, bboxWest, bboxSouth, bboxEast, bboxNorth);
+        if (radarOk) appendDiagLog("ZOOM", "msg=owm_radar_ok\n");
       }
     }
+
+    if (radarOk) {
+      s_radarNoSignatures = false;
+      s_radarDownloadFailed = false;
+    } else {
+      SD.remove(RAINVIEWER_RADAR_RAW);
+      s_radarNoSignatures = true;
+      s_radarDownloadFailed = false;
+    }
+    s_lastRadarCheckUtc = time(nullptr);
     return true;
   }
 
@@ -12104,7 +12266,26 @@ static void compositeIrZoomRaws() {
     size_t got = rf.read((uint8_t*)terrainPx, RAW_FRAME_BYTES);
     rf.close();
     if (got != RAW_FRAME_BYTES) { heap_caps_free(terrainCopy); continue; }
-    blendIrPixelsWithTerrain(terrainPx, terrainCopy, DISP_W * DISP_H, s_mainSpritePixelsByteSwapped);
+    // Only blend terrain for grayscale IR frames, not color (e.g. IODC rgb_natural)
+    bool rawIsGrayscale = true;
+    if (s_activeSourceIsIodc) {
+      int chromatic = 0, sampled = 0;
+      for (int y = 14; y < DISP_H; y += 8) {
+        for (int x = 0; x < DISP_W; x += 8) {
+          uint16_t c = terrainPx[y * DISP_W + x];
+          uint16_t n = s_mainSpritePixelsByteSwapped ? __builtin_bswap16(c) : c;
+          int r5 = (n >> 11) & 0x1F, g5 = ((n >> 5) & 0x3F) >> 1, b5 = n & 0x1F;
+          int mx = r5 > g5 ? (r5 > b5 ? r5 : b5) : (g5 > b5 ? g5 : b5);
+          int mn = r5 < g5 ? (r5 < b5 ? r5 : b5) : (g5 < b5 ? g5 : b5);
+          if (mx - mn > 3) chromatic++;
+          sampled++;
+        }
+      }
+      rawIsGrayscale = (sampled > 0 && chromatic < sampled / 10);
+    }
+    if (rawIsGrayscale) {
+      blendIrPixelsWithTerrain(terrainPx, terrainCopy, DISP_W * DISP_H, s_mainSpritePixelsByteSwapped, s_activeSourceIsIodc);
+    }
     heap_caps_free(terrainCopy);
     SD.remove(rawPaths[zi]);
     File wf = SD.open(rawPaths[zi], FILE_WRITE);
