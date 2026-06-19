@@ -31,10 +31,10 @@ SatProfile selectSatelliteForLonPure(float lonDeg, const char* currentLayer, boo
         return currentLayer && layer && strcmp(currentLayer, layer) == 0;
     };
 
-    // Himawari: > +80
+    // Himawari: > +80 or antimeridian wrap (lon <= -170)
     bool keepHimawari =
-        !force && layerIs(LAYER_HIMAWARI_IR) && (lon >= (kApacSplitLon - kHystDeg));
-    bool enterHimawari = (lon >= (kApacSplitLon + kHystDeg));
+        !force && layerIs(LAYER_HIMAWARI_IR) && (lon >= (kApacSplitLon - kHystDeg) || lon <= -168.0f);
+    bool enterHimawari = (lon >= (kApacSplitLon + kHystDeg) || lon <= -170.0f);
     if (keepHimawari || enterHimawari) {
         return { LAYER_HIMAWARI_IR, 10, 3, "Himawari-IR", false };
     }
@@ -61,11 +61,19 @@ SatProfile selectSatelliteForLonPure(float lonDeg, const char* currentLayer, boo
 }
 
 bool isProgressiveJpeg(const uint8_t* data, size_t len) {
-    for (size_t i = 0; i + 1 < len; i++) {
-        if (data[i] == 0xFF) {
-            if (data[i + 1] == 0xC2) return true;   // SOF2 = progressive
-            if (data[i + 1] == 0xC0) return false;   // SOF0 = baseline
-            if (data[i + 1] == 0xDA) return false;   // SOS = past all SOF markers
+    for (size_t i = 0; i + 1 < len; ) {
+        if (data[i] != 0xFF) { i++; continue; }
+        uint8_t m = data[i + 1];
+        if (m == 0x00 || m == 0xFF) { i++; continue; }
+        if (m == 0xC2) return true;
+        if (m == 0xC0) return false;
+        if (m == 0xDA) return false;
+        // Skip segment payload using 2-byte length field
+        if (i + 3 < len) {
+            uint16_t slen = ((uint16_t)data[i + 2] << 8) | data[i + 3];
+            i += 2 + slen;
+        } else {
+            break;
         }
     }
     return false;
