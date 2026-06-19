@@ -6493,13 +6493,14 @@ static void IRAM_ATTR touchIrqHandler() {
   s_touchIrqFired = true;
 }
 
+// Returns touch count, or 255 on I2C failure (distinct from 0 = no touch)
 static uint8_t readFtTouchPoint(int16_t* x, int16_t* y) {
-  if (s_i2cMutex && xSemaphoreTake(s_i2cMutex, pdMS_TO_TICKS(20)) != pdTRUE) return 0;
+  if (s_i2cMutex && xSemaphoreTake(s_i2cMutex, pdMS_TO_TICKS(50)) != pdTRUE) return 255;
   uint8_t buf[5];
   Wire.beginTransmission(FT_ADDR);
-  Wire.write(0x02);  // start at FingerNum register
-  if (Wire.endTransmission(false) != 0) { if (s_i2cMutex) xSemaphoreGive(s_i2cMutex); return 0; }
-  if (Wire.requestFrom(FT_ADDR, (uint8_t)5) != 5) { if (s_i2cMutex) xSemaphoreGive(s_i2cMutex); return 0; }
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) { if (s_i2cMutex) xSemaphoreGive(s_i2cMutex); return 255; }
+  if (Wire.requestFrom(FT_ADDR, (uint8_t)5) != 5) { if (s_i2cMutex) xSemaphoreGive(s_i2cMutex); return 255; }
   for (int i = 0; i < 5; i++) buf[i] = Wire.read();
   if (s_i2cMutex) xSemaphoreGive(s_i2cMutex);
 
@@ -6520,19 +6521,21 @@ static void initCleanModeTouch() {
   digitalWrite(9, LOW);   delay(20);
   digitalWrite(9, HIGH);  delay(50);
 
-  // Probe FT3168 at 0x38
+  // Probe FT3168 at 0x38 — use I2C mutex to avoid bus collision with PMU task
+  if (s_i2cMutex) xSemaphoreTake(s_i2cMutex, pdMS_TO_TICKS(100));
   Wire.beginTransmission(FT_ADDR);
   if (Wire.endTransmission() == 0) {
-    // Set monitor/interrupt power mode
     Wire.beginTransmission(FT_ADDR);
     Wire.write(0xA5);
     Wire.write(0x01);
     Wire.endTransmission();
+    if (s_i2cMutex) xSemaphoreGive(s_i2cMutex);
     delay(20);
     s_ftPresent = true;
     s_touchHasCoords = true;
     appendDiagLog("TOUCH", "ft3168=ok mode=coord\n");
   } else {
+    if (s_i2cMutex) xSemaphoreGive(s_i2cMutex);
     appendDiagLog("TOUCH", "ft3168=missing mode=any-touch\n");
   }
 
@@ -6555,27 +6558,25 @@ static void exitFullscreen() {
 static void cycleDisplayMode() {
   s_displayMode = (s_displayMode + 1) % 4;
   s_prefsDirtyMs = millis() + 1000;
-  updateBarBufs(s_newestCachedIdx);
   s_moonDrawn = false;
   s_hurricaneHintDrawn = false;
+  s_amoledClearBeforeNextPresent = true;
 }
 
-static uint16_t* s_moonFlashSaved = nullptr;
-static uint16_t* s_moonFlashTarget = nullptr;  // which moon buffer was flashed
-static uint32_t  s_moonFlashRestoreMs = 0;
+static int8_t    s_moonFlashWhich = -1;     // which moon is flashing (-1 = none)
+static uint32_t  s_moonFlashUntilMs = 0;    // when to stop the flash
 
 static void pollCleanModeToggle() {
   if (!s_cleanModeFeatureEnabled) return;
   if (!s_touchInitialized) initCleanModeTouch();
 
-  // Restore moon after flash timeout
-  if (s_moonFlashRestoreMs > 0 && millis() >= s_moonFlashRestoreMs && s_moonFlashSaved && s_moonFlashTarget) {
-    const int mp = MOON_DECODED_PX;
-    memcpy(s_moonFlashTarget, s_moonFlashSaved, (size_t)mp * mp * 2);
+  // Clear moon flash after timeout — push original moon directly to AMOLED
+  if (s_moonFlashWhich >= 0 && millis() >= s_moonFlashUntilMs) {
+    s_moonFlashWhich = -1;
     s_moonDrawn = false;
-    s_moonFlashRestoreMs = 0;
-    s_moonFlashTarget = nullptr;
+    drawMoonComplication();
   }
+
 
   // --- Fullscreen mode: triple-tap anywhere to exit ---
   if (s_fullscreenMode) {
@@ -6612,29 +6613,33 @@ static void pollCleanModeToggle() {
   static uint32_t pressStartMs = 0;
   static uint32_t lastTouchMs = 0;   // last poll where touching > 0
   static bool longHandled = false;
-  static const uint32_t RELEASE_DEBOUNCE_MS = 50;
+  static const uint32_t RELEASE_DEBOUNCE_MS = 30;
 
   bool irqFired = s_touchIrqFired;
-  if (irqFired) s_touchIrqFired = false;
 
   // Only poll I2C when tracking or new IRQ (avoid unnecessary bus traffic)
   if (pressStartMs == 0 && !irqFired) return;
 
   // Read current touch state from FT3168
   int16_t tx = 0, ty = 0;
-  uint8_t touching = s_ftPresent ? readFtTouchPoint(&tx, &ty) : 0;
+  uint8_t rawTouch = s_ftPresent ? readFtTouchPoint(&tx, &ty) : 0;
+  if (rawTouch == 255) return;  // I2C failed — keep IRQ armed for retry
+  if (irqFired) s_touchIrqFired = false;  // only clear after successful read
+  uint8_t touching = rawTouch;
 
   // Hit-test which moon region the coordinates fall in: -1=none, 0=left, 1=center, 2=right
+  // Expanded hit targets: 12px padding on all sides for easier tapping
   auto hitTestMoon = [](int16_t cx, int16_t cy) -> int8_t {
     const int mp = MOON_DECODED_PX;  // 54
     const int gap = mp / 2;          // 27
+    const int pad = 12;
     const int totalW = mp * 3 + gap * 2;
     const int baseX = (SCALED_W - totalW) / 2;
-    const int moonY1 = 439, moonY2 = moonY1 + mp;
+    const int moonY1 = 439 - pad, moonY2 = 439 + mp + pad;
     if (cy < moonY1 || cy > moonY2) return -1;
-    if (cx >= baseX && cx < baseX + mp) return 0;
-    if (cx >= baseX + mp + gap && cx < baseX + mp + gap + mp) return 1;
-    if (cx >= baseX + mp * 2 + gap * 2 && cx < baseX + mp * 3 + gap * 2) return 2;
+    if (cx >= baseX - pad && cx < baseX + mp + pad) return 0;
+    if (cx >= baseX + mp + gap - pad && cx < baseX + mp + gap + mp + pad) return 1;
+    if (cx >= baseX + mp * 2 + gap * 2 - pad && cx < baseX + mp * 3 + gap * 2 + pad) return 2;
     return -1;
   };
 
@@ -6645,44 +6650,15 @@ static void pollCleanModeToggle() {
   static uint32_t lastToggleMs = 0;
   auto fireMoonTap = [&]() {
     uint32_t now = millis();
-    if (now - lastToggleMs < 300) return;
+    if (now - lastToggleMs < 200) return;
 
-    // Flash the tapped moon to bright circle
-    uint16_t* flashBuf = nullptr;
-    if (s_tappedMoon == 0 && s_moonPrevBuf) flashBuf = s_moonPrevBuf;
-    else if (s_tappedMoon == 1 && s_moonBuf) flashBuf = s_moonBuf;
-    else if (s_tappedMoon == 2 && s_moonNextBuf) flashBuf = s_moonNextBuf;
+    s_moonFlashWhich = s_tappedMoon;
+    s_moonFlashUntilMs = millis() + 250;
+    s_moonDrawn = false;
 
-    if (flashBuf && s_amoledOut) {
-      const int mp = MOON_DECODED_PX;
-      size_t moonBytes = (size_t)mp * mp * 2;
-      if (!s_moonFlashSaved)
-        s_moonFlashSaved = (uint16_t*)heap_caps_malloc(moonBytes, MALLOC_CAP_SPIRAM);
-      if (s_moonFlashSaved) {
-        s_moonFlashTarget = flashBuf;
-        memcpy(s_moonFlashSaved, flashBuf, moonBytes);
-        int hx = mp / 2, hy = mp / 2, r = mp / 2 - 1;
-        for (int y = 0; y < mp; y++)
-          for (int x = 0; x < mp; x++) {
-            int d2 = (x - hx) * (x - hx) + (y - hy) * (y - hy);
-            if (d2 <= r * r) {
-              uint8_t b = (d2 < r * r * 3 / 4) ? 255
-                : (uint8_t)(255 - (d2 - r * r * 3 / 4) * 200 / (r * r / 4));
-              flashBuf[y * mp + x] = ((b >> 3) << 11) | ((b >> 2) << 5) | (b >> 3);
-            } else {
-              flashBuf[y * mp + x] = 0;
-            }
-          }
-        s_moonDrawn = false;
-        s_moonFlashRestoreMs = millis() + 300;
-      }
-    }
-
-    // Action depends on which moon was tapped
     if (s_tappedMoon == 1) {
-      cycleDisplayMode();  // center = cycle clean/time modes
+      cycleDisplayMode();
     } else if (s_tappedMoon == 0 || s_tappedMoon == 2) {
-      // Left = previous, Right = next ticker mode
       if (s_tappedMoon == 0)
         s_tickerMode = (s_tickerMode == 0) ? TICKER_NONE : s_tickerMode - 1;
       else
@@ -6702,12 +6678,10 @@ static void pollCleanModeToggle() {
     whichMoon = hitTestMoon(tx, ty);
   }
 
-  // New touch down on any moon: start tracking
+  // New touch down on a moon: fire immediately, track for long-press
   if (irqFired && pressStartMs == 0) {
     if (!s_ftPresent) return;
     if (touching == 0) {
-      // Finger already released before we polled — quick tap.
-      // FT3168 retains last-touch coords; use them for hit-test.
       whichMoon = hitTestMoon(tx, ty);
       if (whichMoon < 0) return;
       s_tappedMoon = whichMoon;
@@ -6716,14 +6690,14 @@ static void pollCleanModeToggle() {
     }
     if (whichMoon < 0) return;
     s_tappedMoon = whichMoon;
+    fireMoonTap();
     pressStartMs = millis();
     longHandled = false;
     return;
   }
 
-  // Tracking a moon press
+  // Tracking a moon press — only for long-press detection (fullscreen)
   if (pressStartMs > 0) {
-    // Debounce release: momentary touching==0 during hold is an I2C glitch
     bool held = touching > 0 || (millis() - lastTouchMs) < RELEASE_DEBOUNCE_MS;
     if (held) {
       if (!longHandled && (millis() - pressStartMs) >= 3000) {
@@ -6732,12 +6706,9 @@ static void pollCleanModeToggle() {
       }
       return;
     }
-    // Confirmed release (touching==0 for >50ms)
-    if (!longHandled) {
-      fireMoonTap();
-    }
     pressStartMs = 0;
     longHandled = false;
+    s_touchIrqFired = false;  // consume touch-up IRQ to prevent double-fire
   }
 }
 
@@ -6770,22 +6741,50 @@ static void delayWithInputPoll(uint32_t ms) {
 // Layout: [prev 54×54] —gap— [center 54×54] —gap— [next 54×54]
 // Previous phase on left, current center, next phase on right.
 // Lets user see at a glance whether the moon is waxing or waning.
+static uint16_t* s_moonFlashBuf = nullptr;  // pre-rendered white circle (PSRAM)
+
 static void drawMoonComplication() {
   if (!s_amoledOut || !s_moonBuf || s_hurricaneMode || s_moonDrawn) return;
-  const int borderY = (AMOLED_HEIGHT - SCALED_H) / 2 + SCALED_H; // 71 + 360 = 431
-  const int borderH = AMOLED_HEIGHT - borderY;                     // 71
+  const int borderY = (AMOLED_HEIGHT - SCALED_H) / 2 + SCALED_H;
+  const int borderH = AMOLED_HEIGHT - borderY;
   const int mp = MOON_DECODED_PX;
-  const int gap = mp / 2;               // half a moon width (27px)
-  const int totalW = mp * 3 + gap * 2;  // 54+27+54+27+54 = 216
+  const int gap = mp / 2;
+  const int totalW = mp * 3 + gap * 2;
   const int baseX = (SCALED_W - totalW) / 2;
   const int moonY = borderY + (borderH - mp) / 2;
 
+  // Lazily render the white circle flash buffer once
+  if (!s_moonFlashBuf && s_moonFlashWhich >= 0) {
+    s_moonFlashBuf = (uint16_t*)heap_caps_malloc((size_t)mp * mp * 2, MALLOC_CAP_SPIRAM);
+    if (s_moonFlashBuf) {
+      int hx = mp / 2, hy = mp / 2, r = mp / 2 - 1;
+      for (int y = 0; y < mp; y++)
+        for (int x = 0; x < mp; x++) {
+          int d2 = (x - hx) * (x - hx) + (y - hy) * (y - hy);
+          if (d2 <= r * r) {
+            uint8_t b = (d2 < r * r * 3 / 4) ? 255
+              : (uint8_t)(255 - (d2 - r * r * 3 / 4) * 200 / (r * r / 4));
+            s_moonFlashBuf[y * mp + x] = ((b >> 3) << 11) | ((b >> 2) << 5) | (b >> 3);
+          } else {
+            s_moonFlashBuf[y * mp + x] = 0;
+          }
+        }
+    }
+  }
+
+  uint16_t* m0 = s_moonPrevBuf;
+  uint16_t* m1 = s_moonBuf;
+  uint16_t* m2 = s_moonNextBuf;
+  if (s_moonFlashBuf && s_moonFlashWhich >= 0) {
+    if (s_moonFlashWhich == 0) m0 = s_moonFlashBuf;
+    else if (s_moonFlashWhich == 1) m1 = s_moonFlashBuf;
+    else if (s_moonFlashWhich == 2) m2 = s_moonFlashBuf;
+  }
+
   amoledLock();
-  if (s_moonPrevBuf)
-    s_amoledOut->draw16bitRGBBitmap(baseX, moonY, s_moonPrevBuf, mp, mp);
-  s_amoledOut->draw16bitRGBBitmap(baseX + mp + gap, moonY, s_moonBuf, mp, mp);
-  if (s_moonNextBuf)
-    s_amoledOut->draw16bitRGBBitmap(baseX + mp * 2 + gap * 2, moonY, s_moonNextBuf, mp, mp);
+  if (m0) s_amoledOut->draw16bitRGBBitmap(baseX, moonY, m0, mp, mp);
+  s_amoledOut->draw16bitRGBBitmap(baseX + mp + gap, moonY, m1, mp, mp);
+  if (m2) s_amoledOut->draw16bitRGBBitmap(baseX + mp * 2 + gap * 2, moonY, m2, mp, mp);
   amoledUnlock();
   s_moonDrawn = true;
 }
@@ -12048,8 +12047,8 @@ static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
   s_forecast.hourlyCount = 0;
   s_forecast.dailyCount = 0;
   const char* s = body.c_str();
-  // Find hourly block
-  const char* hourlyBlock = strstr(s, "\"hourly\"");
+  // Find hourly block — must match "hourly":{ not "hourly_units"
+  const char* hourlyBlock = strstr(s, "\"hourly\":{");
   if (hourlyBlock) {
     // Find time array
     const char* timeArr = strstr(hourlyBlock, "\"time\"");
@@ -12116,8 +12115,8 @@ static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
       }
     }
   }
-  // Parse daily block
-  const char* dailyBlock = strstr(s, "\"daily\"");
+  // Parse daily block — must match "daily":{ not "daily_units"
+  const char* dailyBlock = strstr(s, "\"daily\":{");
   if (dailyBlock) {
     const char* timeArr = strstr(dailyBlock, "\"time\"");
     const char* maxArr = strstr(dailyBlock, "\"temperature_2m_max\"");
@@ -16534,7 +16533,7 @@ appendDiagLog("TICKER", "msg=during-wipe push=%u skip=%u\n",
             // Deep terrain zoom stages (S2 cloudless, daytime only)
             if (s_deepTerrainZoomEnabled && !terrainUsesNightLayerForUtc(time(nullptr))) {
               appendDiagLog("ZOOM", "msg=deep-zoom_start\n");
-              delayWithInputPoll(1000);
+              delayWithInputPoll(zoomPreviewStepMs);
               // Compute geometric-mean zoom levels (same formula as download)
               float baseWKm = ZOOM3_FINAL_W_KM, baseHKm = ZOOM3_FINAL_H_KM;
               float tz2w = sqrtf(baseWKm * TERRAIN_ZOOM_FINAL_W_KM);
@@ -16556,7 +16555,7 @@ appendDiagLog("TICKER", "msg=during-wipe push=%u skip=%u\n",
                 bool tzOk = showZoomSnapshotFrame(tzPaths[tz], newestIdx);
                 appendDiagLog("ZOOM", "msg=deep-zoom level=%d result=%s\n", tz, tzOk ? "ok" : "FAIL");
                 if (!tzOk) break;
-                int32_t tzRemain = 1000 - (int32_t)(millis() - tzStart);
+                int32_t tzRemain = (int32_t)zoomPreviewStepMs - (int32_t)(millis() - tzStart);
                 if (tzRemain > 0) delayWithInputPoll((uint32_t)tzRemain);
               }
             }
