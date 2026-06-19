@@ -2505,6 +2505,15 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/testblend", HTTP_GET, handleTestBlend);
   s_wifiPortalServer.on("/dl", HTTP_GET, handleDownloadFile);
   s_wifiPortalServer.on("/setlocation", HTTP_GET, handleSetLocation);
+  s_wifiPortalServer.on("/resetlocation", HTTP_GET, []() {
+    if (!portalTokenValid()) return;
+    s_geoManualOverride = false;
+    { Preferences p; if (p.begin("satwatch", false)) { p.putBool("geoman", false); p.end(); } }
+    appendDiagLog("GEO", "msg=manual_override_cleared\n");
+    s_wifiPortalServer.send(200, "text/plain", "Location override cleared. Rebooting to re-geolocate.");
+    delay(500);
+    ESP.restart();
+  });
   s_wifiPortalServer.on("/track", HTTP_GET, handleTrackPage);
   s_wifiPortalServer.on("/checkupdate", HTTP_GET, handleCheckUpdate);
   s_wifiPortalServer.on("/doupdate", HTTP_GET, handleDoUpdate);
