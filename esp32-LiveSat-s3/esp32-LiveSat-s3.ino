@@ -64,6 +64,7 @@
 #include "config-s3.h"
 #include "scramble_glyphs.h"
 #include "flags_rgb565.h"
+#include "ble_types.h"
 
 #if defined(AMOLED_PWR_EN) && defined(AMOLED_CS) && defined(AMOLED_WIDTH) && defined(AMOLED_HEIGHT)
 #define BOARD_IS_AMOLED_206 1
@@ -95,7 +96,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    30
+#define FIRMWARE_VERSION    31
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -688,7 +689,7 @@ static char     s_syncProgPhaseLabel[24] = "sync";
 RTC_DATA_ATTR static bool s_sleepModeEnabled = true;
 RTC_DATA_ATTR static bool s_autoUpdateInSleep = true;
 RTC_DATA_ATTR static bool s_ch13_14_detected = false;
-#define CH1314_LOG_PATH "/sd/ch1314.log"
+#define CH1314_LOG_PATH "/ch1314.log"
 
 // ── Hurricane Watch ─────────────────────────────────────────────────────────
 struct HurricaneInfo {
@@ -2821,6 +2822,7 @@ static void ensureWifiPortalHandlers() {
   });
   s_wifiPortalServer.onNotFound(redirectWifiPortalRoot);
   registerInternationalHandlers();
+  registerBleAnalyzerHandlers();
   s_wifiPortalHandlersReady = true;
 }
 
@@ -4264,7 +4266,7 @@ static void startProgBarTask() {
   s_progDisplayPct = 0.0f;
   s_progFinished = false;
   s_progBarLastPct = 0;
-  xTaskCreatePinnedToCore(progBarInterpolateTask, "progBar", 3072, nullptr, 1, &s_progTaskHandle, 1);
+  xTaskCreatePinnedToCore(progBarInterpolateTask, "progBar", 4096, nullptr, 1, &s_progTaskHandle, 1);
 }
 
 static void stopProgBarTask() {
@@ -4350,7 +4352,8 @@ static void drawProgressBarRaw(uint32_t percent, const char* label) {
   tft.setCursor(4, progressTextY);
   tft.print(buf);
 #endif
-  serviceWifiPortalServer();
+  if (xTaskGetCurrentTaskHandle() != s_progTaskHandle)
+    serviceWifiPortalServer();
 }
 
 // Update progress bar — sets target for background interpolation task.
@@ -8921,6 +8924,7 @@ static bool tryConnectSlot(int slot, const char* title, bool showStatus, int max
 
 static bool connectWifiForSync(bool required, const char* statusLine = "Connecting WiFi...") {
   (void)required;
+  stopBleScanning();
   setCpuFrequencyMhz(240);
   loadWifiPortalConfig();
   bool showStatus = (statusLine != nullptr);
@@ -13464,6 +13468,7 @@ static void goToSleep(bool buttonOnly = false) {
     s_tickerTaskHandle = nullptr;
   }
 #endif
+  stopBleScanningFull();
   s_buttonSleepTransition = true;
   closeStream();
 
