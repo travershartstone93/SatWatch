@@ -38,18 +38,15 @@ Display reads from PSRAM fine. I2S/DMA peripherals need `MALLOC_CAP_DMA` (intern
 
 ## FRAME PIPELINE
 
-### Meta Invalidation in buildRawPlaybackCache() = Boot Loop
-DO NOT add `SD.remove(RAW_CACHE_META_FILE)` on decFail in `buildRawPlaybackCache()`.
-decFail includes missing-file failures (not just bad JPEG). 59 missing files → decFail=59 → meta invalidated every boot → infinite loop.
-Safe eviction: `SD.remove(fNNN.jpg)` for corrupt source files. Rolling sync redownloads.
-Meta invalidation is ONLY safe in `remapRawPlaybackCacheRolling()` and `rebuildRawPlaybackCacheRolling()`.
+### Invalid Frame Eviction
+When a frame fails decode in `rebuildRawFromStored()`, mark `s_idx.rawValid[i] = 0` — do NOT delete the JPEG slot from frames.bin. The JPEG may be valid but the decode may fail due to transient memory pressure. The rolling sync path will re-validate on next cycle.
 
 ### GIBS Lag Boundary = Most Likely Corrupt Frame
 Newest frame slot often has incomplete GIBS composite (black rectangles). Passes SOI/EOI checks.
 Handled by: black slab detector + retry offsets + freeze-back eviction.
 
 ### Structural JPEG Validity ≠ Weather Content Validity
-`cachedFrameLooksReusable()` only checks: exists, size >= 7000, SOI, EOI. Does NOT decode.
+`s_idx.jpegValid[i]` only means a JPEG was stored with valid SOI/EOI. Does NOT guarantee content quality.
 Frames can still be: black, cyan, horizontally banded, semantically wrong.
 Every validation layer is necessary.
 
@@ -66,14 +63,11 @@ Original maxCh <= 8 triggered on real dark Pacific Ocean pixels. Caused animatio
 ### dim.cfg Must Be Written After Every Cache Install
 Missing dim.cfg → dimension mismatch → entire cache purged. `writeCurrentFrameDimMeta()` required.
 
-### Rolling Sync Only Redownloads MISSING Files
-`cachedFrameLooksReusable()` returns true for present-but-corrupt files. To force redownload: `SD.remove()` the corrupt file.
+### Rolling Sync Reuses Valid JPEGs in frames.bin
+The ring-buffer index tracks which slots have valid JPEGs (`jpegValid[]`). Rolling sync only downloads frames whose timestamps are missing from the ring. Corrupt-but-present JPEGs must be evicted by clearing `s_idx.jpegValid[i]` and calling `writeIndex()`.
 
-### Remap Copy Pass Can Reuse Old Gap-Fills
-`remapRawPlaybackCacheRolling()` Pass 1 copies old stream slots. If source file was deleted then redownloaded, Pass 1 reuses the OLD gap-fill data. The `!frameFileExists(i, 'f')` check forces those slots to Pass 2 (fresh decode). Do not remove this check.
-
-### commitTempFrames() Is Non-Transactional
-Power loss between delete-all-f and rename-all-n = partially destroyed cache. Known structural risk.
+### Index Write Must Be Atomic
+`writeIndex()` writes to `index.tmp` then renames to `index.bin`. Power loss mid-write loses the temp file but preserves the last good index. Do not write directly to `index.bin`.
 
 ## SLEEP & WAKE
 

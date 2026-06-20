@@ -1,0 +1,70 @@
+# Plan: Fix Sleep Power Drain
+
+## Problem
+Battery drains almost as fast during sleep as when screen is always on.
+
+## Verified Claims
+
+| Claim | Status | Lines | Impact |
+|-------|--------|-------|--------|
+| AMOLED_PWR_EN never driven LOW | CORRECT | 11729-11731, 11879-11881 | ~30-50mA (display power rail stays on) |
+| ES8311 only muted, not powered down | CORRECT | 11704-11708 | ~5-8mA (no power-down API in es8311.h) |
+| AXP2101 LDOs all left enabled | CORRECT | Regs 0x90-0x9C never written | Unknown (need schematic) |
+| SD_MMC.end() incomplete | PARTIALLY CORRECT | 11774 | ~1-3mA (no GPIO low-leakage config) |
+| QMI8658 not managed | CORRECT | No IMU code at all | ~0.5-10mA (unknown state) |
+| I2S never stopped | CORRECT | No i2s.end() call | Minimal (light sleep auto-gates clocks) |
+
+## Key Architecture Insight
+Firmware uses **light sleep** (not deep sleep). GPIO 21 (AMOLED_PWR_EN) is shared with QMI8658 INT1 — it's released to input mode for IMU wake, but the display power rail stays on.
+
+## Estimated Total Sleep Current: ~40-70mA
+The biggest drains are AMOLED power rail and ES8311 codec.
+
+## Implementation Plan (ordered by impact)
+
+### Fix 1: Drive AMOLED_PWR_EN LOW (~30-50mA savings)
+In goToSleep() after displayOff (line ~11731):
+```cpp
+s_amoledOut->displayOff();
+digitalWrite(LCD_PWR, LOW);  // Cut AMOLED power rail
+```
+Wake path already restores it (line 11879-11881).
+Note: GPIO 21 shared with QMI8658 INT1 — existing wake code handles this.
+
+### Fix 2: Power Down ES8311 (~5-8mA savings)
+The es8311.h API has no power-down function. Need raw register write:
+```cpp
+// After es8311_voice_mute:
+Wire.beginTransmission(0x18);
+Wire.write(0x0D);  // SYSTEM_REG0D
+Wire.write(0x00);  // Power down analog circuitry
+Wire.endTransmission();
+Wire.beginTransmission(0x18);
+Wire.write(0x00);  // RESET_REG00
+Wire.write(0x1F);  // Power down digital + analog
+Wire.endTransmission();
+```
+On wake, existing `initAudioStartCue()` re-initializes everything.
+
+### Fix 3: Disable AXP2101 LDOs (impact TBD)
+Need board schematic to know which ALDOs to disable. Safe candidates:
+- ALDO for display (can disable after AMOLED_PWR_EN LOW)
+- ALDO for sensors (if IMU/touch not needed in sleep)
+
+### Fix 4: Configure SDMMC Pins for Sleep (~1-3mA)
+After SD_MMC.end(), set SDMMC pins to input:
+```cpp
+for (int pin : {1, 2, 3}) { // D0, D1, D2 — check actual pins
+  gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);
+  gpio_set_pull_mode((gpio_num_t)pin, GPIO_PULLDOWN_ONLY);
+}
+```
+
+## Files to Modify
+- `esp32-LiveSat-s3/esp32-LiveSat-s3.ino` — goToSleep() function (line ~11672)
+- May need to check es8311.c for correct power-down register sequence
+
+## Testing
+1. Measure current with USB power meter before/after each fix
+2. Verify wake works correctly (display, audio, SD)
+3. Target: <5mA sleep current

@@ -1,0 +1,113 @@
+# LiveSat Open Issues v3 — Escalation to Fable
+# Date: 2026-06-10
+# Current firmware: commit d672b80 (rolled back to last stable)
+# FIRMWARE_VERSION still reads 12 in code (stashed changes had version bumps to 22)
+
+## ISSUE A: PKEY Sleep Button — Partially Solved, Needs Interrupt-Driven Approach
+
+### What We Discovered
+The sleep button is the AXP2101 PKEY (PWR button, Key3 on schematic), NOT GPIO 0 (BOOT button, Key1).
+- GPIO 0 always reads HIGH when pressing the top button — confirmed via live diagnostic logging
+- The top button the user presses is wired to AXP2101 PWRON pin, not to any ESP32 GPIO
+
+### Register Finding (confirmed empirically)
+PKEY short-press IRQ fires in **INTSTS3 register 0x4A bit 3**, NOT INTSTS2 register 0x49 bit 3.
+- The XPowersLib Python source defines PKEY_SHORT_IRQ = (1 << 11), which maps to byte index 1 of the 3-byte status array (0x48, 0x49, 0x4A) — that's 0x49 bit 3
+- But on this board/chip revision, the actual IRQ fires in 0x4A bit 3 instead
+- We confirmed this by polling all three registers every 5 seconds while the user pressed the button:
+  - Before press: sts=0x00.00.00
+  - During press: sts=0x00.00.08 (0x4A bit 3 set)
+
+### What Blocks the Fix
+**Reading register 0x4A from the polling loop freezes the device.**
+- 80ms poll rate: immediate freeze, device won't boot
+- 500ms poll rate: immediate freeze, device won't boot
+- Reading 0x4A from the 5-second diagnostic log (appendDiagLog): works fine
+- Reading 0x49 from the 80ms poll loop: works fine (never freezes)
+- The freeze is from the read, not the write — even read-only polling of 0x4A at any rate in serviceUserButtons freezes
+
+### What Currently Works
+- Clearing all three status registers (0x48, 0x49, 0x4A) with 0xFF at boot init in configureAxp2101PowerKey() — this unblocked a single successful sleep from the PKEY in one test
+- The old code polling 0x49 at 80ms works (doesn't freeze, just doesn't see PKEY events)
+
+### Questions for Fable
+1. Why does reading register 0x4A freeze the device when done from serviceUserButtons (called from portalFriendlyDelay/animation loop on Core 0/1) but NOT when done from appendDiagLog's debug block? Is there an I2C bus contention issue — could the ticker task or button poll task be doing I2C at the same time?
+
+2. The AXP2101 has an IRQ output pin (IRQB). Is it connected to an ESP32 GPIO on this board? The schematic shows it but the pin is hard to read. If IRQB is wired to a GPIO, we could use gpio_isr_handler instead of polling — read 0x4A only when the IRQ line goes low.
+
+3. Could we safely read 0x4A from a dedicated low-priority FreeRTOS task with its own I2C mutex, polling at 200ms, instead of from inside serviceUserButtons? The freeze might be from a reentrancy issue with I2C reads happening from multiple contexts.
+
+4. Alternative: could we remap the PKEY IRQ to fire in a different register? The AXP2101 INTEN1/2/3 registers (0x40-0x42) control which IRQs are enabled — maybe we can shift the PKEY enable to a different register that's safe to poll.
+
+
+## ISSUE B: Device Won't Wake After Long Sleep
+
+### Symptom
+Sleep/wake works for short sleeps (seconds to a few minutes). After a longer sleep (unclear threshold — maybe 5+ minutes), pressing the button doesn't wake the device. Requires AXP long-press power cycle.
+
+### What We Know
+- The light sleep uses GPIO 0 (BOOT_BTN_GPIO) as the wake source via gpio_wakeup_enable with GPIO_INTR_LOW_LEVEL
+- But the user's button is the AXP PKEY, which is NOT GPIO 0
+- GPIO 0 has no physical button accessible to the user on this board revision
+- The wake mechanism is fundamentally broken: we arm GPIO 0 for wake, but the user presses AXP PKEY which doesn't trigger GPIO wake
+
+### Questions for Fable
+1. Can we use the AXP2101 IRQB pin as a light sleep wake source instead of GPIO 0? If IRQB is connected to an ESP32 GPIO, we could arm that GPIO for level-triggered wake, and the PKEY press would pull IRQB low, waking the ESP32.
+
+2. If IRQB isn't connected, can we use the AXP2101's "power on by PKEY" feature as the wake mechanism? The AXP might be able to toggle a power rail or generate a reset that effectively wakes the device.
+
+3. Should we switch from light sleep to a scheme where goToSleep() actually powers off via AXP (disable CPU rail), and the PKEY press re-powers everything (cold boot)? This would fix wake AND save more power, at the cost of losing RTC state.
+
+
+## ISSUE C: Forecast/Ticker Gone (INTERMITTENT)
+
+### Symptom
+The weather forecast ticker at the bottom of the display is missing on many boots. The forecast fetch returns zero data (hr=0 dy=0 nws=0), so the ticker has nothing to render and never starts.
+
+### What We Know
+- The forecast fetch takes ~63 seconds and returns empty on affected boots
+- Both NWS and Open-Meteo fallback return zero data
+- Previous boots on the same firmware had forecast working fine (hr=12 dy=5)
+- The forecast code itself hasn't changed between working and non-working boots
+- The fetch runs after sync completes, with WiFi connected
+- `nws=0` consistently — NWS path never activates
+- Memory diagnostics show stable internal heap (~170KB free, 81KB largest block) — not an OOM issue
+
+### Hypothesis from Fable (previous review, not yet tested)
+Fable suggested: "When the grid URL loads valid from NVS, fetchNwsGridUrl is skipped — so whatever sets nwsAvailable never runs, and the NWS branch is dead even with a valid grid." Also: internal DRAM might be too fragmented after a heavy sync for the TLS handshakes needed by the forecast APIs.
+
+### Questions for Fable
+1. Trace the nwsAvailable flag: where is it set, and is it possible that it's stale/false from a previous boot while the grid URL is valid in NVS? This would skip NWS entirely.
+
+2. For Open-Meteo: the fetch takes 63 seconds and returns empty. Is there a timeout issue? The HTTPClient timeout is 10s, but the total elapsed is 63s — that's 6 sequential timeouts. Are all 6 fetch calls (nowcast radar + NWS grid + NWS hourly + NWS daily + Open-Meteo) timing out in sequence?
+
+3. Should we add per-fetcher logging (one diag line per HTTP GET with status code and body length) to see exactly which requests fail and why?
+
+4. Could the WiFi scan-first rewrite (which creates/destroys connections during the scan phase) be leaving the WiFi stack in a degraded state that causes subsequent HTTPS connections to fail intermittently?
+
+
+## ISSUE D: OTA Manual Flow Broken
+
+### Symptom
+The v12→v13 manual OTA flow (Update.begin + writeToStream) fails with "Update.begin failed: No Error" when Content-Length is unknown (GitHub serves via chunked/redirect).
+
+### What We Know
+- `http.getSize()` returns -1 (chunked response from GitHub CDN)
+- `s_otaRemoteSize` from version.json should provide the fallback size
+- `Update.begin(size)` fails when size is the actual file size — possibly because the OTA partition isn't correctly identified
+- The old HTTPUpdate library approach worked fine (v8→v9, v9→v11 all succeeded)
+
+### Questions for Fable
+1. Should we revert to HTTPUpdate for the actual download while keeping the MD5 verification? HTTPUpdate handles chunked/redirect internally and worked reliably. We could do: check version.json manually (get MD5), then use httpUpdate.update() with the MD5 pre-set.
+
+2. Or: is Update.begin() failing because we're on the wrong OTA partition? After multiple OTA cycles + USB flashes, the partition state might be confused. What does esp_ota_get_running_partition() return vs esp_ota_get_next_update_partition()?
+
+
+## Current Stable State (commit d672b80)
+- Sleep: works via auto-sleep after N animation loops (timer-based)
+- Manual sleep button: doesn't work (AXP PKEY not polled correctly)
+- Wake from short sleep: works (GPIO 0 wake — unclear how, since GPIO 0 has no user-accessible button; possibly touch or timer wake)
+- Wake from long sleep: broken
+- Forecast/ticker: intermittently missing
+- OTA: broken (manual flow fails, old HTTPUpdate was removed)
+- Everything else works: animation, WiFi scan-first, diag logging, UDP live log, portal auth

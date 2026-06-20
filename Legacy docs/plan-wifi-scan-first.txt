@@ -1,0 +1,100 @@
+# Plan: WiFi Scan-First Connection
+
+## Problem
+On boot, the device tries all 5 WiFi config slots sequentially with 10-20 second timeouts each, regardless of whether the networks exist. If only slot 3 is available, slots 0-2 waste 30-60 seconds timing out on networks that aren't there. Worst case: ~2 minutes on power-on boot if all fail.
+
+## Current Behavior (lines 7962-8032)
+```
+for each slot 0..4:
+  if ssid empty → skip
+  WiFi.begin(ssid, pass)
+  wait up to 10-20s (500ms × 20-40 tries)
+  if connected → check internet → return
+  else → try next slot
+```
+No scan. No signal-based ordering. Purely sequential.
+
+## Fix: Scan First, Then Connect to Best Match
+
+### Step 1: Scan visible networks (~2 seconds)
+Before the slot loop, do a quick `WiFi.scanNetworks()`. This takes ~2 seconds and returns all visible SSIDs with RSSI.
+
+### Step 2: Match configured slots against scan results
+Build a priority list: configured slots that were found in the scan, ordered by RSSI (strongest first). Skip slots not found in the scan entirely.
+
+### Step 3: Connect to best match first
+Try the strongest visible configured network first. If it fails (wrong password, no internet), try the next visible one. Only fall back to blind sequential if the scan found nothing.
+
+## Implementation
+
+In `connectWifiForSync()` (line ~7962), before the slot loop:
+
+```cpp
+static bool connectWifiForSync(bool required, const char* statusLine = "Connecting WiFi...") {
+  setCpuFrequencyMhz(240);
+  loadWifiPortalConfig();
+  // ... existing portal teardown ...
+
+  // Scan visible networks first
+  WiFi.mode(WIFI_STA);
+  int found = WiFi.scanNetworks(false, false, false, 300);  // 300ms per channel
+
+  // Build priority order: configured slots found in scan, sorted by RSSI
+  struct SlotMatch { int slot; int32_t rssi; };
+  SlotMatch matches[WIFI_CONFIG_SLOTS];
+  int matchCount = 0;
+  bool slotSeen[WIFI_CONFIG_SLOTS] = {};
+
+  for (int i = 0; i < found && matchCount < WIFI_CONFIG_SLOTS; i++) {
+    String scannedSsid = WiFi.SSID(i);
+    int32_t rssi = WiFi.RSSI(i);
+    for (int slot = 0; slot < WIFI_CONFIG_SLOTS; slot++) {
+      if (slotSeen[slot] || s_wifiConfig[slot].ssid[0] == '\0') continue;
+      if (scannedSsid == s_wifiConfig[slot].ssid) {
+        matches[matchCount++] = {slot, rssi};
+        slotSeen[slot] = true;
+        break;
+      }
+    }
+  }
+  WiFi.scanDelete();
+
+  // Sort by RSSI (strongest first)
+  for (int i = 0; i < matchCount - 1; i++)
+    for (int j = i + 1; j < matchCount; j++)
+      if (matches[j].rssi > matches[i].rssi) { auto t = matches[i]; matches[i] = matches[j]; matches[j] = t; }
+
+  appendDiagLog("WIFI", "scan found=%d matched=%d\n", found, matchCount);
+
+  // Try matched slots first (shorter timeout since we know they're visible)
+  for (int mi = 0; mi < matchCount; mi++) {
+    int slot = matches[mi].slot;
+    // ... existing connect logic but with shorter maxTries (e.g. 15 instead of 40) ...
+  }
+
+  // Fallback: try unmatched configured slots (network might be hidden)
+  for (int slot = 0; slot < WIFI_CONFIG_SLOTS; slot++) {
+    if (slotSeen[slot] || s_wifiConfig[slot].ssid[0] == '\0') continue;
+    // ... existing connect logic with original timeout ...
+  }
+
+  return false;
+}
+```
+
+### Timing Improvement
+- Scan: ~2 seconds
+- Connect to visible network: ~3-5 seconds (shorter timeout since we know it's there)
+- Total when primary is visible: ~5-7 seconds (vs 10-20 seconds currently)
+- Total when primary is absent but backup is visible: ~5-7 seconds (vs 20-40 seconds currently)
+- Total when nothing visible: ~2 seconds scan + existing fallback behavior
+
+## Files to Modify
+- `esp32-LiveSat-s3/esp32-LiveSat-s3.ino` — `connectWifiForSync()` (lines 7962-8032)
+
+## Testing
+1. Boot with primary network available → connects in ~5s
+2. Boot with only backup network available → connects in ~5s (no timeout on primary)
+3. Boot with no networks → falls through to portal in ~2s + existing timeouts
+4. Verify diag shows `tag=WIFI scan found=X matched=Y`
+5. Verify BSSID geolocation still works (it does its own scan separately)

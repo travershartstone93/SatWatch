@@ -1,0 +1,97 @@
+# LiveSat Open Issues v4 — Escalation to Fable
+# Date: 2026-06-12
+# Current firmware: commit c6120ec (v23), all Fable v3 fixes landed
+# Status: PKEY sleep button works, touch-to-wake works, forecast/ticker intermittent
+
+## RESOLVED THIS SESSION
+- PKEY button: PMU polling task, 0x4A bit 3 confirmed, suspend/resume across sleep
+- Touch-to-wake: FT3168 monitor mode + GPIO 38 wake source
+- delay() macro inverted to plain vTaskDelay
+- OTA: HTTPUpdate + post-flash MD5 readback verification
+- Portal: serviceWifiPortalServer added to delayWithInputPoll + animation pacing loop
+- Forecast: nwsAvailable set from NVS grid URL, per-fetcher isolation
+- Safeboot: auto-clears on clean boot
+
+## ISSUE: Slow Wake from Sleep (~10 seconds)
+
+### Symptom
+After pressing the button to sleep then tapping to wake, the device takes ~10 seconds
+showing "Loading..." before the animation plays. This is the PSRAM animation cache
+being rebuilt from SD (144 frames × 160×140 half-res = 6.3MB read from stream.raw).
+
+### Root Cause
+The timer-wake sync path in goToSleep() frees the animation cache before syncing:
+```cpp
+if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; }
+```
+If ANY timer wake fires during sleep (auto-update interval), the cache is gone.
+The next button/touch wake has no cache and must rebuild from SD.
+
+SLEEPBC from a typical session shows `timer=20` — 20 timer wakes happened,
+each freeing the cache.
+
+### What We Tried
+Removing the cache free (keeping 6.3MB cache during sync). Result: device does not
+wake from sleep at all. The sync with 6.3MB less PSRAM available either:
+1. Fails to allocate s_dlBuf (128KB) or sprite (112KB) or other sync buffers
+2. Causes an OOM crash during the sync that prevents proper re-sleep
+3. The remaining ~1.4MB isn't enough when PSRAM fragmentation is factored in
+
+### Questions for Fable
+1. With 8MB PSRAM and 6.3MB cache resident, is ~1.4MB actually enough for the
+   sync path? The sync allocates: s_dlBuf (128KB, already allocated at boot),
+   sprite (112KB, already allocated), s_frameDisplayBuf (288KB, already allocated).
+   These are already allocated — they don't need new PSRAM during sync. So what
+   additional PSRAM does the sync need that would fail with only 1.4MB free?
+
+2. Could the issue be that stb_image's progressive JPEG decode needs temporary
+   PSRAM (~730KB peak for 320×176 progressive)? If the source is GOES-East (baseline),
+   stb_image isn't used. But the persistent stb worker task's 16KB stack is in
+   internal DRAM, not PSRAM.
+
+3. Alternative approach: instead of keeping the full cache, could we keep a
+   smaller "wake preview" — just the last displayed frame in s_frameDisplayBuf
+   (288KB, already survives sleep in PSRAM) — and display that instantly on wake
+   while the cache rebuilds in the background? The user sees the last frame
+   immediately, then animation starts after cache rebuild.
+
+4. Another alternative: rebuild the cache lazily — play directly from SD (showFrame
+   reads stream.raw, ~120ms per frame = ~8fps) while building the cache in a
+   background task. The animation starts immediately at lower framerate, then
+   switches to cache playback when ready.
+
+5. Could the crash be from the sync trying to write to stream.raw while the
+   cache read pointers are still valid? If the sync modifies the raw file and
+   the cache was built from stale offsets, the rebuild after sync would read
+   garbage anyway — so freeing it is correct behavior. The question is how to
+   make the rebuild faster or hide it.
+
+## ISSUE: Forecast/Ticker Still Intermittent
+
+### Status After Fixes
+- nwsAvailable is now correctly set from NVS grid URL (confirmed: nws=1 in diag)
+- Per-fetcher http.end()+client.stop() isolation added between tiers
+- BUT: forecast still returns valid=0 hr=0 dy=0 on some boots
+- No FORECAST tag in diag — the fetch runs but produces no diagnostic output
+  about individual HTTP failures
+
+### What's Needed
+Per-fetcher diagnostic logging inside each fetch function:
+- fetchNwsGridUrl: log HTTP status code + body length
+- fetchNwsHourlyForecast: log HTTP status code + body length
+- fetchNwsDailyForecast: log HTTP status code + body length
+- fetchOpenMeteoFallback: log HTTP status code + body length
+- fetchAndAnalyzeNowcastRadar: log HTTP status code
+
+This will reveal which specific API call is failing and why.
+
+## ISSUE: Glitched Frame (White Band)
+Frame 026 in the current cache has a white band across the top ~30%.
+This is a GIBS partial composite that the validators didn't catch because:
+- The white pixels are non-zero (not all-black MCUs)
+- The horizontal corruption detector looks for repeated rows, not white bands
+- The partial-composite detector checks for all-zero 8×8 MCUs at 8-bit grayscale
+
+Possible fix: add a "top-band whiteness" check — if the average luminance of
+the top 20% of rows exceeds a threshold (e.g., >200) while the bottom 80% is
+significantly darker, reject the frame.

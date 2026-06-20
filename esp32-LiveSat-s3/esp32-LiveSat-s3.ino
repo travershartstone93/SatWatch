@@ -95,7 +95,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    26
+#define FIRMWARE_VERSION    30
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -687,6 +687,8 @@ static char     s_syncProgPhaseLabel[24] = "sync";
 
 RTC_DATA_ATTR static bool s_sleepModeEnabled = true;
 RTC_DATA_ATTR static bool s_autoUpdateInSleep = true;
+RTC_DATA_ATTR static bool s_ch13_14_detected = false;
+#define CH1314_LOG_PATH "/sd/ch1314.log"
 
 // ── Hurricane Watch ─────────────────────────────────────────────────────────
 struct HurricaneInfo {
@@ -2423,6 +2425,7 @@ static void handleDoUpdate() {
 
   s_otaInProgress = true;
   if (Update.isRunning()) Update.abort();
+  showMessage("Update in progress", "Do not power off");
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -2509,6 +2512,241 @@ static void handleDoUpdate() {
   s_otaInProgress = false;
 }
 
+// ── SD File Manager ─────────────────────────────────────────────────────────
+static File s_uploadFile;
+
+static const char kFileManagerHtml[] PROGMEM =
+  "<!DOCTYPE html><html><head>"
+  "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+  "<title>SD File Manager</title><style>"
+  "*{margin:0;padding:0;box-sizing:border-box}"
+  "body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:1.5em;max-width:700px;margin:0 auto}"
+  "h2{color:#38bdf8;margin-bottom:.3em;text-align:center;font-size:1.4em}"
+  ".path{color:#94a3b8;text-align:center;font-family:monospace;margin-bottom:1em;font-size:.9em;word-break:break-all}"
+  ".entry{display:flex;align-items:center;padding:8px 10px;border-bottom:1px solid #1e293b;cursor:pointer;gap:8px}"
+  ".entry:hover{background:#1e293b;border-radius:6px}"
+  ".icon{font-size:1.3em;flex-shrink:0;width:1.6em;text-align:center}"
+  ".name{flex:1;word-break:break-all}"
+  ".size{color:#64748b;font-size:.8em;font-family:monospace;white-space:nowrap}"
+  ".dir .name{color:#38bdf8;font-weight:600}"
+  ".actions{display:flex;gap:6px;flex-shrink:0}"
+  ".abtn{padding:4px 10px;border-radius:4px;border:none;font-size:.75em;cursor:pointer}"
+  ".dl{background:#1e40af;color:#fff}.dl:hover{background:#2563eb}"
+  ".del{background:#7f1d1d;color:#fff}.del:hover{background:#991b1b}"
+  ".upload-area{margin-top:1.2em;border:2px dashed #334155;border-radius:10px;padding:1.5em;text-align:center;transition:border-color .2s}"
+  ".upload-area.hover{border-color:#38bdf8}"
+  ".upload-area input[type=file]{display:none}"
+  ".upload-area label{color:#38bdf8;cursor:pointer;font-weight:600}"
+  ".prog{margin-top:.8em;display:none}"
+  ".prog-bar{height:6px;background:#1e293b;border-radius:3px;overflow:hidden}"
+  ".prog-fill{height:100%;background:#38bdf8;width:0%;transition:width .3s}"
+  ".prog-text{color:#94a3b8;font-size:.8em;margin-top:4px;text-align:center}"
+  "</style></head><body>"
+  "<h2>&#128193; SD File Manager</h2>"
+  "<div class='path' id='cwd'>/</div>"
+  "<div id='list'></div>"
+  "<div class='upload-area' id='dropzone'>"
+  "<label for='filein'>Choose files</label> or drag &amp; drop"
+  "<input type='file' id='filein' multiple>"
+  "<div class='prog' id='prog'><div class='prog-bar'><div class='prog-fill' id='progfill'></div></div>"
+  "<div class='prog-text' id='progtxt'></div></div></div>"
+  "<script>"
+  "var K=new URLSearchParams(location.search).get('k')||'';"
+  "var cwd='/';"
+  "var nav=function(p){cwd=p;load();};"
+  "var parentDir=function(p){var s=p.replace(/\\/$/,'').split('/');s.pop();return s.join('/')||'/';};"
+  "var fmtSz=function(b){if(b<1024)return b+' B';if(b<1048576)return(b/1024).toFixed(1)+' KB';return(b/1048576).toFixed(1)+' MB';};"
+  "var dlFile=function(p){window.location='/dl?path='+encodeURIComponent(p);};"
+  "var delFile=function(p,n){if(!confirm('Delete '+n+'?'))return;"
+  "fetch('/sddelete?path='+encodeURIComponent(p)+'&k='+K).then(function(){load();});};"
+  "var load=function(){"
+  "document.getElementById('cwd').textContent=cwd;"
+  "fetch('/lsjson?path='+encodeURIComponent(cwd)).then(function(r){return r.json();}).then(function(d){"
+  "var h='';"
+  "if(cwd!=='/'){h+=\"<div class='entry dir' onclick=\\\"nav('\"+parentDir(cwd)+\"')\\\"><span class='icon'>&#128281;</span><span class='name'>..</span></div>\";}"
+  "d.sort(function(a,b){if(a.dir!==b.dir)return a.dir?-1:1;return a.name.localeCompare(b.name);});"
+  "d.forEach(function(e){"
+  "var fp=cwd+(cwd.endsWith('/')?'':'/')+e.name;"
+  "if(e.dir){"
+  "h+=\"<div class='entry dir' onclick=\\\"nav('\"+fp+\"')\\\"><span class='icon'>&#128193;</span><span class='name'>\"+e.name+\"</span></div>\";"
+  "}else{"
+  "h+=\"<div class='entry'><span class='icon'>&#128196;</span><span class='name'>\"+e.name+\"</span><span class='size'>\"+fmtSz(e.size)+\"</span><span class='actions'>\""
+  "+\"<button class='abtn dl' onclick=\\\"event.stopPropagation();dlFile('\"+fp+\"')\\\">Download</button>\""
+  "+\"<button class='abtn del' onclick=\\\"event.stopPropagation();delFile('\"+fp+\"','\"+e.name+\"')\\\">Delete</button>\""
+  "+\"</span></div>\";"
+  "}"
+  "});"
+  "document.getElementById('list').innerHTML=h||\"<div style='text-align:center;color:#64748b;padding:2em'>Empty directory</div>\";"
+  "});};"
+  "var dz=document.getElementById('dropzone'),fi=document.getElementById('filein');"
+  "dz.addEventListener('dragover',function(e){e.preventDefault();dz.classList.add('hover');});"
+  "dz.addEventListener('dragleave',function(){dz.classList.remove('hover');});"
+  "dz.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('hover');uploadFiles(e.dataTransfer.files);});"
+  "fi.addEventListener('change',function(){uploadFiles(fi.files);fi.value='';});"
+  "var uploadFiles=function(files){"
+  "var i=0,prog=document.getElementById('prog'),fill=document.getElementById('progfill'),txt=document.getElementById('progtxt');"
+  "prog.style.display='block';"
+  "var next=function(){"
+  "if(i>=files.length){setTimeout(function(){prog.style.display='none';load();},800);return;}"
+  "var f=files[i++];"
+  "txt.textContent='Uploading '+f.name+' ('+i+'/'+files.length+')';"
+  "fill.style.width='0%';"
+  "var fd=new FormData();fd.append('file',f);fd.append('dir',cwd);"
+  "var xhr=new XMLHttpRequest();"
+  "xhr.upload.onprogress=function(e){if(e.lengthComputable)fill.style.width=Math.round(e.loaded/e.total*100)+'%';};"
+  "xhr.onload=function(){fill.style.width='100%';next();};"
+  "xhr.onerror=function(){txt.textContent='Error uploading '+f.name;};"
+  "xhr.open('POST','/sdupload?k='+K);xhr.send(fd);"
+  "};"
+  "next();};"
+  "load();"
+  "</script></body></html>";
+
+static void handleFileManagerPage() {
+  s_wifiPortalServer.send(200, "text/html", kFileManagerHtml);
+}
+
+static void handleLsJson() {
+  String path = s_wifiPortalServer.hasArg("path") ? s_wifiPortalServer.arg("path") : String("/");
+  File dir = SD.open(path);
+  String json = "[";
+  bool first = true;
+  if (dir && dir.isDirectory()) {
+    while (true) {
+      File entry = dir.openNextFile();
+      if (!entry) break;
+      if (!first) json += ",";
+      first = false;
+      json += "{\"name\":\"";
+      json += entry.name();
+      json += "\",\"dir\":";
+      json += entry.isDirectory() ? "true" : "false";
+      json += ",\"size\":";
+      json += String((unsigned long)entry.size());
+      json += "}";
+      entry.close();
+    }
+    dir.close();
+  }
+  json += "]";
+  s_wifiPortalServer.send(200, "application/json", json);
+}
+
+static void handleSdUpload() {
+  HTTPUpload& upload = s_wifiPortalServer.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    String dir = s_wifiPortalServer.arg("dir");
+    if (dir.length() == 0) dir = "/";
+    if (!dir.endsWith("/")) dir += "/";
+    String path = dir + upload.filename;
+    s_uploadFile = SD.open(path, FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (s_uploadFile) s_uploadFile.write(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (s_uploadFile) { s_uploadFile.close(); }
+  }
+}
+
+static void handleSdUploadDone() {
+  s_wifiPortalServer.send(200, "text/plain", "OK");
+}
+
+static void handleSdDelete() {
+  if (!portalTokenValid()) return;
+  String path = s_wifiPortalServer.arg("path");
+  if (path.length() == 0 || path.indexOf("..") >= 0) {
+    s_wifiPortalServer.send(400, "text/plain", "invalid path");
+    return;
+  }
+  if (SD.remove(path)) {
+    s_wifiPortalServer.send(200, "text/plain", "deleted");
+  } else {
+    s_wifiPortalServer.send(404, "text/plain", "not found or is directory");
+  }
+}
+
+static void handleDataLogger() {
+  String html = F("<!DOCTYPE html><html><head>"
+    "<meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>CH13/14 Data Logger</title><style>"
+    "*{margin:0;padding:0;box-sizing:border-box}"
+    "body{font-family:-apple-system,sans-serif;background:#0f172a;color:#e2e8f0;padding:1.5em}"
+    "h2{color:#f87171;margin-bottom:.8em;font-size:1.4em;text-align:center}"
+    ".status{text-align:center;color:#94a3b8;margin-bottom:1em;font-size:.9em}"
+    "table{width:100%;border-collapse:collapse;font-size:.8em}"
+    "th{background:#1e293b;color:#f87171;padding:8px 6px;text-align:left;position:sticky;top:0}"
+    "td{padding:6px;border-bottom:1px solid #1e293b;word-break:break-all}"
+    "tr:hover{background:#1e293b}"
+    ".ch13{color:#fbbf24}.ch14{color:#f87171}"
+    ".btn{display:block;margin:1.5em auto 0;padding:12px 24px;background:#991b1b;color:#fff;"
+    "border:none;border-radius:8px;font-size:1em;cursor:pointer}"
+    ".btn:hover{background:#b91c1c}"
+    ".empty{text-align:center;color:#4ade80;padding:3em;font-size:1.1em}"
+    "</style></head><body>"
+    "<h2>&#128520; CH13/14 Data Logger</h2>");
+
+  File f = SD.open(CH1314_LOG_PATH, FILE_READ);
+  if (!f || f.size() == 0) {
+    if (f) f.close();
+    html += F("<div class='empty'>No channel 13/14 activity detected.</div>"
+              "</body></html>");
+    s_wifiPortalServer.send(200, "text/html", html);
+    return;
+  }
+
+  // Count entries
+  int entryCount = 0;
+  while (f.available()) { if (f.read() == '\n') entryCount++; }
+  f.seek(0);
+
+  html += "<div class='status'>" + String(entryCount) + " detection" + (entryCount != 1 ? "s" : "") + " logged</div>";
+  html += F("<table><tr><th>Time (UTC)</th><th>CH</th><th>SSID</th>"
+            "<th>BSSID</th><th>RSSI</th><th>Location</th></tr>");
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    // Format: timestamp|ch|ssid|bssid|rssi|lat|lon
+    int p1 = line.indexOf('|');
+    int p2 = line.indexOf('|', p1 + 1);
+    int p3 = line.indexOf('|', p2 + 1);
+    int p4 = line.indexOf('|', p3 + 1);
+    int p5 = line.indexOf('|', p4 + 1);
+    int p6 = line.indexOf('|', p5 + 1);
+    if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) continue;
+
+    String ts   = line.substring(0, p1);
+    String ch   = line.substring(p1 + 1, p2);
+    String ssid = line.substring(p2 + 1, p3);
+    String bssid = line.substring(p3 + 1, p4);
+    String rssi = line.substring(p4 + 1, p5 > 0 ? p5 : line.length());
+    String loc  = "";
+    if (p5 > 0 && p6 > 0) {
+      loc = line.substring(p5 + 1, p6) + ", " + line.substring(p6 + 1);
+    }
+
+    String chClass = (ch == "13") ? "ch13" : "ch14";
+    html += "<tr><td>" + ts + "</td><td class='" + chClass + "'>" + ch +
+            "</td><td>" + ssid + "</td><td>" + bssid +
+            "</td><td>" + rssi + " dBm</td><td>" + loc + "</td></tr>";
+  }
+  f.close();
+
+  html += F("</table>"
+    "<button class='btn' onclick=\"if(confirm('Clear all log entries?'))"
+    "fetch('/cleardatalog?k=" "'+new URLSearchParams(location.search).get('k'))"
+    ".then(()=>location.reload())\">Clear Log</button>"
+    "</body></html>");
+  s_wifiPortalServer.send(200, "text/html", html);
+}
+
+static void handleClearDataLog() {
+  if (!portalTokenValid()) return;
+  SD.remove(CH1314_LOG_PATH);
+  s_wifiPortalServer.send(200, "text/plain", "Log cleared");
+}
+
 static void ensureWifiPortalHandlers() {
   if (s_wifiPortalHandlersReady) return;
   s_wifiPortalServer.on("/", HTTP_GET, sendWifiPortalPage);
@@ -2567,6 +2805,12 @@ static void ensureWifiPortalHandlers() {
              s_urlOverrideEumet[0] ? s_urlOverrideEumet : "(production)");
     s_wifiPortalServer.send(200, "text/plain", resp);
   });
+  s_wifiPortalServer.on("/files", HTTP_GET, handleFileManagerPage);
+  s_wifiPortalServer.on("/lsjson", HTTP_GET, handleLsJson);
+  s_wifiPortalServer.on("/sdupload", HTTP_POST, handleSdUploadDone, handleSdUpload);
+  s_wifiPortalServer.on("/sddelete", HTTP_GET, handleSdDelete);
+  s_wifiPortalServer.on("/datalogger", HTTP_GET, handleDataLogger);
+  s_wifiPortalServer.on("/cleardatalog", HTTP_GET, handleClearDataLog);
   s_wifiPortalServer.on("/netlog", HTTP_GET, []() {
     if (!portalTokenValid()) return;
     bool on = s_wifiPortalServer.arg("on") == "1";
@@ -3337,6 +3581,57 @@ static void drawSleepModeGlyph(LGFX_Sprite& spr, int x, int y, int w, int h, boo
       }
     }
   };
+
+  if (s_ch13_14_detected) {
+    // Devil face — horns + angry eyes + fanged grin
+    static const uint32_t kDevilFace[] = {
+      0b01000000000000000010,  // horn tips
+      0b01100000000000000110,  // horn mid
+      0b01110011111111001110,  // horns meet head
+      0b00111111111111111100,
+      0b00011111111111111000,
+      0b00011111111111111000,
+      0b00111111111111111100,  // widest
+      0b00111111111111111100,
+      0b00111111111111111100,
+      0b00111111111111111100,
+      0b00011111111111111000,
+      0b00011111111111111000,
+      0b00001111111111110000,
+      0b00000111111111100000,
+      0b00000011111111000000,
+      0b00000000111100000000,
+    };
+    static const uint32_t kDevilDetail[] = {
+      0b00000000000000000000,
+      0b00000000000000000000,
+      0b00000000000000000000,
+      0b00000000000000000000,
+      0b00000000000000000000,
+      0b00000110000001100000,  // angry eye slits
+      0b00000011000011000000,  // angled brows
+      0b00000000000000000000,
+      0b00000000000000000000,
+      0b00010011111111001000,  // fanged grin: fangs + teeth
+      0b00000100000000100000,  // mouth corners
+      0b00000011111111000000,  // lower lip
+      0b00000000000000000000,
+      0b00000000000000000000,
+      0b00000000000000000000,
+      0b00000000000000000000,
+    };
+    constexpr int baseW = 20;
+    constexpr int baseH = 16;
+    int scale = min(max(1, w / baseW), max(1, h / baseH));
+    if (scale < 1) scale = 1;
+    int drawW = baseW * scale;
+    int drawH = baseH * scale;
+    int ox = x + (w - drawW) / 2;
+    int oy = y + (h - drawH) / 2;
+    drawMask(kDevilFace, baseH, baseW, baseH, ox, oy, scale, TFT_RED);
+    drawMask(kDevilDetail, baseH, baseW, baseH, ox, oy, scale, TFT_BLACK);
+    return;
+  }
 
   if (sleepEnabled) {
     static const uint32_t kSleepGlyph[] = {
@@ -6558,6 +6853,7 @@ static void exitFullscreen() {
 static void cycleDisplayMode() {
   s_displayMode = (s_displayMode + 1) % 4;
   s_prefsDirtyMs = millis() + 1000;
+  updateBarBufs(s_newestCachedIdx);
   s_moonDrawn = false;
   s_hurricaneHintDrawn = false;
   s_amoledClearBeforeNextPresent = true;
@@ -8641,6 +8937,10 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
   esp_wifi_set_protocol(WIFI_IF_STA,
     WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G |
     WIFI_PROTOCOL_11N | WIFI_PROTOCOL_11AX);
+  // Widen scan to include channels 13-14 (restricted in US, used in JP/EU)
+  wifi_country_t wc = { .cc = "JP", .schan = 1, .nchan = 14,
+                         .max_tx_power = 80, .policy = WIFI_COUNTRY_POLICY_MANUAL };
+  esp_wifi_set_country(&wc);
   int found = WiFi.scanNetworks(false, true, false, 300);
 
   // Build priority list: configured slots found in scan, sorted by RSSI
@@ -8670,6 +8970,31 @@ static bool connectWifiForSync(bool required, const char* statusLine = "Connecti
     }
   }
   s_scanCacheMs = millis();
+
+  // Check for activity on restricted channels 13/14
+  for (int i = 0; i < found; i++) {
+    uint8_t ch = (uint8_t)WiFi.channel(i);
+    if (ch == 13 || ch == 14) {
+      s_ch13_14_detected = true;
+      appendDiagLog("WIFI", "msg=ch13_14_detected ch=%d ssid=%s rssi=%d\n",
+                     ch, WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i));
+      File logF = SD.open(CH1314_LOG_PATH, FILE_APPEND);
+      if (logF) {
+        time_t now = time(nullptr);
+        struct tm tm; gmtime_r(&now, &tm);
+        char ts[32]; strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm);
+        char bssidStr[18];
+        const uint8_t* b = WiFi.BSSID(i);
+        snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 b[0], b[1], b[2], b[3], b[4], b[5]);
+        logF.printf("%s|%d|%s|%s|%d|%.4f|%.4f\n",
+                    ts, ch, WiFi.SSID(i).c_str(), bssidStr,
+                    (int)WiFi.RSSI(i), s_weatherCenterLat, s_weatherCenterLon);
+        logF.close();
+      }
+    }
+  }
+
   WiFi.scanDelete();
 
   // Sort by RSSI (strongest first)
@@ -14090,6 +14415,60 @@ void setup() {
       hardBootSyncDue = true;
     }
   }
+  // Quick scan for channels 13/14 — runs every boot regardless of safeboot
+  {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    wifi_country_t wc = { .cc = "JP", .schan = 1, .nchan = 14,
+                           .max_tx_power = 80, .policy = WIFI_COUNTRY_POLICY_MANUAL };
+    esp_wifi_set_country(&wc);
+    // Full passive scan on all 14 channels to detect ch13/14 beacons
+    wifi_scan_config_t scanCfg = {};
+    scanCfg.ssid = nullptr;
+    scanCfg.bssid = nullptr;
+    scanCfg.channel = 0;
+    scanCfg.show_hidden = true;
+    scanCfg.scan_type = WIFI_SCAN_TYPE_PASSIVE;
+    scanCfg.scan_time.passive = 300;
+    esp_wifi_scan_start(&scanCfg, true);
+    uint16_t apCount = 0;
+    esp_wifi_scan_get_ap_num(&apCount);
+    wifi_ap_record_t* apList = nullptr;
+    if (apCount > 0) {
+      apList = (wifi_ap_record_t*)malloc(apCount * sizeof(wifi_ap_record_t));
+      if (apList) esp_wifi_scan_get_ap_records(&apCount, apList);
+    }
+    s_ch13_14_detected = false;
+    for (uint16_t i = 0; i < apCount && apList; i++) {
+      if (apList[i].primary == 13 || apList[i].primary == 14) {
+        s_ch13_14_detected = true;
+        appendDiagLog("WIFI", "msg=ch13_14_detected ch=%d ssid=%s rssi=%d\n",
+                       apList[i].primary, (const char*)apList[i].ssid, apList[i].rssi);
+        // Log to SD for data logger portal
+        File logF = SD.open(CH1314_LOG_PATH, FILE_APPEND);
+        if (logF) {
+          time_t now = time(nullptr);
+          struct tm tm; gmtime_r(&now, &tm);
+          char ts[32]; strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", &tm);
+          char bssidStr[18];
+          snprintf(bssidStr, sizeof(bssidStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                   apList[i].bssid[0], apList[i].bssid[1], apList[i].bssid[2],
+                   apList[i].bssid[3], apList[i].bssid[4], apList[i].bssid[5]);
+          logF.printf("%s|%d|%s|%s|%d|%.4f|%.4f\n",
+                      ts, apList[i].primary, (const char*)apList[i].ssid,
+                      bssidStr, apList[i].rssi,
+                      s_weatherCenterLat, s_weatherCenterLon);
+          logF.close();
+        }
+      }
+    }
+    appendDiagLog("WIFI", "msg=ch14_scan found=%d detected=%d\n", (int)apCount, (int)s_ch13_14_detected);
+    if (apList) free(apList);
+    WiFi.scanDelete();
+    WiFi.disconnect(true);
+  }
+
   // Safe-boot: skip sync if crash streak ≥ 3 (geo override stays intact)
   bool safeBootNoSync = false;
   { Preferences sp; if (sp.begin("satwatch", true)) { safeBootNoSync = sp.getBool("safeboot", false); sp.end(); } }

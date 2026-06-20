@@ -1,0 +1,75 @@
+# Plan: Fix Wake Display Glitches
+
+## Problem
+Three glitches when waking from sleep:
+1. Overlays flash all at once
+2. Half/bottom of screen blank for a moment
+3. Ticker doesn't work until next animation cycle
+
+## Verified Claims
+
+| Claim | Status | Lines | Notes |
+|-------|--------|-------|-------|
+| Overlays drawn outside AMOLED lock | CORRECT | 6578-6579 | But they have their OWN internal locks |
+| s_moonDrawn reset on wake | CORRECT | 11910 | Explicitly set false |
+| Ticker recreated AFTER first frame | INCORRECT | 14405-14406 | Created BEFORE animation loop starts |
+| s_tickerShouldRun race condition | INCORRECT | 14405 | Flag set BEFORE task creation, no race |
+| Bottom rows blank from pushH conditional | CORRECT | 6542 | Ticker task owns rows 329-359 |
+
+## Revised Analysis
+
+### Glitch 1: Overlay Flash
+- Moon and hurricane overlays are drawn at lines 6578-6579 AFTER the main frame push
+- Each has its own amoledLock() internally, so no concurrent write issue
+- `s_moonDrawn = false` on wake (line 11910) causes moon to redraw on first frame
+- The "flash" is likely: stale frame push → all overlays draw on top → looks like everything appears at once
+- **Root cause**: The first frame after wake may be stale (from pre-sleep buffer) and overlays stamp onto it simultaneously
+
+### Glitch 2: Bottom Blank
+- `pushH = s_tickerTaskHandle ? (outH - SCALED_BAR_H) : outH` (line 6542)
+- Ticker task IS created before animation loop (claim was wrong)
+- But: the ticker task needs time to render its first frame and push it
+- Between task creation and first ticker push, rows 329-359 show stale AMOLED memory
+- **Root cause**: Timing gap between ticker task creation and its first AMOLED push
+
+### Glitch 3: Ticker Not Working
+- The race condition claim was INCORRECT
+- `s_tickerShouldRun = true` is set before task creation
+- But the ticker CONTENT (pre-rendered strip in PSRAM) may be stale or need re-rendering
+- The ticker width/content is set during forecast processing, not on wake
+- **Root cause**: Ticker visual state (scroll position, content) may be stale from pre-sleep state, causing it to appear frozen until the animation loop re-triggers rendering
+
+## Implementation Plan
+
+### Fix 1: Push Black Bottom Bar Before Ticker Starts
+After ticker task creation but before animation loop, push black rows to the bottom bar region:
+```cpp
+if (s_tickerTaskHandle) {
+  memset(s_botBarBuf, 0, SCALED_W * SCALED_BAR_H * 2);
+  // Push one black bottom bar to clear stale AMOLED memory
+  amoledLock();
+  s_amoledOut->draw16bitRGBBitmap(0, AMOLED_HEIGHT - SCALED_BAR_H, s_botBarBuf, SCALED_W, SCALED_BAR_H);
+  amoledUnlock();
+}
+```
+
+### Fix 2: Suppress Overlays on First Wake Frame
+Add a wake transition flag:
+```cpp
+// In goToSleep wake path:
+s_wakeTransition = true;
+
+// In presentScaledBuf, before overlay calls at line 6578:
+if (s_wakeTransition) { s_wakeTransition = false; return; }
+```
+
+### Fix 3: Reset Ticker Scroll State on Wake
+Before ticker task recreation, reset scroll position and animation state so it starts fresh.
+
+## Files to Modify
+- `esp32-LiveSat-s3/esp32-LiveSat-s3.ino` — goToSleep() wake path, presentScaledBuf(), animation loop init
+
+## Testing
+1. Sleep → wake via touch, verify no overlay flash
+2. Verify bottom bar appears immediately (no blank strip)
+3. Verify ticker animates from first cycle

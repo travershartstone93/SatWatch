@@ -1,7 +1,7 @@
 # Opus Notes — LiveSat ESP32-S3 Firmware Reference
 
 Personal reference documentation for the LiveSat firmware codebase.
-Main file: `esp32-LiveSat-s3/esp32-LiveSat-s3.ino` (~10,863 lines)
+Main file: `esp32-LiveSat-s3/esp32-LiveSat-s3.ino` (~15,400 lines)
 
 ## File Index
 
@@ -24,7 +24,7 @@ Main file: `esp32-LiveSat-s3/esp32-LiveSat-s3.ino` (~10,863 lines)
 - Config: `/home/whisper/Desktop/LiveSat/esp32-LiveSat-s3/config-s3.h`
 - Board examples: `/home/whisper/Desktop/LiveSat/ESP32-S3-Touch-AMOLED-2.06/examples/`
 - SensorLib: `/home/whisper/Arduino/libraries/SensorLib/`
-- Pitfalls doc: `/home/whisper/Desktop/LiveSat/The-fuckup-sofar.txt`
-- Fixes log: `/home/whisper/Desktop/LiveSat/S3-Fixes.txt`
-- WoM debug: `/home/whisper/Desktop/LiveSat/Shake-Wake-Issue.txt`
-- System outline: `/home/whisper/Desktop/LiveSat/LiveSat-System_outline.txt`
+- Pitfalls doc: `/home/whisper/Desktop/LiveSat/Legacy docs/The-fuckup-sofar03-08-26.txt`
+- Fixes log: `/home/whisper/Desktop/LiveSat/Legacy docs/S3-Fixes.txt`
+- WoM debug: `/home/whisper/Desktop/LiveSat/Legacy docs/Shake-Wake-Issue.txt`
+- System outline: `/home/whisper/Desktop/LiveSat/Legacy docs/LiveSat-System_outline.txt`

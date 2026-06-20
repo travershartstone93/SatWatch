@@ -1,0 +1,169 @@
+# Plan: Diagnostic Log Overhaul
+
+## Problem
+Single append-only `diag.txt` grows to 8MB, mixes all boot sessions together, has no timestamps, and is hard to parse (both for humans and LLMs). Unicode separators, inconsistent formats, no structured fields.
+
+## New Architecture
+
+### Two Files
+| File | Purpose | Lifecycle |
+|------|---------|-----------|
+| `/diag-current.log` | Current boot only | Truncated each boot |
+| `/diag.log` | Persistent multi-boot | Append each boot, rotate when >128KB |
+
+### Endpoints
+| URL | Returns | Use Case |
+|-----|---------|----------|
+| `/diag` | `diag-current.log` + live state | "What happened this boot?" (default) |
+| `/diag?full` | `diag.log` + live state | Multi-boot history |
+
+### Structured Log Format
+Every line is a consistent key=value record with fixed prefix fields:
+
+```
+t=4.237 boot=142 tag=SYNC msg=ntp_start
+t=12.881 boot=142 tag=GEO lat=51.5000 lon=-0.1000 src=bssid valid=1 label=London
+t=13.104 boot=142 tag=SYNC msg=fetchGibs_done count=94
+t=15.200 boot=142 tag=DL slot=0 len=14642 result=ok
+t=15.400 boot=142 tag=DL slot=1 len=13200 result=vld-fail reason=PARTIAL-COMPOSITE blackMcus=397
+t=28.934 boot=142 tag=SYNC msg=done saved=141 fail=3 total=144
+```
+
+Rules:
+- **`t=`** — seconds since boot, decimal with ms precision
+- **`boot=`** — boot counter (NVS persistent, increments every boot)
+- **`tag=`** — category (BOOT, WIFI, SYNC, GEO, DL, VLD, RAW, FORECAST, ZOOM, ANIM, TICKER, CUE, MEM, SLEEP)
+- **All remaining fields** — key=value pairs, no spaces in values (use underscores)
+- **No Unicode**, no decorative separators, no free-form prose
+- **One event per line**, newline terminated
+- Boot boundary is obvious: `tag=BOOT` line with `rst=` and `fw=`
+
+### Boot Header
+```
+t=1.839 boot=142 tag=BOOT rst=1 fw=7 bat=85 chg=0x14 idx=144 ready=1 frames=144
+t=1.840 boot=142 tag=BOOT hard=1 timer=0 skip=0 sync=1 hot=0
+```
+
+No separators needed — boot boundaries are trivially found by scanning for `tag=BOOT rst=`.
+
+### Boot Counter
+Stored in NVS (`bootcnt` key, uint32_t). Survives USB reflash. Embedded in every log line so multi-boot logs are trivially filterable: `grep "boot=142"`.
+
+## Implementation
+
+### 1. appendDiagLog — Dual-File Write + Structured Prefix
+Replace current impl at line ~7385:
+```cpp
+static uint32_t s_diagBootNum = 0;  // loaded from NVS at boot
+
+static void appendDiagLog(const char* tag, const char* fmt, ...) {
+  char line[300];
+  unsigned long ms = millis();
+  int pfx = snprintf(line, sizeof(line), "t=%lu.%03lu boot=%lu tag=%s ",
+                     ms / 1000, ms % 1000, (unsigned long)s_diagBootNum, tag);
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line + pfx, sizeof(line) - pfx, fmt, args);
+  va_end(args);
+  File fc = SD.open(SD_ROOT "/diag-current.log", FILE_APPEND);
+  if (fc) { fc.print(line); fc.close(); }
+  File fp = SD.open(SD_ROOT "/diag.log", FILE_APPEND);
+  if (fp) { fp.print(line); fp.close(); }
+}
+```
+
+**Signature change**: `appendDiagLog(fmt, ...)` → `appendDiagLog(tag, fmt, ...)`. Every call site gets a tag parameter.
+
+### 2. Call Site Migration
+Every `appendDiagLog("message\n")` becomes `appendDiagLog("TAG", "key=val key=val\n")`.
+
+Examples:
+```cpp
+// BEFORE:
+appendDiagLog("[SYNC] ntp start ms=%lu\n", millis());
+// AFTER:
+appendDiagLog("SYNC", "msg=ntp_start\n");
+
+// BEFORE:
+appendDiagLog("geo: loc=%s lat=%.4f lon=%.4f src=%s\n", label, lat, lon, src);
+// AFTER:
+appendDiagLog("GEO", "lat=%.4f lon=%.4f src=%s label=%s\n", lat, lon, src, label);
+
+// BEFORE:
+appendDiagLog("dl[%d]: vld-fail len=%u\n", i, len);
+// AFTER:
+appendDiagLog("DL", "slot=%d result=vld-fail len=%u\n", i, len);
+
+// BEFORE:
+appendDiagLog("rawdec[%d]: decode-fail prog=%d\n", idx, prog);
+// AFTER:
+appendDiagLog("RAW", "slot=%d result=decode-fail prog=%d\n", idx, prog);
+```
+
+### 3. Boot Init Sequence
+Replace block at lines 12361-12413:
+
+1. **Load/increment NVS boot counter** → store in `s_diagBootNum`
+2. **Rotate `diag.log`** if >128KB → delete and start fresh
+3. **Truncate `diag-current.log`** → open FILE_WRITE, close
+4. **Delete old `diag.txt`** if exists (one-time migration)
+5. **Write boot header** via appendDiagLog:
+```cpp
+appendDiagLog("BOOT", "rst=%d fw=%d bat=%d chg=0x%02X idx=%d ready=%d frames=%d\n", ...);
+appendDiagLog("BOOT", "hard=%d timer=%d skip=%d sync=%d hot=%d\n", ...);
+```
+
+### 4. Convert 9 Inline SD Writes
+Lines 12370-12508: each inline `SD.open("diag.txt")` block → `appendDiagLog("TAG", ...)`.
+
+### 5. sendDiagHandler — Serve Current vs Full
+Replace impl at line ~1758:
+- Default `/diag`: read `/diag-current.log`, append live state
+- `/diag?full`: read `/diag.log`, append live state
+- Cap at 128KB read, send as `text/plain`
+
+## Tag Reference
+
+| Tag | Usage |
+|-----|-------|
+| BOOT | Boot header, reset reason, battery, frame state |
+| WIFI | Connection attempts, success/fail, RSSI |
+| SYNC | NTP, sync plan, download loop start/end |
+| GEO | Location: BSSID, NVS load, manual override |
+| DL | Per-frame download result |
+| VLD | Frame validation detail (stb decode, partial composite) |
+| RAW | Raw cache decode result |
+| FORECAST | NWS/Open-Meteo fetch results |
+| ZOOM | Terrain zoom download/decode |
+| ANIM | Animation loop stats, cache build |
+| TICKER | Ticker task lifecycle |
+| CUE | Audio chime playback |
+| MEM | PSRAM/heap stats |
+| SLEEP | Sleep entry, wake reason |
+
+## Removals
+- `s_diagMemBuf`, `s_diagMemPos`, `s_diagMemWrapped`, `DIAG_MEM_SIZE` globals — delete
+- PSRAM ring buffer allocation in `initFrameStore()` — delete
+- `?recent` code path — replaced by default `/diag`
+- Unicode `════` separators — gone
+- Old `diag.txt` — deleted on first boot
+
+## Files to Modify
+- `esp32-LiveSat-s3/esp32-LiveSat-s3.ino` only:
+  - Delete s_diagMemBuf globals (~line 484-488)
+  - Add `s_diagBootNum` global
+  - Rewrite appendDiagLog signature + impl (~line 7385)
+  - Rewrite sendDiagHandler (~line 1758)
+  - Rewrite boot diag init (~line 12361-12413)
+  - Delete ring buffer alloc from initFrameStore (~line 7419)
+  - Convert ALL appendDiagLog call sites to use tag parameter (~178 calls)
+  - Convert 9 inline SD.open diag writes to appendDiagLog calls
+
+## Testing
+1. `curl satwatch.local/diag` — current boot, structured, parseable
+2. `curl satwatch.local/diag?full` — multi-boot, grep-friendly
+3. `grep "boot=142" diag.log` — filter single boot from full log
+4. `grep "tag=DL result=vld-fail"` — find all download failures
+5. `grep "tag=GEO"` — trace location changes
+6. Verify boot counter increments
+7. Verify `diag.log` stays under 128KB

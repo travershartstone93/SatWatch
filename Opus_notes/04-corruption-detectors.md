@@ -108,7 +108,7 @@ Every detector, its purpose, thresholds, and where it's wired.
 - Fires at freeze-hold time (end of animation loop)
 - Walks backward from newest frame until a clean frame is found
 - For each corrupt frame detected:
-  - `SD.remove(fNNN.jpg)` — removes source JPEG
-  - `SD.remove(RAW_CACHE_META_FILE)` + `s_rawMetaVersionCurrent = false` — forces raw rebuild
-- Next boot: rolling sync redownloads missing files, raw rebuild completes cleanly
+  - Clears `s_idx.jpegValid[i]` and `s_idx.rawValid[i]`, writes index
+  - Marks `s_streamValid[i] = 0` so playback skips the slot
+- Next sync: rolling sync redownloads slots with cleared validity
 - Only fires on NEWEST frames (lag boundary) — mid-animation corruption is not caught here

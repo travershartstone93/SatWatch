@@ -71,13 +71,13 @@ After full erase: flash entire `merged.bin` via `esptool`.
 | `BOARD_IS_AMOLED_206` | derived | Enables AMOLED-specific code paths |
 | `BOARD_HAS_SDMMC` | derived | SD_MMC vs SPI SD |
 | `BOARD_HAS_PSRAM_SPRITES` | derived | PSRAM sprite allocation |
-| `RAW_CACHE_VERSION` | main .ino | Bump to force raw rebuild |
+| `INDEX_MAGIC` | main .ino | 0x4C534658 — index.bin format marker |
 | `WEATHER_VIEW_VERSION` | main .ino | Bump to force weather redownload |
 
 ## Source Files
 | File | Purpose |
 |------|---------|
-| `esp32-LiveSat-s3.ino` | Main firmware (~10,863 lines) |
+| `esp32-LiveSat-s3.ino` | Main firmware (~15,400 lines) |
 | `config-s3.h` | User-editable config (WiFi, timing, timezone) |
 | `es8311.h` / `es8311.c` | ES8311 audio codec driver |
 | `es8311_reg.h` | ES8311 register definitions |

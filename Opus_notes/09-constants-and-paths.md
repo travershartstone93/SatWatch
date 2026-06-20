@@ -36,7 +36,7 @@
 ## Meta/Cache Versions
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `RAW_CACHE_VERSION` | 34 | Bump: force one-time raw rebuild |
+| `INDEX_MAGIC` | 0x4C534658 | "LSFX" — index.bin format magic |
 | `CACHE_VALIDATE_VERSION` | 2 | Bump: force cache repair scan |
 | `ZOOM_META_VERSION` | 6 | Bump: force zoom asset rebuild |
 | `WEATHER_VIEW_VERSION` | 5 | Bump: force weather redownload |
@@ -47,12 +47,10 @@ All paths relative to card root (no "/sdcard" prefix):
 
 ### Frame Cache
 ```
-/frames/fNNN.jpg          Final validated JPEG frames (N=000..143)
-/frames/nNNN.jpg          Temp frames during rolling update
-/frames/meta.txt          Frame count (single integer)
-/frames/times.bin         time_t[] array of frame timestamps
+/frames/frames.bin        Contiguous JPEG store (64KB slots × 144)
+/frames/index.bin         FrameStoreIndex struct (magic, ring head, timestamps, validity)
+/frames/index.tmp         Temp index during atomic writes
 /frames/stream.raw        Contiguous pre-scaled RGB565 playback stream
-/frames/raw.meta          Version + validity bitmap + slot map
 /frames/dim.cfg           Frame dimensions "320 176"
 /frames/view.meta         Bbox/layer/cadence signature
 /frames/validate.meta     Cache integrity marker

@@ -10,11 +10,11 @@ Decode viability (JPEGDEC, geometry check)
     ↓
 Structural pixel validation (10+ detectors)
     ↓
-Atomic install (*.part → verify → re-decode → rename to fNNN.jpg)
+Write to frames.bin slot + update index.bin (ring buffer, timestamps, validity)
     ↓
-times.bin (timestamps), meta.txt (frame count), dim.cfg (geometry)
+dim.cfg (geometry), view.meta (bbox/layer signature)
     ↓
-Raw cache build: decode fNNN.jpg → scale 410×360 → stream.raw slot
+Raw cache build: decode JPEG from frames.bin → scale 410×360 → stream.raw slot
     (semantic + size outlier checks at admission)
     ↓
 Gap fill: nearest-neighbor copy for invalid slots
@@ -63,14 +63,11 @@ See [04-corruption-detectors.md](04-corruption-detectors.md) for full catalog.
 - `weatherFrameLooksSemanticOutlier()`: per-tile color signatures vs neighbors
 
 ## SD File Layout (`/frames/`)
-| File | Purpose | Size per entry |
-|------|---------|----------------|
-| `fNNN.jpg` | Final validated JPEG frames (N=000..143) | ~15-30 KB |
-| `nNNN.jpg` | Temp frames during rolling update | ~15-30 KB |
-| `meta.txt` | Frame count (single integer) | tiny |
-| `times.bin` | `time_t[]` array of frame UTC timestamps | 4 bytes × N |
-| `stream.raw` | Contiguous pre-scaled RGB565 playback stream | 295,200 bytes/slot |
-| `raw.meta` | Version + validity bitmap + slot map | ~300 bytes |
+| File | Purpose | Size |
+|------|---------|------|
+| `frames.bin` | Contiguous JPEG store (64KB slots × 144) | ~9 MB |
+| `index.bin` | FrameStoreIndex struct (ring head, timestamps, validity) | ~2.5 KB |
+| `stream.raw` | Pre-scaled RGB565 playback stream (295,200 bytes/slot) | ~42.5 MB |
 | `dim.cfg` | Frame dimensions "320 176" | tiny |
 | `view.meta` | Bbox/layer/cadence signature | tiny |
 | `validate.meta` | Cache integrity marker | tiny |
@@ -80,18 +77,20 @@ See [04-corruption-detectors.md](04-corruption-detectors.md) for full catalog.
 ## Raw Cache (stream.raw)
 - Slot size: 410 × 360 × 2 = 295,200 bytes (pre-scaled RGB565)
 - Total for 144 frames: ~42.5 MB
-- Build paths:
-  1. `buildRawPlaybackCache()`: full rebuild — decode every JPEG
-  2. `rebuildRawPlaybackCacheRolling()`: copy unchanged slots + rebuild new ones (temp file → rename)
-  3. `remapRawPlaybackCacheRolling()`: in-place reuse via `s_streamSlotMap[]` indirection
-- All paths run validation: slab → partial → hold-block → cyan-block → botband → size outlier → semantic outlier
+- Build path: `rebuildRawFromStored()` — iterates index, decodes each valid JPEG from frames.bin into stream.raw
+- Validation gates: slab → partial → hold-block → cyan-block → botband → topband-white → size outlier → semantic outlier
 - Failed slots zeroed → gap-filled by nearest neighbor
 
-## raw.meta Format
-- Byte 0: version (RAW_CACHE_VERSION = 34)
-- Bytes 1-144: `s_streamValid[]` — 1=valid, 0=invalid per slot
-- Bytes 145-288: `s_streamSlotMap[]` — logical→physical slot mapping
-- Runtime guard: if meta=1 but zero valid slots (vbm=0) → force invalidate + rebuild
+## index.bin Format (`FrameStoreIndex` struct)
+- `magic` (uint32): `INDEX_MAGIC` = 0x4C534658 ("LSFX")
+- `head` (uint16): ring buffer head position
+- `count` (uint16): number of slots in use
+- `times[144]` (time_t): UNIX timestamp per frame
+- `jpegLen[144]` (uint32): JPEG byte length per slot in frames.bin
+- `jpegValid[144]` (uint8): 1=valid JPEG, 0=invalid
+- `rawValid[144]` (uint8): 1=valid decoded raw, 0=needs rebuild
+- On load: SOI-byte integrity check on each jpegValid slot; clears both jpegValid+rawValid on fail
+- `s_streamValid[]` populated from `s_idx.rawValid[]` at load time
 
 ## Gap Fill
 - `gapFillInvalidStreamSlotsInFile()`: copies nearest valid neighbor's raw data into zero slots

@@ -1,0 +1,161 @@
+# LiveSat Open Issues — Summary for Fable Review
+# Date: 2026-06-09
+# Context: ESP32-S3 weather satellite watch (Waveshare ESP32-S3-Touch-AMOLED-2.06)
+# Firmware: ~14,600 lines, Arduino framework, FreeRTOS, PSRAM, SD card, AMOLED display
+# All plan docs are attached separately as plan-*.txt
+
+## What Has Been Completed This Session
+
+### 1. OTA Firmware Updates (DONE)
+- Added HTTPUpdate-based OTA via GitHub Releases (travershartstone93/LiveSat-OTA)
+- Portal UI: Check for Update / Install Update buttons
+- deploy-ota.sh script: compile + gh release create
+- Partition scheme changed from single factory to dual OTA (custom partitions.csv)
+- Tested and working: v7→v8 via USB, v8→v9 via OTA wirelessly
+- GitHub redirect handling (HTTPC_STRICT_FOLLOW_REDIRECTS) required for both version check and firmware download
+
+### 2. Diagnostic Log Overhaul (DONE)
+- Replaced single 8MB diag.txt with dual-file system: diag-current.log (current boot) + diag.log (persistent multi-boot)
+- /diag returns current boot only; /diag?full returns multi-boot history
+- Every line is structured: t=4.237 boot=142 tag=SYNC msg=ntp_start
+- NVS boot counter on every line for grep filtering
+- 189 call sites converted to new appendDiagLog("TAG", "fmt", ...) signature
+- Rotation: diag.log deleted when >128KB
+- Old diag.txt deleted on first boot
+
+### 3. Sleep Power Drain (MOSTLY DONE)
+- AMOLED_PWR_EN (GPIO 21) driven LOW before sleep — biggest savings
+- ES8311 codec powered down via raw register writes (not just muted)
+- SDMMC pins set to pulldown input after SD_MMC.end()
+- AMOLED power-off had to be moved to right before esp_light_sleep_start() (after all I2C/SD ops) because doing it earlier killed I2C bus for touch hibernate command
+- User confirmed battery improvement
+- s_audioReady set false to force full ES8311 re-init on wake
+
+### 4. WiFi Portal Persistence (DONE)
+- disconnectWifiAfterSync() was killing WiFi when connection dropped during long zoom/terrain downloads
+- Added reconnect logic: if WiFi lost after sync, retry connection before giving up
+- Portal now stays accessible during animation playback
+- Verified: checkupdate and OTA work during playback
+
+### 5. Wake Display Glitches (PARTIALLY DONE)
+- Added s_wakeTransition flag to suppress overlay drawing on first frame after wake
+- Push black bottom bar immediately after ticker task creation
+- Reset s_tickerScrollPx to 0 before ticker recreation
+- User reports glitches are "slightly better" but still present
+
+### 6. International Coverage Prep (PARTIALLY DONE)
+- selectSatelliteForLon() updated: GOES-West <-110°, GOES-East -110° to -15°, MTG -15° to +80°, Himawari >+80°
+- buildWeatherFrameUrl() dual-endpoint: EUMETVIEW_WMS_BASE vs GIBS_WMS_BASE based on s_activeSourceIsEumetview
+- isProgressiveJpeg() function: scans JPEG data for SOF2 marker, independent of source flag
+- stb_image fallback in both validateBufferedWeatherFrameJpeg and decodeAndWriteRawSlot
+- /teststb and /testvld test endpoints: single-frame EUMETView download+decode works perfectly
+- s_geoManualOverride NVS flag for /setlocation persistence
+- Crash guard: clears geoman on ESP_RST_PANIC/WDT to prevent boot loops
+- loadWeatherViewCenterFromCache() guarded with !s_geoManualOverride
+
+---
+
+## Open Issues — Questions for Fable
+
+### ISSUE 1: EUMETView 144-Frame Sync Crashes
+
+**What happens:** Setting location to London and clearing frames triggers a full EUMETView sync. The device downloads progressive JPEG frames from view.eumetsat.int. Single-frame test (/testvld) works perfectly (13KB, 200ms decode, validation passes). But syncing 144 frames crashes the device (watchdog/panic reset).
+
+**What we know:**
+- WiFiClientSecure + HTTPClient are created ONCE and reused with http.setReuse(true)
+- readHttpJpegBodyToDlBuf uses writeToStream() which handles chunked transfer encoding correctly
+- isProgressiveJpeg() correctly detects SOF2 and routes to stb_image
+- stb_image decodes in a 16KB FreeRTOS task on Core 1 with PSRAM malloc hooks
+- The crash guard (clears geoman on panic/WDT) fires, confirming it's a crash not a logic error
+
+**Questions for Fable:**
+1. ESP32 Arduino WiFiClientSecure is known to leak ~100 bytes per HTTPS connection even with setReuse(true). Over 144 connections to EUMETView (different host than GIBS), does the TLS session cache actually get reused, or does each http.begin() with the same client create a new TLS session? Is the leak in internal DRAM (which would be fatal) or PSRAM?
+
+2. EUMETView uses chunked transfer encoding. When http.setReuse(true) is set, does HTTPClient actually keep the TCP connection alive with chunked responses, or does it close after each response? If it closes, each of 144 requests creates a new TLS handshake.
+
+3. Should we add heap monitoring (heap_caps_get_free_size(MALLOC_CAP_INTERNAL)) every 20 frames and abort if internal RAM drops below 40KB? What's the minimum internal RAM needed for WiFi+TLS to function?
+
+4. Would requesting FORMAT=image/png from EUMETView avoid the progressive JPEG issue entirely? PNG can be decoded by pngle (already used for RainViewer tiles in the old international.ino). Tradeoff: 2-5x larger files. Is this worth pursuing?
+
+5. Should we add a 100-200ms delay between EUMETView frame downloads to avoid potential rate limiting? EUMETSAT Data Store docs say 10 req/s unauthenticated limit — does EUMETView WMS share this?
+
+6. Alternative approach: could we download all 144 frames as JPEG to SD first (without decoding), then decode them from SD in a second pass? This would separate the TLS session lifecycle from the stb_image decode lifecycle, potentially avoiding the memory pressure.
+
+### ISSUE 2: Wake Display Glitches (Partially Fixed)
+
+**What happens:** When the watch wakes from light sleep via button press, there are visual glitches for the first ~1 second:
+- Overlays (moon complication, possibly clock) appear to flash/draw simultaneously
+- Bottom bar area may show stale content briefly
+- Ticker animation may be frozen or wrong for the first cycle
+
+**What we've done:**
+- Added s_wakeTransition flag that suppresses drawMoonComplication() and drawHurricaneRebootHint() on the first presentScaledBuf() call after wake
+- Push black bottom bar (memset + draw16bitRGBBitmap) right after ticker task creation
+- Reset s_tickerScrollPx to 0 before ticker task recreation
+- User says "slightly better but still glitches"
+
+**What we verified is NOT the cause:**
+- Ticker task IS created before the animation loop starts (not after first frame)
+- s_tickerShouldRun IS set before xTaskCreatePinnedToCore (no race condition)
+- Overlay functions DO have their own internal amoledLock() (no write collision)
+
+**Questions for Fable:**
+1. The AMOLED display (CO5300) was powered off before sleep (AMOLED_PWR_EN LOW) and powered back on after wake. Does the CO5300 need a specific initialization delay after power-on before accepting pixel data? The current code does displayOn() + setBrightness() immediately. Should there be a delay or re-init sequence?
+
+2. The s_wakeTransition flag suppresses overlays on ONE frame. But presentScaledBuf is called from multiple places — could the first call after wake be from a different code path (like the cache loading loop or the zoom display) rather than the main animation loop?
+
+3. The stale content issue: s_frameDisplayBuf contains the last frame from before sleep. On wake, the animation loop reads frames from the PSRAM cache (s_animCache, kept across sleep). The first frame pushed is from the cache upscale. Could the upscale be producing visual artifacts because the cache was built with a different byte order or the sprite buffer state is stale?
+
+4. Is there a better approach than suppressing overlays? For example, should we push a full black frame to the AMOLED before displayOn() to ensure no stale pixels are visible, then immediately push the first real frame?
+
+5. The ticker task runs on Core 1 at priority 2. After wake, it's recreated and starts its loop. Could there be a timing issue where the main loop (Core 0) pushes a frame with pushH=329 (excluding bottom bar) before the ticker task has had a chance to run even once? The vTaskDelay in the ticker loop is 32-35ms jittered.
+
+### ISSUE 3: WiFi Scan-First Connection (Not Started)
+
+**What happens:** On boot, connectWifiForSync tries all 5 configured WiFi slots sequentially with 10-20 second timeouts each. If the primary network is absent but a backup is present, it wastes 10-20 seconds timing out on the primary before trying the backup.
+
+**Proposed fix:** Do a WiFi.scanNetworks() first (~2 seconds), match results against configured SSIDs, try the strongest visible match first with a shorter timeout.
+
+**Questions for Fable:**
+1. WiFi.scanNetworks() temporarily disconnects any active connection. Since connectWifiForSync always starts disconnected, this should be safe. But does the scan interfere with subsequent WiFi.begin() on ESP32-S3? Any known issues with scan→connect sequences?
+
+2. The BSSID geolocation (bssidGeoLocate) does its own WiFi.scanNetworks() later in the sync. If we scan in connectWifiForSync, can we cache the scan results and reuse them for BSSID geo to avoid scanning twice?
+
+3. Should hidden networks (not broadcasting SSID) still fall through to blind sequential connect as a fallback after scan-matched networks are tried?
+
+### ISSUE 4: Sleep Power — Remaining Items
+
+**What's done:** AMOLED power off, ES8311 power down, SDMMC pin config.
+**What's open:** AXP2101 LDO disable, QMI8658 IMU standby.
+
+**Questions for Fable:**
+1. We don't have the board schematic for the Waveshare ESP32-S3-Touch-AMOLED-2.06. The AXP2101 PMIC has registers 0x90-0x9C for LDO enable/voltage control. These are NEVER written in the firmware. Can you determine from the Waveshare wiki, datasheet, or community sources which ALDO/BLDO rails power which peripherals? Which can be safely disabled during sleep?
+
+2. The QMI8658 IMU is never initialized or managed in this firmware at all. It sits at I2C 0x6B in whatever power-on default state. Writing 0x00 to register 0x02 (CTRL7) should disable all sensors. Is this safe to do before sleep without ever having initialized the IMU? Could it leave the I2C bus in a bad state?
+
+3. GPIO 21 (AMOLED_PWR_EN) is shared with QMI8658 INT1. We drive it LOW before sleep for AMOLED power savings. Does this affect the IMU's INT1 output in any way that could cause unexpected wake events or current draw?
+
+### ISSUE 5: Geo Manual Override Reliability
+
+**What happens:** The /setlocation endpoint sets s_geoManualOverride=true in NVS to prevent BSSID geolocation from overwriting the manual location. This works on the current boot, but on reboot there are multiple code paths that can reset the location:
+- loadWeatherViewCenterFromCache() restores old coordinates from view.meta on SD (FIXED: guarded with !s_geoManualOverride)
+- BSSID geolocation in refreshDisplayLocationTimeFromIpInfo() is blocked when s_geoManualOverride=true (WORKING)
+- Crash guard clears geoman on panic/WDT reset (INTENTIONAL: prevents boot loops)
+
+**But:** When we set London + clear frames, the device crashes during EUMETView sync (Issue 1), the crash guard fires, geoman is cleared, BSSID overwrites back to BVI, and the device boots with BVI. This makes it impossible to test international coverage end-to-end.
+
+**Question for Fable:**
+1. Is the crash guard (clear geoman on panic) the right approach? It prevents boot loops but also makes it impossible to persist a manual location through a crash. Alternative: count consecutive crashes and only clear geoman after 3+ crashes in a row?
+
+2. Should the manual override be tied to the portal "Save and Reboot" button instead of /setlocation? The user could add a "Location Override" field to the portal settings card, and it would be cleared by "Clear Frames & Reboot" explicitly rather than implicitly by crash detection.
+
+---
+
+## Architecture Notes for Context
+
+- Main file: esp32-LiveSat-s3/esp32-LiveSat-s3.ino (~14,600 lines)
+- stb_decode.cpp: standalone progressive JPEG decoder (68 lines, 16KB FreeRTOS task)
+- international.ino: test endpoints for EUMETView (/teststb, /testdl, /testvld)
+- Build: arduino-cli, FQBN esp32:esp32:waveshare_esp32_s3_touch_amoled_206:PSRAM=enabled,PartitionScheme=custom
+- No USB serial console — all debugging via SD diag log + curl to portal
+- OTA via GitHub Releases: travershartstone93/LiveSat-OTA

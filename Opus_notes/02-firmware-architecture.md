@@ -13,11 +13,11 @@ Two-phase state machine:
 5. Button poll task init (FreeRTOS, core 1)
 6. Audio cue preload to PSRAM
 7. Boot type detection: hard boot / timer wake / GPIO wake
-8. SD cache check: `readMetaCount()`, dimension check via `dim.cfg`
+8. SD cache check: `loadIndex()`, dimension check via `dim.cfg`
 9. **Sync decision**: `needSync = hardBootSyncDue || timerWake || !framesReady || autoUpdateDue`
-10. If needSync: WiFi connect → `syncFramesRolling()` → fallback `downloadFrames()` → zoom/terrain refresh
+10. If needSync: WiFi connect → `syncWeatherFrames()` → zoom/terrain refresh
 11. If no sync but hard boot: WiFi → NTP → IP geolocation → zoom refresh if needed
-12. Raw cache stale check → `buildRawPlaybackCache()` if needed
+12. Raw cache stale check → `rebuildRawFromStored()` if needed
 13. `ensureStreamOpen()`, rebuild if needed
 14. Restore brightness, arm start cue, enter `loop()`
 
@@ -47,9 +47,9 @@ Two-phase state machine:
 - `s_sleepModeEnabled`, `s_autoUpdateInSleep`: sleep policy
 
 ## Key Runtime State (regular RAM, lost on any sleep)
-- `s_frameTimes[MAX_FRAMES]`: per-frame UTC timestamps from `times.bin`
-- `s_streamValid[MAX_FRAMES]`: validity bitmap for stream.raw slots
-- `s_streamSlotMap[MAX_FRAMES]`: logical→physical mapping for stream.raw
+- `s_idx` (`FrameStoreIndex`): ring-buffer index for frames.bin (magic, head, count, times, jpegLen, validity)
+- `s_frameTimes[MAX_FRAMES]`: per-frame UTC timestamps (populated from `s_idx.times[]`)
+- `s_streamValid[MAX_FRAMES]`: validity bitmap for stream.raw slots (from `s_idx.rawValid[]`)
 - `s_validIdx[MAX_FRAMES]`: indices of valid frames for playback
 - `s_validCount`: count of valid frames
 - `s_streamFile`: open File handle for stream.raw during playback

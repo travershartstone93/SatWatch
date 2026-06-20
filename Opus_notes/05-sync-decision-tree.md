@@ -56,10 +56,8 @@ if (detectForwardWindowShift > 0):
 
 ### Gate 5: General Rolling Path
 For each target slot timestamp:
-- If exact timestamp exists in cache and `cachedFrameLooksReusable()`: reuse
-- Else: download that slot
-- Uses `/frames/nNNN.jpg` temp staging → commit to `/frames/fNNN.jpg`
-- Raw slot provenance tracked via `rawSourceIdx`
+- If exact timestamp exists in index and slot has valid JPEG: reuse
+- Else: download that slot → write to frames.bin ring slot → update index.bin
 
 ### Gate 6: Partial-Window Tolerance
 ```
@@ -88,18 +86,13 @@ Cache count < target is VALID state — not treated as failure.
 
 ## Raw Cache Coupling
 After weather sync completes:
-1. **Remap** (`remapRawPlaybackCacheRolling`): if old raw is current and slot mapping known — fastest
-2. **Rolling rebuild** (`rebuildRawPlaybackCacheRolling`): copy unchanged + rebuild new into temp → rename
-3. **Full rebuild** (`buildRawPlaybackCache`): decode all JPEGs — slowest fallback
+- `rebuildRawFromStored()`: iterates `s_idx`, decodes each valid JPEG slot from frames.bin → stream.raw
+- Skips slots already marked `rawValid` in the index (incremental when possible)
 
 ## Key Functions
-- `cachedFrameLooksReusable()`: file exists + size >= 7000 + SOI + EOI (does NOT decode)
-- `commitTempFrames()`: delete all fNNN.jpg → rename all nNNN.jpg → fNNN.jpg (non-transactional!)
-- `readMetaCount()`: reads frame count from meta.txt
-- `writeMetaCount()`: writes frame count to meta.txt
-- `loadFrameTimes()` / `saveFrameTimes()`: load/save times.bin
+- `loadIndex()` / `writeIndex()`: read/write `FrameStoreIndex` struct (index.bin)
+- `ensureStreamOpen()`: opens stream.raw, triggers `rebuildRawFromStored()` if needed
 - `writeCurrentFrameDimMeta()`: writes dim.cfg (must be called after every cache install)
 
-## Caution: commitTempFrames() Is Non-Transactional
-Steps: (1) delete all fNNN.jpg, (2) rename all nNNN.jpg to fNNN.jpg.
-Power loss between steps = partially destroyed cache. No recovery mechanism exists.
+## Caution: Index Write Atomicity
+`writeIndex()` writes to `index.tmp` then renames to `index.bin`. Power loss mid-write loses temp but preserves last good index.

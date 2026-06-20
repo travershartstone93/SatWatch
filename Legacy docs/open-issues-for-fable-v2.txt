@@ -1,0 +1,108 @@
+# LiveSat Open Issues v2 — Escalation to Fable
+# Date: 2026-06-10
+# Current firmware: v13 (OTA deployed)
+# Previous session resolved: OTA, diag overhaul, UDP live log, flight recorder,
+#   battery canary, WiFi scan-first, sleep power fixes, portal auth token,
+#   mock satellite server, host tests, geo override crash streak, background sync scaffold
+
+## ISSUE A: Sleep Button Intermittently Non-Responsive (REGRESSION, CRITICAL)
+
+### Symptom
+The top button (BOOT, GPIO 0) sometimes stops putting the device to sleep.
+- Works for the first few minutes after boot
+- After some time, pressing the button does nothing
+- Holding it long enough triggers AXP2101 hardware power-off (not firmware)
+- After a reboot (power cycle or AXP long-press), button works again for a while
+- Pattern: works → stops → works after reboot → stops again
+
+### What We Know
+- The button poll task (topButtonPollTask, priority 3, Core 1) is created at boot
+- serviceUserButtons() is called in the animation loop and checks for short press → goToSleep(true)
+- The button debounce uses a state machine with s_topBtnStablePressed, s_topBtnReleasePending
+- Live UDP log confirms sleep/wake DOES work sometimes — we captured successful wake_reconnect events
+- No diagnostic logging inside serviceUserButtons — we can't see if the function runs, if the button state machine detects presses, or where the press is being swallowed
+
+### What We Don't Know
+1. Is topButtonPollTask still running when the button stops working? Could it have been killed or starved?
+2. Is s_topBtnIgnoreUntilRelease stuck true from some code path?
+3. Is suppressUntilMs set to a future value that never expires?
+4. Is the GPIO 0 pin being reconfigured by something (WiFi scan, SD_MMC, the background WiFi reconnect task)?
+5. Is the animation loop calling serviceUserButtons frequently enough, or is something blocking the loop?
+6. Could the background WiFi reconnect task (spawned in loop() on wake) interfere with the button poll task?
+
+### Questions for Fable
+1. The WiFi reconnect after wake now runs in a background FreeRTOS task (lambda, 4096 stack, Core 0, priority 1). Does WiFi.begin() or WiFi.scanNetworks() reconfigure GPIO 0 on ESP32-S3? GPIO 0 is a strapping pin — could WiFi driver operations affect it?
+
+2. Should we add periodic diagnostic logging inside serviceUserButtons to see what's happening? Something like every 5 seconds: log the button state machine values (stablePressed, releasePending, ignoreUntilRelease, suppressUntilMs, allowAction).
+
+3. The button poll task runs at priority 3 on Core 1. The ticker task also runs on Core 1 at priority 2. The stb decode worker runs on Core 1 at priority 1. Could priority inversion or starvation prevent the button poll task from running?
+
+4. Is there a known ESP32-S3 issue where GPIO 0 reads stop working after WiFi.scanNetworks() or WiFi.begin()?
+
+
+## ISSUE B: Forecast API Returns Zero Data (INTERMITTENT)
+
+### Symptom
+The forecast fetch (NWS + Open-Meteo fallback) returns zero hourly and daily entries on some boots. When this happens, the ticker has no content to render and doesn't appear.
+- Previous boots on the same firmware had forecast working fine (hr=12 dy=5)
+- The fetch takes a long time (26s→89s = 63 seconds) and returns nothing
+- Both NWS and Open-Meteo fallback return zero data
+
+### What We Know
+- Device location is BVI (18.41, -64.62) — NWS should work for US territories
+- Open-Meteo is the fallback and was working on earlier boots
+- The forecast code itself hasn't changed — this is the same code that worked on v9-v11
+- The fetch function runs after sync, with WiFi already connected
+- forecast valid=0, hr=0, dy=0, nws=0
+
+### Questions for Fable
+1. Could the WiFi scan-first rewrite be affecting HTTP connections made after the scan? The scan creates and destroys connections — could it leave the HTTP client in a bad state?
+
+2. The NWS grid URL is cached in s_nwsGridUrlValid. After an OTA reboot, is this RTC_DATA_ATTR variable garbage? Could it be pointing to an invalid grid URL, causing NWS to fail, and then Open-Meteo also fails?
+
+3. Should we add more granular logging inside fetchNwsHourlyForecast/fetchNwsDailyForecast/fetchOpenMeteoFallback to see which specific HTTP request fails and with what error code?
+
+
+## ISSUE C: Background Sync Not Yet Tested (NEW, Phase 4)
+
+### What Was Implemented
+- autoUpdateDueNow() now spawns bgFullSyncTask instead of ESP.restart()
+- Cooperative cancel via s_bgSyncCancel flag
+- Slot busy-skip in showFrame (s_slotBusy)
+- Cache refresh at loop boundary (s_animCacheRefreshPending)
+
+### What Hasn't Been Tested
+- The bg sync task shares s_dlBuf, sprite, and s_frameDisplayBuf with the animation loop
+  (Fable's plan called for sync-private buffers — E1 — which we did NOT implement)
+- The sync functions (syncWeatherFrames, fetchForecastData, etc.) still write to the shared globals
+- A collision between the bg sync writing s_frameDisplayBuf while the animation loop reads it could cause torn frames or crashes
+
+### Questions for Fable
+1. Is the current implementation (shared buffers, no E1) safe to test, or will it definitely crash?
+2. Should we gate bgFullSyncTask behind an NVS toggle ("legacy reboot sync" escape hatch) so the user can fall back if it crashes?
+3. The plan calls for a PSRAM reserve (ANIM_CACHE_PSRAM_RESERVE) to ensure bg sync has memory. Without sync-private buffers, is this still needed?
+
+
+## ISSUE D: presentFirstWakeFrame Crashes (UNRESOLVED)
+
+### Symptom
+Calling presentFirstWakeFrame() in the wake path after displayOn causes the device to not wake (crash during wake → silent re-sleep via crash guard).
+
+### What We Know
+- The function pushes frame data to GRAM, draws moon complication, draws hurricane hint
+- s_frameDisplayBuf is in PSRAM and survives light sleep
+- drawMoonComplication requires s_moonBuf to be valid
+- The AMOLED controller (CO5300) accepts GRAM writes while in DISPOFF state
+
+### Questions for Fable
+1. Which specific buffer is likely null after sleep? s_moonBuf? The sprite? s_botBarBuf?
+2. Could the issue be that AMOLED QSPI needs the full init sequence after power was cut (AMOLED_PWR_EN was LOW during sleep), not just displayOn?
+3. Should we guard each draw call with null checks and add a diagnostic endpoint that reports which buffers are valid?
+
+
+## Current Firmware State (v13)
+- Sleep/wake: intermittently broken (Issue A)
+- Forecast/ticker: intermittently missing (Issue B)
+- Background sync: implemented but untested, likely unsafe without private buffers (Issue C)
+- Wake display compose-then-reveal: disabled due to crash (Issue D)
+- Everything else from the session works: OTA, diag, UDP log, battery canary, WiFi scan-first, portal auth
