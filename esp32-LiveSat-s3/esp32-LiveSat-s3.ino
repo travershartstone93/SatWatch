@@ -96,7 +96,7 @@
 // ─────────────────────────────────────────────────────────────
 //  OTA firmware update
 // ─────────────────────────────────────────────────────────────
-#define FIRMWARE_VERSION    31
+#define FIRMWARE_VERSION    43
 #define OTA_VERSION_URL  "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/version.json"
 #define OTA_FIRMWARE_URL "https://github.com/travershartstone93/LiveSat-OTA/releases/latest/download/firmware.bin"
 
@@ -184,7 +184,11 @@ static NullSerialSink s_nullSerial;
 #define WIFI_PORTAL_AP_SSID  "Sat Watch"
 // AP password derived from chip MAC at runtime — see s_portalApPass[]
 #define WIFI_PORTAL_AP_PASS  s_portalApPass
-#define WIFI_PORTAL_HOSTNAME "satwatch"
+// Hostname derived at runtime from chip eFuse MAC — see initDeviceHostname()
+static char s_portalHostname[24] = "satwatch";
+static char s_portalHostnameDotLocal[32] = "satwatch.local";
+static uint16_t s_deviceId = 0;
+#define WIFI_PORTAL_HOSTNAME s_portalHostname
 #define ZOOM_SNAPSHOT_META_FILE SD_ROOT "/frames/zoom.meta"
 
 // ── Pre-allocated frame store (replaces per-frame .jpg files) ──
@@ -658,6 +662,11 @@ static volatile bool s_syncSuppressUi = false;
 static volatile uint32_t s_pmuPendingIrq = 0;
 static TaskHandle_t s_pmuTaskHandle = nullptr;
 
+// SOC history ring — sampled every 30s from PMU task, stores last 120 entries (1 hour)
+struct SocSample { uint32_t uptimeS; int8_t soc; };
+static SocSample s_socRing[120];
+static volatile int s_socRingHead = 0, s_socRingCount = 0;
+
 // PSRAM animation cache (file-scope for bg sync splice access)
 static uint16_t* s_animCache = nullptr;
 static int       s_animCacheCount = 0;
@@ -912,6 +921,13 @@ static void refreshWifiDisplayNameFromConfig() {
     }
   }
   snprintf(s_wifiDisplayName, sizeof(s_wifiDisplayName), "%s", WIFI_SSID);
+}
+
+static void initDeviceHostname() {
+  uint64_t efuse = ESP.getEfuseMac();
+  s_deviceId = (uint16_t)((efuse >> 32) ^ (efuse >> 16) ^ efuse);
+  snprintf(s_portalHostname, sizeof(s_portalHostname), "satwatch-%04x", s_deviceId);
+  snprintf(s_portalHostnameDotLocal, sizeof(s_portalHostnameDotLocal), "%s.local", s_portalHostname);
 }
 
 static void loadWifiPortalConfig() {
@@ -1427,17 +1443,21 @@ static void sendWifiPortalPage() {
   html += F(">Fast boot (skip sync when cache is fresh)</label></div>");
   html += F("</div>");
   html += F("<div class='hint'>Portal AP: Sat Watch / 123456789</div>");
-  html += F("<div class='hint'>Portal URL: http://satwatch.local/</div>");
+  html += "<div class='hint'>Portal URL: http://";
+  html += s_portalHostnameDotLocal;
+  html += "/</div>";
   if (WiFi.status() == WL_CONNECTED) {
     html += F("<div class='hint'>Local portal: ");
     html += htmlEscape(WiFi.localIP().toString().c_str());
     html += F("</div>");
   }
-  html += F("<div class='hint' style='margin-top:12px;border-top:1px solid #444;padding-top:12px'>"
-            "<b>GPS Tracking (mobile use):</b><br>"
-            "Open <a href='/track' style='color:#38bdf8'>satwatch.local/track</a> in Safari, "
-            "then tap Share &rarr; Add to Home Screen.<br>"
-            "Tap the icon anytime to push iPhone GPS to the watch.</div>");
+  html += "<div class='hint' style='margin-top:12px;border-top:1px solid #444;padding-top:12px'>"
+           "<b>GPS Tracking (mobile use):</b><br>"
+           "Open <a href='/track' style='color:#38bdf8'>";
+  html += s_portalHostnameDotLocal;
+  html += "/track</a> in Safari, "
+           "then tap Share &rarr; Add to Home Screen.<br>"
+           "Tap the icon anytime to push iPhone GPS to the watch.</div>";
   html += F("</div>");
   html += F("<script>"
             "var s_rowCount=0;"
@@ -2765,6 +2785,19 @@ static void ensureWifiPortalHandlers() {
     }
   });
   s_wifiPortalServer.on("/diag", HTTP_GET, sendDiagHandler);
+  s_wifiPortalServer.on("/devinfo", HTTP_GET, []() {
+    String json = "{\"devId\":\"";
+    char idStr[8]; snprintf(idStr, sizeof(idStr), "%04X", s_deviceId);
+    json += idStr;
+    json += "\",\"hostname\":\"";
+    json += s_portalHostname;
+    json += "\",\"token\":\"";
+    json += s_portalToken;
+    json += "\",\"fw\":";
+    json += FIRMWARE_VERSION;
+    json += "}";
+    s_wifiPortalServer.send(200, "application/json", json);
+  });
   s_wifiPortalServer.on("/ls", HTTP_GET, sendLsHandler);
   s_wifiPortalServer.on("/clearframes", HTTP_POST, handleClearFrames);
   s_wifiPortalServer.on("/hwclearsup", HTTP_POST, handleClearHurricaneSuppression);
@@ -2812,6 +2845,107 @@ static void ensureWifiPortalHandlers() {
   s_wifiPortalServer.on("/sddelete", HTTP_GET, handleSdDelete);
   s_wifiPortalServer.on("/datalogger", HTTP_GET, handleDataLogger);
   s_wifiPortalServer.on("/cleardatalog", HTTP_GET, handleClearDataLog);
+  s_wifiPortalServer.on("/powerprofile", HTTP_GET, []() {
+
+    int soc = (int)readAxp2101BatPct();
+    int chgState = readAxp2101ChargeState();
+    bool charging = (chgState >= 0) && (chgState & 0x60) == 0x20;
+    bool vbusPresent = false;
+    { int s0 = readAxp2101Register(0x00); vbusPresent = (s0 >= 0) && (s0 & 0x20); }
+
+    // Read which AXP2101 LDO/DCDC rails are enabled (0x80 = DCDC on/off, 0x90 = LDO on/off)
+    int dcdcEn = readAxp2101Register(0x80);
+    int ldoEn  = readAxp2101Register(0x90);
+
+    // Subsystem states
+    bool wifiOn = (WiFi.getMode() != WIFI_OFF);
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+    int  wifiRssi = wifiConnected ? WiFi.RSSI() : 0;
+    bool portalHttp = s_wifiPortalHttpRunning;
+    bool portalAp = s_wifiPortalApActive;
+    bool displayOn = true;
+    #if BOARD_IS_AMOLED_206
+    // no direct query — infer from brightness
+    #endif
+    bool audioReady = s_audioReady;
+    bool sdMounted = (bool)SD_MMC.cardType();
+    bool bleScanner = s_scannerMode;
+    bool syncActive = s_syncProgActive;
+    bool syncSuppressUi = s_syncSuppressUi;
+    uint32_t cpuMhz = getCpuFrequencyMhz();
+    uint32_t uptimeMs = millis();
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t freePsram = ESP.getFreePsram();
+
+    // Estimated mA per active subsystem
+    struct Sub { const char* name; bool on; int mA_est; };
+    Sub subs[] = {
+      {"cpu",           true,          (int)(cpuMhz >= 240 ? 67 : cpuMhz >= 160 ? 46 : 33)},
+      {"wifi_radio",    wifiOn,        wifiConnected ? 50 : (portalAp ? 40 : 0)},
+      {"wifi_portal",   portalHttp,    5},
+      {"amoled",        !syncSuppressUi, (int)s_displayBrightness * 40 / 255},
+      {"sd_card",       sdMounted,     syncActive ? 80 : 1},
+      {"audio_codec",   audioReady,    8},
+      {"pa_amp",        false,         0},
+      {"ble",           bleScanner,    bleScanner ? 110 : 0},
+      {"touch",         true,          1},
+      {"imu",           bleScanner,    bleScanner ? 4 : 0},
+      {"psram",         true,          2},
+      {"pmic_quiescent",true,          1},
+    };
+    int totalEst = 0;
+    for (auto& s : subs) if (s.on) totalEst += s.mA_est;
+
+    // Compute drain rate from SOC ring (pct/hour)
+    float drainPctPerHr = 0;
+    if (s_socRingCount >= 2) {
+      int oldest = (s_socRingCount < 120) ? 0 : s_socRingHead;
+      int newest = (s_socRingHead + 120 - 1) % 120;
+      int dtS = (int)s_socRing[newest].uptimeS - (int)s_socRing[oldest].uptimeS;
+      int dSoc = (int)s_socRing[oldest].soc - (int)s_socRing[newest].soc;
+      if (dtS > 0) drainPctPerHr = (float)dSoc * 3600.0f / (float)dtS;
+    }
+
+    String json = "{";
+    // Battery
+    json += "\"soc_pct\":" + String(soc);
+    json += ",\"drain_pct_per_hr\":" + String(drainPctPerHr, 1);
+    json += ",\"charging\":" + String(charging ? "true" : "false");
+    json += ",\"vbus\":" + String(vbusPresent ? "true" : "false");
+    // Rails
+    json += ",\"dcdc_en\":\"0x" + String(dcdcEn >= 0 ? dcdcEn : 0, HEX) + "\"";
+    json += ",\"ldo_en\":\"0x" + String(ldoEn >= 0 ? ldoEn : 0, HEX) + "\"";
+    // System
+    json += ",\"cpu_mhz\":" + String(cpuMhz);
+    json += ",\"uptime_s\":" + String(uptimeMs / 1000);
+    json += ",\"free_heap\":" + String(freeHeap);
+    json += ",\"free_psram\":" + String(freePsram);
+    json += ",\"brightness\":" + String((int)s_displayBrightness);
+    // Subsystems
+    json += ",\"subsystems\":[";
+    for (int i = 0; i < (int)(sizeof(subs)/sizeof(subs[0])); i++) {
+      if (i > 0) json += ",";
+      json += "{\"name\":\"" + String(subs[i].name) + "\"";
+      json += ",\"on\":" + String(subs[i].on ? "true" : "false");
+      json += ",\"est_mA\":" + String(subs[i].mA_est) + "}";
+    }
+    json += "]";
+    json += ",\"total_est_mA\":" + String(totalEst);
+    // SOC history (oldest→newest)
+    json += ",\"soc_history\":[";
+    for (int i = 0; i < s_socRingCount; i++) {
+      int idx = (s_socRingCount < 120) ? i : (s_socRingHead + i) % 120;
+      if (i > 0) json += ",";
+      json += "[" + String(s_socRing[idx].uptimeS) + "," + String(s_socRing[idx].soc) + "]";
+    }
+    json += "]";
+    // WiFi detail
+    json += ",\"wifi\":{\"mode\":\"" + String(wifiOn ? (portalAp ? "AP_STA" : "STA") : "OFF") + "\"";
+    json += ",\"connected\":" + String(wifiConnected ? "true" : "false");
+    json += ",\"rssi\":" + String(wifiRssi) + "}";
+    json += "}";
+    s_wifiPortalServer.send(200, "application/json", json);
+  });
   s_wifiPortalServer.on("/netlog", HTTP_GET, []() {
     if (!portalTokenValid()) return;
     bool on = s_wifiPortalServer.arg("on") == "1";
@@ -3030,6 +3164,20 @@ static void audioCueWorkerTask(void* arg) {
                     (int)s_audioCueReady, (s_audioCueBuf != nullptr), (unsigned)s_audioCueLen);
     }
     s_audioCueBusy = false;
+    // Power down codec after cue — saves ~8mA until next cue
+    if (s_audioReady) {
+      es8311_voice_mute(s_audioCodec, true);
+      digitalWrite(46, LOW);
+      Wire.beginTransmission(0x18);
+      Wire.write(0x0D); Wire.write(0x00);
+      Wire.endTransmission();
+      Wire.beginTransmission(0x18);
+      Wire.write(0x00); Wire.write(0x1F);
+      Wire.endTransmission();
+      s_audioPathPrimed = false;
+      s_audioReady = false;
+      appendDiagLog("CUE", "msg=codec_powerdown\n");
+    }
   }
 }
 
@@ -3121,6 +3269,12 @@ static bool writeAxp2101Register(uint8_t reg, uint8_t value) {
 
 static void configureAxp2101PowerKey() {
 #if BOARD_IS_AMOLED_206
+  // Disable TS pin battery temp detection — prevents shutdown when no battery connected
+  int tsCfg = readAxp2101Register(0x16);
+  if (tsCfg >= 0) {
+    writeAxp2101Register(0x16, (uint8_t)(tsCfg | 0x04));  // TS pin → external input, not bat temp
+  }
+
   int cfg = readAxp2101Register(0x27);  // IRQ_OFF_ON_LEVEL_CTRL
   if (cfg >= 0) {
     cfg &= ~0x0C;  // bits[3:2] = 00 => 4s power-off hold
@@ -3131,6 +3285,10 @@ static void configureAxp2101PowerKey() {
     inten2 |= 0x0F;  // pkey positive/negative/long/short
     writeAxp2101Register(0x41, (uint8_t)inten2);
   }
+  // Enable VBAT ADC for voltage monitoring (reg 0x30, bit 2)
+  int adcEn = readAxp2101Register(0x30);
+  if (adcEn >= 0) writeAxp2101Register(0x30, (uint8_t)(adcEn | 0x04));
+
   // Clear ALL three IRQ status registers
   writeAxp2101Register(0x48, 0xFF);
   writeAxp2101Register(0x49, 0xFF);
@@ -3139,6 +3297,7 @@ static void configureAxp2101PowerKey() {
   // Launch PMU polling task — reads IRQ registers via I2C from a safe task context
   if (!s_pmuTaskHandle) {
     xTaskCreatePinnedToCore([](void*) {
+      uint32_t socNextMs = 0;
       for (;;) {
         int s1 = readAxp2101Register(0x48);
         int s2 = readAxp2101Register(0x49);
@@ -3148,9 +3307,20 @@ static void configureAxp2101PowerKey() {
         if (s2 > 0) { writeAxp2101Register(0x49, (uint8_t)s2); combined |= (uint32_t)s2 << 8; }
         if (s3 > 0) { writeAxp2101Register(0x4A, (uint8_t)s3); combined |= (uint32_t)s3 << 16; }
         if (combined) s_pmuPendingIrq |= combined;
+        // Sample SOC every 30s into ring buffer
+        uint32_t now = millis();
+        if (now >= socNextMs) {
+          socNextMs = now + 30000;
+          int8_t sNow = readAxp2101BatPct();
+          if (sNow >= 0) {
+            s_socRing[s_socRingHead] = { now / 1000, sNow };
+            s_socRingHead = (s_socRingHead + 1) % 120;
+            if (s_socRingCount < 120) s_socRingCount++;
+          }
+        }
         vTaskDelay(pdMS_TO_TICKS(150));
       }
-    }, "pmu", 2048, nullptr, 1, &s_pmuTaskHandle, 0);
+    }, "pmu", 2560, nullptr, 1, &s_pmuTaskHandle, 0);
   }
 #endif
 }
@@ -3252,10 +3422,10 @@ static void showWifiPortalJoinInfo(bool canSkip = false) {
     s_amoledOut->setCursor(8, y);
     s_amoledOut->print("Enter in browser");
     y += 34;  // keep spacing consistent with other sections
-    s_amoledOut->setTextSize(6);  // 6x requested
+    s_amoledOut->setTextSize(5);
     s_amoledOut->setCursor(8, y);
-    s_amoledOut->print("satwatch");
-    y += 46;
+    s_amoledOut->print(s_portalHostname);
+    y += 40;
     s_amoledOut->setCursor(8, y);
     s_amoledOut->print(".local");
     if (canSkip) {
@@ -3285,7 +3455,9 @@ static void showWifiPortalJoinInfo(bool canSkip = false) {
   tft.print("Password: " WIFI_PORTAL_AP_PASS);
   y += 16;
   tft.setCursor(4, y);
-  tft.print("URL: http://satwatch.local/");
+  tft.print("URL: http://");
+  tft.print(s_portalHostnameDotLocal);
+  tft.print("/");
   y += 16;
   tft.setCursor(4, y);
   tft.print("Join AP then open URL");
@@ -8919,6 +9091,7 @@ static bool tryConnectSlot(int slot, const char* title, bool showStatus, int max
                 s_wifiConfig[slot].ssid, WiFi.localIP().toString().c_str(),
                 WiFi.RSSI(), WiFi.channel());
   refreshCachedWifiDisplayState();
+  enableWifiPowerSave();
   return true;
 }
 
@@ -9282,11 +9455,22 @@ static void topButtonPollTask(void*) {
   }
 }
 
+static void enableWifiPowerSave() {
+  wifi_config_t wconf;
+  esp_wifi_get_config(WIFI_IF_STA, &wconf);
+  wconf.sta.listen_interval = 10;
+  esp_wifi_set_config(WIFI_IF_STA, &wconf);
+  esp_wifi_set_ps(WIFI_PS_MAX_MODEM);
+  appendDiagLog("WIFI", "msg=power_save_max_modem\n");
+}
+
+
 static void disconnectWifiAfterSync() {
   // If WiFi is still connected, keep it up and start the portal server
   if (WiFi.status() == WL_CONNECTED) {
     appendDiagLog("WIFI", "msg=post-sync_portal_start ip=%s\n", WiFi.localIP().toString().c_str());
     startWifiPortalServer(false);
+    enableWifiPowerSave();
     return;
   }
   // WiFi dropped during sync — try to reconnect for portal
@@ -9303,6 +9487,7 @@ static void disconnectWifiAfterSync() {
       appendDiagLog("WIFI", "msg=reconnected ssid=%s ip=%s\n",
                     s_wifiConfig[slot].ssid, WiFi.localIP().toString().c_str());
       startWifiPortalServer(false);
+      enableWifiPowerSave();
       return;
     }
   }
@@ -12433,9 +12618,18 @@ static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
           s_forecast.hourly[idx].windSpeedKmh = (uint16_t)(ws > 999 ? 999 : ws);
           s_forecast.hourly[idx].windDirDeg16 = (uint8_t)((int)roundf(wd) / 16);
           int wci = (int)wc;
-          if (wci >= 95) strlcpy(s_forecast.hourly[idx].shortForecast, "Thunderstorm", 32);
+          int pp = s_forecast.hourly[idx].precipProbability;
+          if (wci >= 95) {
+            if (pp >= 50) strlcpy(s_forecast.hourly[idx].shortForecast, "Thunderstorm", 32);
+            else if (pp >= 20) strlcpy(s_forecast.hourly[idx].shortForecast, "Sct Showers", 32);
+            else strlcpy(s_forecast.hourly[idx].shortForecast, "Cloudy", 32);
+          }
           else if (wci >= 71) strlcpy(s_forecast.hourly[idx].shortForecast, "Snow", 32);
-          else if (wci >= 61) strlcpy(s_forecast.hourly[idx].shortForecast, "Rain", 32);
+          else if (wci >= 61) {
+            if (pp >= 50) strlcpy(s_forecast.hourly[idx].shortForecast, "Rain", 32);
+            else if (pp >= 20) strlcpy(s_forecast.hourly[idx].shortForecast, "Chance Rain", 32);
+            else strlcpy(s_forecast.hourly[idx].shortForecast, "Cloudy", 32);
+          }
           else if (wci >= 51) strlcpy(s_forecast.hourly[idx].shortForecast, "Drizzle", 32);
           else if (wci >= 3) strlcpy(s_forecast.hourly[idx].shortForecast, "Cloudy", 32);
           else strlcpy(s_forecast.hourly[idx].shortForecast, "Clear", 32);
@@ -12491,9 +12685,18 @@ static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
           s_forecast.daily[idx].precipProbability = (uint8_t)(precip > 100 ? 100 : (precip < 0 ? 0 : (int)precip));
           int wci = (int)wc;
           s_forecast.daily[idx].weatherCode = (uint8_t)(wci > 99 ? 99 : (wci < 0 ? 0 : wci));
-          if (wci >= 95) strlcpy(s_forecast.daily[idx].shortForecast, "Thunderstorm", 32);
+          int dpp = s_forecast.daily[idx].precipProbability;
+          if (wci >= 95) {
+            if (dpp >= 50) strlcpy(s_forecast.daily[idx].shortForecast, "Thunderstorm", 32);
+            else if (dpp >= 20) strlcpy(s_forecast.daily[idx].shortForecast, "Sct Showers", 32);
+            else strlcpy(s_forecast.daily[idx].shortForecast, "Cloudy", 32);
+          }
           else if (wci >= 71) strlcpy(s_forecast.daily[idx].shortForecast, "Snow", 32);
-          else if (wci >= 61) strlcpy(s_forecast.daily[idx].shortForecast, "Rain", 32);
+          else if (wci >= 61) {
+            if (dpp >= 50) strlcpy(s_forecast.daily[idx].shortForecast, "Rain", 32);
+            else if (dpp >= 20) strlcpy(s_forecast.daily[idx].shortForecast, "Chance Rain", 32);
+            else strlcpy(s_forecast.daily[idx].shortForecast, "Cloudy", 32);
+          }
           else if (wci >= 51) strlcpy(s_forecast.daily[idx].shortForecast, "Drizzle", 32);
           else if (wci >= 3) strlcpy(s_forecast.daily[idx].shortForecast, "Cloudy", 32);
           else strlcpy(s_forecast.daily[idx].shortForecast, "Clear", 32);
@@ -13593,6 +13796,8 @@ static void goToSleep(bool buttonOnly = false) {
 
   // Cut AMOLED power rail last (after all I2C/SD done, ~30-50mA savings)
   digitalWrite(LCD_PWR, LOW);
+  gpio_hold_en((gpio_num_t)LCD_PWR);      // hold LOW during light sleep
+  gpio_hold_en(GPIO_NUM_46);              // hold PA amp off during light sleep
 
   // Outer loop: timer wakes sync silently and re-sleep; button wakes break out.
   esp_sleep_wakeup_cause_t wake;
@@ -13629,9 +13834,9 @@ static void goToSleep(bool buttonOnly = false) {
 
     // ── Timer wake: silent background sync, then re-sleep ──
     if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
+      Wire.begin(SDA, SCL);
+      int8_t socPre = readAxp2101BatPct();
       s_syncSuppressUi = true;  // C3: prevent QSPI writes to unpowered panel
-      // Free PSRAM cache for sync (needs memory for downloads)
-      if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; s_lastCacheSlot = -1; }
       // Silent background sync — mount SD, sync, unmount, re-sleep
       bool sdOk = false;
       for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
@@ -13646,7 +13851,7 @@ static void goToSleep(bool buttonOnly = false) {
         }
       }
       if (sdOk) {
-        appendDiagLog("SLEEP", "msg=timer-wake sd=ok\n");
+        appendDiagLog("SLEEP", "msg=timer-wake sd=ok soc_pre=%d\n", (int)socPre);
         if (s_hurricaneMode && s_hurricaneWatchEnabled) {
           hurricaneRecheckAndUpdate();
         }
@@ -13680,6 +13885,7 @@ static void goToSleep(bool buttonOnly = false) {
           appendDiagLog("SLEEP", "msg=timer-wake_sync_done nextSec=%d\n", nextSec);
           if (nextSec > 0) esp_sleep_enable_timer_wakeup((uint64_t)nextSec * 1000000ULL);
         }
+        { int8_t sp = readAxp2101BatPct(); appendDiagLog("SLEEP", "msg=timer-wake_soc_post soc=%d\n", (int)sp); }
         SD_MMC.end();
         sdmmcPinsForSleep();
       } else {
@@ -13687,6 +13893,7 @@ static void goToSleep(bool buttonOnly = false) {
         int nextSec = secondsUntilNextUpdate();
         if (nextSec > 0) esp_sleep_enable_timer_wakeup((uint64_t)nextSec * 1000000ULL);
       }
+      Wire.end();
       s_syncSuppressUi = false;
       continue;  // re-enter outer loop → sleep again
     }
@@ -13710,6 +13917,10 @@ static void goToSleep(bool buttonOnly = false) {
   // Log which GPIO actually woke us
   appendDiagLog("SLEEP", "wake gpio0=%d gpio38=%d\n",
                 gpio_get_level(GPIO_NUM_0), gpio_get_level(GPIO_NUM_38));
+
+  // Release GPIO holds from sleep
+  gpio_hold_dis((gpio_num_t)LCD_PWR);
+  gpio_hold_dis(GPIO_NUM_46);
 
   // Restore AMOLED power rail with soft-start delay
   panelPowerOn();
@@ -14031,12 +14242,86 @@ void setup() {
     }
   }
 
+  // ── Scanner mode check (before heavy init) ──────────────────────────────
+  {
+    Preferences sp;
+    if (sp.begin("satwatch", true)) {
+      s_scannerMode = sp.getBool("scanmode", false);
+      sp.end();
+    }
+  }
+
   Serial.println("[INIT] Wire.begin");
   Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
   if (!s_i2cMutex) s_i2cMutex = xSemaphoreCreateMutex();
+  initDeviceHostname();
   Serial.println("[INIT] loadWifiPortalConfig");
   loadWifiPortalConfig();  // needed before QMI decision below
   configureAxp2101PowerKey();
+
+  if (s_scannerMode) {
+    Serial.println("[SCANNER MODE] Booting as BLE scanner only");
+#if BOARD_IS_AMOLED_206
+    if (s_amoledOut) {
+      s_amoledOut->begin();
+      s_amoledOut->setRotation(0);
+      s_amoledOut->setBrightness(0);
+      s_amoledOut->fillScreen(0x0000);
+    }
+    // Mount SD for diag logging
+    SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
+    bool sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
+    if (!sdOk) {
+      SD_MMC.end();
+      sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+    }
+    Serial.printf("[SCANNER] SD %s\n", sdOk ? "OK" : "FAIL");
+#endif
+    // Diag log init
+    {
+      Preferences diagPrefs;
+      if (diagPrefs.begin("satwatch", false)) {
+        s_diagBootNum = diagPrefs.getUInt("bootcnt", 0) + 1;
+        diagPrefs.putUInt("bootcnt", s_diagBootNum);
+        diagPrefs.getString("token", s_portalToken, sizeof(s_portalToken));
+        if (s_portalToken[0] == '\0') {
+          uint32_t r = esp_random();
+          snprintf(s_portalToken, sizeof(s_portalToken), "%06x", r & 0xFFFFFF);
+          diagPrefs.putString("token", s_portalToken);
+        }
+        diagPrefs.end();
+      }
+      File diagCheck = SD.open(SD_ROOT "/diag.log", FILE_READ);
+      if (diagCheck) {
+        size_t dsize = diagCheck.size();
+        if (dsize > 128UL * 1024UL) {
+          const size_t keepBytes = 64UL * 1024UL;
+          uint8_t* tail = (uint8_t*)heap_caps_malloc(keepBytes, MALLOC_CAP_SPIRAM);
+          if (tail) {
+            diagCheck.seek(dsize - keepBytes);
+            size_t rd = diagCheck.readBytes((char*)tail, keepBytes);
+            diagCheck.close();
+            File dw = SD.open(SD_ROOT "/diag.log", FILE_WRITE);
+            if (dw) { dw.write(tail, rd); dw.close(); }
+            heap_caps_free(tail);
+          } else {
+            diagCheck.close();
+            SD.remove(SD_ROOT "/diag.log");
+          }
+        } else {
+          diagCheck.close();
+        }
+      }
+      { File fc = SD.open(SD_ROOT "/diag-current.log", FILE_WRITE); if (fc) fc.close(); }
+      appendDiagLog("BOOT", "rst=%d fw=%d mode=scanner token=%s\n",
+                    (int)esp_reset_reason(), FIRMWARE_VERSION, s_portalToken);
+    }
+    // Connect WiFi (scan for known networks)
+    connectWifiForSync(false, nullptr);
+    startWifiPortalServer(WiFi.status() != WL_CONNECTED);
+    scannerModeLoop();  // never returns
+  }
+
   Serial.printf("reset reason: %d\n", (int)esp_reset_reason());
   Serial.printf("free heap: %u\n", (unsigned)ESP.getFreeHeap());
   Serial.println("\n== Geo Weather Loop ==");
@@ -16002,7 +16287,24 @@ static bool spriteLooksTopBandWhite() {
   uint32_t topAvg = topLum / topCount;
   uint32_t botAvg = botLum / botCount;
   // White top band: top avg > 400 (out of ~500 max) AND much brighter than bottom
-  return (topAvg > 400 && botAvg < 300 && topAvg > botAvg * 2);
+  if (topAvg > 400 && botAvg < 300 && topAvg > botAvg * 2) return true;
+  // Yellow placeholder band: high R+G, low B in top 20%
+  uint32_t topR = 0, topG = 0, topB = 0;
+  for (int y = 0; y < topRows; y += 2) {
+    for (int x = 0; x < DISP_W; x += 4) {
+      uint16_t c = px[y * DISP_W + x];
+      if (swapped) c = __builtin_bswap16(c);
+      topR += (c >> 11) & 0x1F;
+      topG += (c >> 5) & 0x3F;
+      topB += c & 0x1F;
+    }
+  }
+  if (topCount > 0) {
+    uint32_t avgR = topR / topCount, avgG = topG / topCount, avgB = topB / topCount;
+    if (avgR > 24 && avgG > 40 && avgB < 10 && botAvg < 300)
+      return true;
+  }
+  return false;
 }
 
 static bool spriteLooksBottomBandJunkCorrupted() {
@@ -16273,6 +16575,7 @@ void loop() {
     if (wifiReconSlot >= 0) {
       if (WiFi.status() == WL_CONNECTED) {
         startWifiPortalServer(false);
+        enableWifiPowerSave();
         int connectedSlot = wifiReconSlot > 0 ? wifiReconSlot - 1 : 0;
         appendDiagLog("WIFI", "msg=wake_reconnect ssid=%s ip=%s\n",
                       s_wifiConfig[connectedSlot].ssid, WiFi.localIP().toString().c_str());
@@ -16341,7 +16644,9 @@ void loop() {
 #endif
 
   if (!framesReady || frameCount == 0) {
-    showMessage("No frames", "satwatch.local/diag");
+    char diagUrl[48];
+    snprintf(diagUrl, sizeof(diagUrl), "%s/diag", s_portalHostnameDotLocal);
+    showMessage("No frames", diagUrl);
     // Keep portal alive during no-frames state so diag is accessible
     for (uint32_t t0 = millis(); millis() - t0 < 5000; ) {
       serviceWifiPortalServer();
@@ -16427,12 +16732,36 @@ void loop() {
     }
   }
 
-  // Auto-update: foreground reboot (bg sync crashes due to shared sprite/dlBuf)
+  // Auto-update: inline sync (no reboot — saves ~2min full-power boot overhead)
   if (autoUpdateDueNow()) {
-    showMessage("Auto update", "Resyncing...");
-    delayWithInputPoll(300);
-    SD_MMC.end();
-    ESP.restart();
+    appendDiagLog("SYNC", "msg=inline-update_start\n");
+    if (s_streamFile) { s_streamFile.close(); s_streamReady = false; }
+    if (connectWifiForSync(false)) {
+      if (s_hurricaneWatchEnabled && !s_hurricaneMode) {
+        HurricaneInfo hStorms[4]; int hCount = 0;
+        if (pollNoaaForHurricane(hStorms, 4, &hCount)) {
+          cleanupSuppressedStorms(hStorms, hCount);
+          for (int hi = 0; hi < hCount; hi++) {
+            if (!isStormSuppressed(hStorms[hi].id)) {
+              enterHurricaneMode(hStorms[hi]);
+              break;
+            }
+          }
+        }
+      }
+      syncWeatherFrames();
+      fetchForecastData();
+      downloadMoonFramesIfMissing();
+      s_zoomSnapshotsRefreshPending = true;
+      maybeRefreshPendingZoomSnapshots();
+      noteSuccessfulScanNow();
+      disconnectWifiAfterSync();
+    }
+    ensureStreamOpen();
+    s_validCount = -1;
+    if (s_animCache) { heap_caps_free(s_animCache); s_animCache = nullptr; s_animCacheCount = 0; s_lastCacheSlot = -1; }
+    decodeMoonPhase();
+    appendDiagLog("SYNC", "msg=inline-update_done\n");
   }
 
   // Loop timing: animation + 2s hold + 3×1s zoom + ~1s terrain + clock ≈ 17-28s.
@@ -16550,7 +16879,10 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
             dst[dy * CACHE_W + x] = srcRow[x * SCALED_W / CACHE_W];
         }
         s_animCacheCount++;
-        if ((ci & 15) == 15) { yield(); }
+        if ((ci & 15) == 15) {
+          yield();
+          if (!syncProgressIsActive()) presentScaledBuf(s_frameDisplayBuf);
+        }
         if (syncProgressIsActive()) syncProgressTick(1);
       }
       if (syncProgressIsActive()) syncProgressCompletePhase();
@@ -16869,10 +17201,15 @@ appendDiagLog("ANIM", "jlen[%03d]=%s\n", row, buf);
   }
 
   // Freeze: reload full-res frame from SD (animation used low-res PSRAM cache)
+  uint32_t postAnimT0 = millis();
   pollCleanModeToggle();
   int holdFrameIdx = (lastDisplayedFrameIdx >= 0) ? lastDisplayedFrameIdx : newestIdx;
   showFrame(holdFrameIdx, true);
+  uint32_t postAnimT1 = millis();
   runFreezeZoom3LocatorCue(latestFrameHoldMs, holdFrameIdx);
+  uint32_t postAnimT2 = millis();
+  appendDiagLog("PERF", "msg=post-anim showFrame=%ums freezeCue=%ums\n",
+                postAnimT1 - postAnimT0, postAnimT2 - postAnimT1);
 
   // Zoom + terrain stages — each step is wall-clock governed so decode time is
   // included in the step budget, keeping the total loop time predictable.
@@ -17011,11 +17348,13 @@ appendDiagLog("TICKER", "msg=during-wipe push=%u skip=%u\n",
                 loopElapsedMs, loopExpectedMs, loopDriftMs,
                 (double)animFps, animFramesPushed, animationDurationMs);
 
-  // Low-battery protection: force sleep at critically low SOC
+  // Low-battery protection: force sleep at critically low SOC (skip if USB powered)
   {
     static uint8_t s_lowBatConsec = 0;
     int8_t bp = readAxp2101BatPct();
-    if (bp >= 0 && bp <= 3) {
+    int cs = readAxp2101ChargeState();
+    bool usbPowered = (cs >= 0) && (cs & 0x01);
+    if (bp >= 0 && bp <= 3 && !usbPowered) {
       s_lowBatConsec++;
       if (s_lowBatConsec >= 3) {
         appendDiagLog("BAT", "msg=critical_shutdown pct=%d\n", (int)bp);
