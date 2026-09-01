@@ -1,5 +1,5 @@
 /*
- * esp32-caribbean-s3.ino
+ * esp32-LiveSat-s3.ino
  *
  * Location-aware weather loop, ported to ESP32-S3 targets.
  * Current S3 hardware path supports:
