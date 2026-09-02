@@ -1,10 +1,10 @@
-# SatWatch — LiveSat firmware
+# SatWatch: LiveSat firmware
 
 Firmware for **LiveSat**, an ESP32-S3 smartwatch that shows a live 24-hour loop
 of GOES-East satellite weather imagery on your wrist, with hurricane/storm
 alerts for your location.
 
-It's a single-sketch Arduino build (`esp32-LiveSat-s3.ino`) — deliberately one
+It's a single-sketch Arduino build (`esp32-LiveSat-s3.ino`), deliberately one
 file for easy flashing. Section markers inside the sketch divide the major
 subsystems.
 
@@ -39,8 +39,8 @@ Timing, loop counts, and sleep cadence are configured in `config-s3.h`.
 
 ## Files
 
-- `esp32-LiveSat-s3.ino` — the application (single-sketch build)
-- `config-s3.h` — build-time configuration
-- `flags_rgb565.h` — generated pixel data, do not edit
-- `es8311.*` — vendored audio codec driver
-- `partitions.csv`, `max_app_32MB.csv` — flash partition tables
+- `esp32-LiveSat-s3.ino`: the application (single-sketch build)
+- `config-s3.h`: build-time configuration
+- `flags_rgb565.h`: generated pixel data, do not edit
+- `es8311.*`: vendored audio codec driver
+- `partitions.csv`, `max_app_32MB.csv`: flash partition tables

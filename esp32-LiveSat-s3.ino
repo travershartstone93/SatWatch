@@ -166,7 +166,7 @@ static NullSerialSink s_nullSerial;
 #define WEATHER_VIEW_META_FILE SD_ROOT "/frames/view.meta"
 #define CACHE_VALIDATE_META_FILE SD_ROOT "/frames/validate.meta"
 #define WIFI_PORTAL_AP_SSID  "Sat Watch"
-// AP password derived from chip MAC at runtime — see s_portalApPass[]
+// AP password derived from chip MAC at runtime - see s_portalApPass[]
 #define WIFI_PORTAL_AP_PASS  s_portalApPass
 #define WIFI_PORTAL_HOSTNAME "satwatch"
 #define ZOOM_SNAPSHOT_META_FILE SD_ROOT "/frames/zoom.meta"
@@ -294,7 +294,7 @@ public:
       cfg.panel_height   = 320;      // physical panel height (portrait native)
       cfg.memory_width   = 240;      // ST7789 internal GRAM width
       cfg.memory_height  = 320;      // ST7789 internal GRAM height
-      cfg.offset_x       = 34;       // (240-172)/2 — centres 172px panel in 240px GRAM
+      cfg.offset_x       = 34;       // (240-172)/2 - centres 172px panel in 240px GRAM
       cfg.offset_y       = 0;
       cfg.offset_rotation = 0;
       cfg.dummy_read_pixel = 8;
@@ -361,11 +361,11 @@ static const int SCALED_TOP_ROW_H = SCALED_BAR_H;
 static const int SCALED_TOP_BAR_H = SCALED_BAR_H * 2;
 static const int SCALED_BAR_SPRITE_H = SCALED_BAR_H;
 
-// Pre-scaled display frame (410×360×2 = 295,200 bytes) — allocated from PSRAM in setup()
+// Pre-scaled display frame (410×360×2 = 295,200 bytes) - allocated from PSRAM in setup()
 static uint16_t* s_frameDisplayBuf   = nullptr;
-// Terrain wipe pre-load (295,200 bytes) — loaded from SD once before wipe starts
+// Terrain wipe pre-load (295,200 bytes) - loaded from SD once before wipe starts
 static uint16_t* s_terrainDisplayBuf = nullptr;
-// Persistent top/bottom timestamp bars at 410×SCALED_BAR_H — overlaid every present.
+// Persistent top/bottom timestamp bars at 410×SCALED_BAR_H - overlaid every present.
 static uint16_t* s_topBarBuf = nullptr;
 static uint16_t* s_botBarBuf = nullptr;
 
@@ -414,7 +414,7 @@ static int activeLagHours();
 static void selectSatelliteForLon(float lonDeg, bool force = false);
 
 // ─────────────────────────────────────────────────────────────
-//  RTC memory — survives deep sleep, cleared on power cycle
+//  RTC memory - survives deep sleep, cleared on power cycle
 // ─────────────────────────────────────────────────────────────
 RTC_DATA_ATTR static bool   framesReady = false;
 RTC_DATA_ATTR static int    loopsDone   = 0;
@@ -429,11 +429,11 @@ RTC_DATA_ATTR static int     s_activeLagHours = GIBS_LAG_HOURS;
 RTC_DATA_ATTR static char    s_activeGibsLayer[48] = WEATHER_LAYER_GOES_EAST;
 RTC_DATA_ATTR static char    s_activeWeatherSource[20] = "GOES-East";
 
-// Battery state — updated once per bar render from AXP2101 PMIC
+// Battery state - updated once per bar render from AXP2101 PMIC
 static int8_t s_batPct = -1;  // -1 = not yet read / unavailable
 static int    s_batChargeState = -1;  // Raw AXP2101 STATUS2 (0x01) byte
 
-// Per-frame UTC timestamps — loaded from SD at playback start
+// Per-frame UTC timestamps - loaded from SD at playback start
 #define MAX_FRAMES 144
 static time_t s_frameTimes[MAX_FRAMES];
 static bool   s_timesLoaded = false;
@@ -458,7 +458,7 @@ static uint8_t s_streamValid[MAX_FRAMES];
 static File    s_streamFile;
 static bool    s_streamReady = false;
 
-// Cached valid-frame index list — rebuilt lazily when s_validCount < 0
+// Cached valid-frame index list - rebuilt lazily when s_validCount < 0
 static int  s_validIdx[MAX_FRAMES];
 static int  s_validCount = -1;
 static int  s_newestCachedIdx = -1;
@@ -471,7 +471,7 @@ RTC_DATA_ATTR static bool   s_lastRadarUtcValid = false;
 static bool s_radarMetaLoaded = false;
 static bool s_radarNoSignatures = false;  // download succeeded but no precipitation echoes ("Clear")
 RTC_DATA_ATTR static time_t s_lastRadarCheckUtc = 0;  // when radar was last polled (for "Clear" age)
-static bool s_radarDownloadFailed = false; // download itself failed — outside coverage or service error ("no sig")
+static bool s_radarDownloadFailed = false; // download itself failed - outside coverage or service error ("no sig")
 static bool s_topBarUseRadarScanTime = false; // Terrain stage shows radar scan time/min age in top bar.
 static bool s_zoomSnapshotsRefreshPending = false;
 
@@ -588,7 +588,7 @@ static uint16_t s_shakeEntryIgnoreMs = 2000;  // ignore WoM for this long after 
 static uint16_t s_shakeConfirmMs     = 600;   // after settle: require 2nd WoM event within this window (0=any single event wakes)
 static SensorQMI8658 s_qmi;
 static bool s_qmiInitialized = false;
-static bool s_qmiInitFailed = false;  // sticky — prevents infinite retry on hardware failure
+static bool s_qmiInitFailed = false;  // sticky - prevents infinite retry on hardware failure
 // ──── Forecast data structures ────────────────────────────────────────────────
 struct NowcastSample {
   time_t   timestamp;
@@ -943,7 +943,7 @@ static void initQmiShakeToWake() {
   // WoM hardware path: resets sensor, arms dedicated threshold comparator.
   // defaultPinValue=1: INT1 idles HIGH (push-pull), pulses LOW on motion.
   // Pair with GPIO_INTR_LOW_LEVEL and gpio_pullup_en in goToSleep().
-  // 200mg threshold — sensitive enough for wrist flick, filters table vibration.
+  // 200mg threshold - sensitive enough for wrist flick, filters table vibration.
   int ret = s_qmi.configWakeOnMotion(255,
                                      SensorQMI8658::ACC_ODR_LOWPOWER_128Hz,
                                      SensorQMI8658::INTERRUPT_PIN_1,
@@ -1702,7 +1702,7 @@ static void handleClearFrames() {
   File dir = SD.open(FRAMES_DIR);
   if (dir && dir.isDirectory()) {
     File entry;
-    // Collect names first — deleting while iterating can skip entries.
+    // Collect names first - deleting while iterating can skip entries.
     String names[200];
     int n = 0;
     while ((entry = dir.openNextFile()) && n < 200) {
@@ -1846,7 +1846,7 @@ static bool initAudioStartCue() {
   pinMode(46, OUTPUT);  // PA_CTRL
   digitalWrite(46, LOW);  // Keep amp path off until codec is stable and muted.
 
-  // Step 1: I2S — guard with flag to prevent double-begin
+  // Step 1: I2S - guard with flag to prevent double-begin
   static bool s_i2sStarted = false;
   if (!s_i2sStarted) {
     s_audioI2s.setPins(41, 45, 40, 42, 16);  // bclk, lrck, dout, din, mclk
@@ -1858,7 +1858,7 @@ static bool initAudioStartCue() {
     s_i2sStarted = true;
   }
 
-  // Step 2: Codec handle — only create once
+  // Step 2: Codec handle - only create once
   if (!s_audioCodec) {
     s_audioCodec = es8311_create(0, ES8311_ADDRRES_0);
     if (!s_audioCodec) {
@@ -1867,7 +1867,7 @@ static bool initAudioStartCue() {
     }
   }
 
-  // Step 3: Codec config — idempotent (I2C register writes)
+  // Step 3: Codec config - idempotent (I2C register writes)
   const es8311_clock_config_t clk = {
     .mclk_inverted = false,
     .sclk_inverted = false,
@@ -2263,12 +2263,12 @@ static void showWifiPortalJoinInfo(bool canSkip = false) {
 
 static void runWifiConfigPortal(bool canSkip = false) {
   loadWifiPortalConfig();
-  if (canSkip) pinMode(38, INPUT_PULLUP);  // TP_INT — active-low touch interrupt
+  if (canSkip) pinMode(38, INPUT_PULLUP);  // TP_INT - active-low touch interrupt
 
   const uint32_t kRetryIntervalMs = 60000UL;  // re-scan for known networks every 60 s
 
   for (;;) {
-    // (Re)start AP + portal — done on first entry and after every failed retry
+    // (Re)start AP + portal - done on first entry and after every failed retry
     WiFi.disconnect(true);
     WiFi.mode(WIFI_AP);
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -2290,12 +2290,12 @@ static void runWifiConfigPortal(bool canSkip = false) {
     // Retry all known SSIDs (tears down AP temporarily)
     appendDiagLog("portal: wifi-retry\n");
     if (connectWifiForSync(false, "Retrying WiFi...")) {
-      // Connected — reboot so setup() runs the full sync path cleanly
+      // Connected - reboot so setup() runs the full sync path cleanly
       appendDiagLog("portal: wifi-retry ok -> restart\n");
       SD_MMC.end();
       ESP.restart();
     }
-    // Still no WiFi — outer loop restarts AP + portal and waits again
+    // Still no WiFi - outer loop restarts AP + portal and waits again
   }
 }
 
@@ -2308,7 +2308,7 @@ static int wifiBarsForRssi(int rssi) {
 }
 
 static void drawWifiIndicator(LGFX_Sprite& spr, int x, int y, int w, int h, int rssi, bool connectedNow) {
-  // 24×14 monochrome Wi-Fi icon — flatter arcs to avoid vertical stretch.
+  // 24×14 monochrome Wi-Fi icon - flatter arcs to avoid vertical stretch.
   static const uint32_t outerArc[] = {
     0b000000011111111100000000,
     0b000001111000000111100000,
@@ -2419,7 +2419,7 @@ static int drawCountryFlag(LGFX_Sprite& spr, int x, int y, int h, const char* cc
 
 // Draw satellite icon (9×9 base, multicolor) at given position.
 static void drawSatelliteIcon(LGFX_Sprite& spr, int x, int y, int sz, uint16_t /*color*/) {
-  // Solar panels (blue), body (gold/yellow) — 9×9 base so scale=2 at sz=18
+  // Solar panels (blue), body (gold/yellow) - 9×9 base so scale=2 at sz=18
   static const uint32_t kPanels[] = {
     0b000000000,
     0b000000000,
@@ -2615,7 +2615,7 @@ static void drawSleepModeGlyph(LGFX_Sprite& spr, int x, int y, int w, int h, boo
 }
 
 // ─────────────────────────────────────────────────────────────
-//  JPEGDEC draw callback — renders into current target
+//  JPEGDEC draw callback - renders into current target
 // ─────────────────────────────────────────────────────────────
 static int jpegDraw(JPEGDRAW* pDraw) {
   if (!g_drawTarget) return 0;
@@ -2642,7 +2642,7 @@ static int jpegDraw(JPEGDRAW* pDraw) {
   s_jpegDrawCalls++;
 
   if (drawW == blockW) {
-    // Full MCU strip — buffer stride matches draw width, single call is correct
+    // Full MCU strip - buffer stride matches draw width, single call is correct
     g_drawTarget->pushImage(x0, y0, blockW, pDraw->iHeight,
                             (uint16_t*)pDraw->pPixels);
   } else {
@@ -2785,7 +2785,7 @@ static bool spriteLooksPartialDecode() {
   int zeroPct = exactZero * 100 / sampled;
   if (zeroPct < 40) return false;   // mostly non-zero → valid frame
 
-  // High exact-zero fraction — now check if the non-zero content is
+  // High exact-zero fraction - now check if the non-zero content is
   // concentrated in a single quadrant (hallmark of partial decode).
   if (nonZero < 20) return false;   // too few non-zero to judge
 
@@ -2810,7 +2810,7 @@ static bool spriteLooksPartialDecode() {
     return true;
   }
 
-  // Content in 2+ quadrants but one dominates >90 % — still partial
+  // Content in 2+ quadrants but one dominates >90 % - still partial
   int maxQ = qTL;
   if (qTR > maxQ) maxQ = qTR;
   if (qBL > maxQ) maxQ = qBL;
@@ -2871,14 +2871,14 @@ static bool spriteLooksHorizontallyCorrupted() {
 // the opposite half has substantial content.  This is the exact pattern of the
 // "right half / left half black" display artifact caused by the ST7789 GRAM
 // window being left in a sub-region state after many clock-overlay partial
-// pushes — the next full-frame sprite.pushSprite() writes to the wrong window
+// pushes - the next full-frame sprite.pushSprite() writes to the wrong window
 // and half the GRAM retains the old (zero) content.
 static bool spriteLooksVerticallyCorrupted() {
   uint16_t* px = (uint16_t*)sprite.getBuffer();
   if (!px) return false;
 
   const int startY = 14;               // skip timestamp bar
-  const int halfX  = DISP_W / 2;      // 160 — split point
+  const int halfX  = DISP_W / 2;      // 160 - split point
   const int stepX  = 4;
   const int stepY  = 4;
 
@@ -3144,7 +3144,7 @@ static void setProgBarTarget(uint32_t pct, const char* label) {
   }
 }
 
-// Raw draw — no animation, just paint the bar at the given percentage
+// Raw draw - no animation, just paint the bar at the given percentage
 static void drawProgressBarRaw(uint32_t percent, const char* label) {
   if (percent > 100U) percent = 100U;
 
@@ -3207,7 +3207,7 @@ static void drawProgressBarRaw(uint32_t percent, const char* label) {
   serviceWifiPortalServer();
 }
 
-// Update progress bar — sets target for background interpolation task.
+// Update progress bar - sets target for background interpolation task.
 // If the task isn't running, falls back to direct draw.
 static void drawProgressBarUi(uint32_t current, uint32_t total, const char* label) {
   if (total == 0) total = 1;
@@ -3219,7 +3219,7 @@ static void drawProgressBarUi(uint32_t current, uint32_t total, const char* labe
     // Background task handles smooth drawing
     setProgBarTarget(targetPct, label);
   } else {
-    // No background task — draw directly
+    // No background task - draw directly
     s_progBarLastPct = targetPct;
     drawProgressBarRaw(targetPct, label);
   }
@@ -3302,7 +3302,7 @@ static void syncProgressEnd() {
   if (!syncProgressIsActive()) return;
   appendDiagLog("[PROG] END done=%lu total=%lu ms=%lu\n",
                (unsigned long)s_syncProgDoneUnits, (unsigned long)s_syncProgTotalUnits, millis());
-  // Signal completion — let background task snap to 100%
+  // Signal completion - let background task snap to 100%
   s_progFinished = true;
   setProgBarTarget(100, "done");
   // Give the task a moment to render 100%, then stop it
@@ -3331,9 +3331,9 @@ static void showProgress(int current, int total, const char* label) {
   drawProgressBarUi((uint32_t)current, (uint32_t)total, label);
 }
 
-// Fast bilinear lerp for RGB565. t is 0–15 (0 = all a, 15 = ~all b, 16 means full b).
+// Fast bilinear lerp for RGB565. t is 0-15 (0 = all a, 15 = ~all b, 16 means full b).
 // Packs R,G,B into non-overlapping bit-fields of a single uint32 so one multiply
-// blends all three channels simultaneously — no per-channel division.
+// blends all three channels simultaneously - no per-channel division.
 // Layout: G in bits [26:21], R in bits [15:11], B in bits [4:0] (zero gaps between).
 static inline uint16_t lerp565_16(uint16_t a, uint16_t b, uint8_t t) {
   uint32_t a32 = (uint32_t)(a | ((uint32_t)a << 16)) & 0x07E0F81FU;
@@ -3452,7 +3452,7 @@ static void scaleBarRowsToBuffer(uint16_t* dst, int srcY0) {
   }
 }
 
-// Forward declaration — defined later in file.
+// Forward declaration - defined later in file.
 static void drawTimestamp(int frameIdx, LovyanGFX* target);
 
 // Use real UTC time when available; otherwise fall back to a monotonic
@@ -3803,7 +3803,7 @@ static void renderBarsAtScaledRes(int frameIdx, bool skipBottomBar = false) {
     const int iconGap = 3;  // gap on each side of icon
     int iconSpace = iconSz + iconGap * 2;
 
-    // Find the last "  " separator — everything after it is the age portion
+    // Find the last "  " separator - everything after it is the age portion
     char dtPart[64] = {};
     char agePart[48] = {};
     const char* lastSep = nullptr;
@@ -3895,7 +3895,7 @@ static void renderBarsAtScaledRes(int frameIdx, bool skipBottomBar = false) {
       strlcpy(out, days[lt.tm_wday], outSz);
     };
 
-    // Structured forecast entries — flat array, single line
+    // Structured forecast entries - flat array, single line
     struct ForecastEntry { char type; char text[24]; bool drawDeg; };
     ForecastEntry entries[6] = {};
     int entryCount = 0;
@@ -4084,12 +4084,12 @@ static void renderBarsAtScaledRes(int frameIdx, bool skipBottomBar = false) {
 
     for (int i = 0; i < entryCount; i++) {
       if (i > 0) cx += sepGap;
-      // Draw weather icon — fills bar height
+      // Draw weather icon - fills bar height
       if (entries[i].type != 0) {
         int iw = drawWeatherIcon(s_barSprite, cx, 1, iconH, entries[i].type);
         cx += iw + iconGap;
       }
-      // Draw text — centered vertically by font height
+      // Draw text - centered vertically by font height
       s_barSprite.setCursor(cx, textY);
       s_barSprite.print(entries[i].text);
       cx += s_barSprite.textWidth(entries[i].text);
@@ -4102,13 +4102,13 @@ static void renderBarsAtScaledRes(int frameIdx, bool skipBottomBar = false) {
       }
     }
   }
-  // No fallback — bottom bar is blank when forecast is off or has no data
+  // No fallback - bottom bar is blank when forecast is off or has no data
   copyBarSpriteToBuffer(s_botBarBuf, (size_t)SCALED_W * SCALED_BAR_H);
   } // !skipBottomBar
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Hurricane Watch — storm bars, NOAA poll, suppression, mode enter/exit
+//  Hurricane Watch - storm bars, NOAA poll, suppression, mode enter/exit
 // ═══════════════════════════════════════════════════════════════════════════
 
 static uint16_t hurricaneCategoryColor(uint8_t cat) {
@@ -4281,7 +4281,7 @@ static void computeStormBbox(float lat, float lon, uint8_t category,
     case 3:  radiusKm = 600.0f; break;
     case 4:  radiusKm = 500.0f; break;
     case 5:  radiusKm = 450.0f; break;
-    default: radiusKm = 900.0f; break;  // TD/TS — wider view
+    default: radiusKm = 900.0f; break;  // TD/TS - wider view
   }
   float cosLat = cosf(lat * 0.01745329252f);
   if (cosLat < 0.2f) cosLat = 0.2f;
@@ -4361,7 +4361,7 @@ static bool parseNoaaStormJson(const String& body, HurricaneInfo* storms,
     cursor = braceOpen + 1;
   }
 
-  // Sort by STORMNUM descending (newest first) — bubble sort, max 4 items
+  // Sort by STORMNUM descending (newest first) - bubble sort, max 4 items
   for (int i = 0; i < *outCount - 1; i++) {
     for (int j = 0; j < *outCount - 1 - i; j++) {
       // Extract storm number from ID (characters 2-3)
@@ -4393,7 +4393,7 @@ static bool pollNoaaForHurricane(HurricaneInfo* storms, int maxStorms, int* outC
   fake.pressureMb = 955;
   fake.advisoryUtc = time(nullptr);
   *outCount = 1;
-  Serial.println("hurricane: TEST MODE — fake Cat 3");
+  Serial.println("hurricane: TEST MODE - fake Cat 3");
   return true;
 #endif
 
@@ -4415,16 +4415,16 @@ static bool pollNoaaForHurricane(HurricaneInfo* storms, int maxStorms, int* outC
     }
     Serial.println("hurricane: NOAA response too short");
   } else {
-    Serial.printf("hurricane: NOAA HTTP %d — trying GDACS fallback\n", httpCode);
+    Serial.printf("hurricane: NOAA HTTP %d - trying GDACS fallback\n", httpCode);
     http.end();
   }
 
-  // NOAA unreachable or invalid — fall back to GDACS (EU/UN infrastructure)
+  // NOAA unreachable or invalid - fall back to GDACS (EU/UN infrastructure)
   if (syncProgressIsActive()) syncProgressTick(1);
   return pollGdacsForHurricane(storms, maxStorms, outCount);
 }
 
-// Bounded strstr — returns nullptr if match is beyond haystack+haystackLen.
+// Bounded strstr - returns nullptr if match is beyond haystack+haystackLen.
 static const char* boundedStrstr(const char* haystack, const char* needle, int haystackLen) {
   if (!haystack || !needle || haystackLen <= 0) return nullptr;
   int needleLen = (int)strlen(needle);
@@ -4666,9 +4666,9 @@ static void cleanupSuppressedStorms(const HurricaneInfo* activeStorms, int activ
     if (!keep && tokLen >= 4) {
       int idYear = atoi(tok + tokLen - 4);
       if (idYear == curYear) {
-        keep = true;  // current-year storm not in active list — keep for safety
+        keep = true;  // current-year storm not in active list - keep for safety
       } else if (idYear < curYear && tmNow.tm_mon < 5) {
-        keep = true;  // previous-year, off-season (before June) — keep through winter
+        keep = true;  // previous-year, off-season (before June) - keep through winter
       }
       // else: previous-year AND past June → expired, keep stays false
     }
@@ -4781,7 +4781,7 @@ static void hurricaneRecheckAndUpdate() {
   disconnectWifiAfterSync();
 
   if (!polled || stormCount == 0) {
-    // Storm dissipated — exit mode
+    // Storm dissipated - exit mode
     exitHurricaneMode();
     return;
   }
@@ -4818,7 +4818,7 @@ static void hurricaneRecheckAndUpdate() {
   }
 
   if (!found) {
-    // Active storm not in list anymore — check for new unsuppressed storm
+    // Active storm not in list anymore - check for new unsuppressed storm
     cleanupSuppressedStorms(storms, stormCount);
     bool entered = false;
     for (int i = 0; i < stormCount; i++) {
@@ -4855,7 +4855,7 @@ static float computeMoonPhase(time_t utc) {
   return (float)phase;
 }
 
-// JPEGDEC draw callback for moon — target buffer and size set before decode
+// JPEGDEC draw callback for moon - target buffer and size set before decode
 static uint16_t* s_moonDecTarget = nullptr;
 static int        s_moonDecTargetPx = 0;
 
@@ -4934,7 +4934,7 @@ static void downloadMoonFramesIfMissing() {
           f.flush();
           f.close();
           if (total == len) ok++;
-          else SD.remove(sdPath);  // partial — delete
+          else SD.remove(sdPath);  // partial - delete
         }
       }
     }
@@ -4983,7 +4983,7 @@ static bool decodeMoonFrameInto(int frameIdx, uint16_t* buf, int px, int scale) 
 static bool decodeMoonPhase() {
   time_t now = time(nullptr);
   if (now < 1000000000) {
-    appendDiagLog("moon: skip — NTP not set (now=%ld)\n", (long)now);
+    appendDiagLog("moon: skip - NTP not set (now=%ld)\n", (long)now);
     return false;
   }
 
@@ -5164,7 +5164,7 @@ static void pollCleanModeToggle() {
   // New touch down on moon: start tracking
   if (irqFired && pressStartMs == 0) {
     if (touching == 0) {
-      // Fast tap: finger lifted before I2C poll — no coords available.
+      // Fast tap: finger lifted before I2C poll - no coords available.
       // Can't verify it was on the moon zone, so discard.
       return;
     }
@@ -5214,7 +5214,7 @@ static void delayWithInputPoll(uint32_t ms) {
 }
 
 // Draw moon phase triptych in the AMOLED bottom border (Y=431-502).
-// Layout: [prev 54×54] —gap— [center 54×54] —gap— [next 54×54]
+// Layout: [prev 54×54] -gap- [center 54×54] -gap- [next 54×54]
 // Previous phase on left, current center, next phase on right.
 // Lets user see at a glance whether the moon is waxing or waning.
 static void drawMoonComplication() {
@@ -5285,7 +5285,7 @@ static void presentScaledBuf(uint16_t* src) {
   if (!s_chunkBuf) return;
 
   if (s_fullscreenMode) {
-    // Zero rows 0–13: normally hidden by top bar, but fullscreen scaler samples them.
+    // Zero rows 0-13: normally hidden by top bar, but fullscreen scaler samples them.
     memset(src, 0, 14U * SCALED_W * 2U);
     // Fullscreen: center-crop 410×360 and scale to fill 410×502, no bars/moon/hints
     const int dstW = SCALED_W;      // 410
@@ -5331,7 +5331,7 @@ static void presentScaledBuf(uint16_t* src) {
 
   // Stamp location pin directly into frame buffer (no intermediate sprite).
   // Draws filled circle head + triangle pointer + white center dot using
-  // per-pixel distance checks — avoids LGFX sprite byte-order issues.
+  // per-pixel distance checks - avoids LGFX sprite byte-order issues.
   if (s_pinOverlayRequested && s_weatherGeoValid && !s_fullscreenMode) {
     const int r = 10, centerDot = 4;
     // Pin tip at frame center, head circle above
@@ -5670,7 +5670,7 @@ static size_t jpegEffectiveLength(const uint8_t* data, size_t len) {
 //  Returns bytes written, or 0 on failure.
 // ─────────────────────────────────────────────────────────────
 
-// Download buffer — reused for every frame fetch and for showFrame playback
+// Download buffer - reused for every frame fetch and for showFrame playback
 #define DL_BUF_BYTES  MAX_JPEG_BYTES
 static uint8_t* s_dlBuf = nullptr;
 
@@ -5757,7 +5757,7 @@ static void computeWeatherBboxFromCenter(float lat, float lon,
   // and expand longitude by aspect/cos(latitude) so the tile stays useful at
   // higher latitudes.
   const float kHalfLatDeg = 4.5f;  // ~1000 km tall view
-  // Hardcoded original aspect ratio — must not change when DISP_H changes or
+  // Hardcoded original aspect ratio - must not change when DISP_H changes or
   // the bbox will drift, invalidate view.meta, and wipe radar.meta.
   const float kAspect = 320.0f / 172.0f;
 
@@ -6147,7 +6147,7 @@ static void loadRadarMetaIfNeeded() {
 }
 
 static bool zoomSnapshotFileLooksUsable(const char* path) {
-  // Fast path: just check file size — avoids a full JPEG decode on startup.
+  // Fast path: just check file size - avoids a full JPEG decode on startup.
   File f = SD.open(path, FILE_READ);
   if (!f) return false;
   size_t sz = f.size();
@@ -6532,7 +6532,7 @@ static bool decodeAndWriteRawSlot(int logicalIdx, size_t jpegLen) {
   if (spriteLooksHoldFrameBlockCorrupted()) return false;
   if (spriteLooksCyanWhiteBlockCorrupted()) return false;
   if (spriteLooksBottomBandJunkCorrupted()) return false;
-  // slab detector disabled — GOES-West disk edge triggers false positives for limb regions
+  // slab detector disabled - GOES-West disk edge triggers false positives for limb regions
 
   scaleSpriteTo410x360(s_frameDisplayBuf);
   if (scaledFrameLooksFreezeBlockCorrupted() || scaledFrameLooksHoldBlockCorrupted()) return false;
@@ -6645,7 +6645,7 @@ static bool installValidatedWeatherJpegToPath(const char* finalPath,
 static time_t s_gibsAvailTimes[MAX_GIBS_AVAIL];
 static int s_gibsAvailCount = 0;
 
-// Download a GIBS frame to an SD file path — used by zoom/terrain pipeline.
+// Download a GIBS frame to an SD file path - used by zoom/terrain pipeline.
 static bool downloadFrameToPathAtBbox(HTTPClient& http,
                                       WiFiClientSecure& client,
                                       time_t t,
@@ -6856,7 +6856,7 @@ static bool readPcf85063(time_t* out) {
   uint8_t minRaw = Wire.read();
   uint8_t hrRaw  = Wire.read();
   uint8_t dayRaw = Wire.read();
-  Wire.read();  // weekday — unused
+  Wire.read();  // weekday - unused
   uint8_t monRaw = Wire.read();
   uint8_t yrRaw  = Wire.read();
   if (secRaw & 0x80) return false;  // OS flag: oscillator stopped, time invalid
@@ -6966,12 +6966,12 @@ static bool loadGeoFromNvs(float* lat, float* lon) {
 }
 
 // Poll for a "skip" tap: touch INT pin (TP_INT = GPIO 38, active-low) or AXP2101 PKEY.
-// Used in the dismissible portal loop only — does NOT call serviceUserButtons().
+// Used in the dismissible portal loop only - does NOT call serviceUserButtons().
 static bool pollPortalSkip() {
   // Touch IC INT pin (GPIO 38) goes low when a touch is detected.
-  // This works even when the IC is in auto-sleep — touch wakes it and asserts INT.
+  // This works even when the IC is in auto-sleep - touch wakes it and asserts INT.
   if (digitalRead(38) == LOW) return true;
-  // AXP2101 PKEY short-press interrupt (reg 0x49 bit 2) — intercept before restart
+  // AXP2101 PKEY short-press interrupt (reg 0x49 bit 2) - intercept before restart
   uint8_t intSts = readAxp2101Register(0x49);
   if (intSts & 0x04) {
     writeAxp2101Register(0x49, intSts);  // clear
@@ -7110,7 +7110,7 @@ static bool decodeJpegFrameToSprite(int idx, bool rejectBlank) {
   return true;
 }
 
-// Individual rNNN.raw read/write functions removed — replaced by stream.raw
+// Individual rNNN.raw read/write functions removed - replaced by stream.raw
 
 
 // ─────────────────────────────────────────────────────────────
@@ -7299,7 +7299,7 @@ static int weatherSemanticDistance(const WeatherSemanticSignature& a,
 
 
 // ─────────────────────────────────────────────────────────────
-//  GIBS DescribeDomains — query exact available timestamps
+//  GIBS DescribeDomains - query exact available timestamps
 // ─────────────────────────────────────────────────────────────
 
 static time_t parseISOToUtcEpoch(const char* p) {
@@ -7472,7 +7472,7 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
       decodeOpt = 0;
     } else if (relaxedHeight && jw == DISP_W && jh >= DISP_H - 8 && jh < DISP_H) {
       // NOAA Esri service returns slightly shorter JPEG due to Web Mercator reprojection
-      // rounding (e.g. 320×172 when 320×176 was requested). Accept it — the bottom
+      // rounding (e.g. 320×172 when 320×176 was requested). Accept it - the bottom
       // rows of the sprite stay black (from fillScreen above), which is correct for radar.
       decodeOpt = 0;
       jpegActualH = jh;
@@ -7498,7 +7498,7 @@ static bool decodeJpegPathToSprite(const char* path, bool relaxedHeight) {
   if (ok) {
     if (jpegActualH > 0) {
       // Accept any full-width decode that didn't go out of bounds.
-      // No s_jpegMaxY constraint — short JPEG ends before DISP_H and that's fine.
+      // No s_jpegMaxY constraint - short JPEG ends before DISP_H and that's fine.
       ok = (s_jpegDrawCalls > 0 && !s_jpegDrawOutOfBounds &&
             s_jpegMinX == 0 && s_jpegMinY == 0 &&
             s_jpegMaxX == DISP_W);
@@ -8039,7 +8039,7 @@ static bool terrainUsesNightLayerForUtc(time_t weatherFrameUtc) {
 }
 
 // Return the terrain JPEG / raw paths appropriate for the current wall-clock time.
-// ~0.1ms of float math — safe to call once per terrain stage, no FPS impact.
+// ~0.1ms of float math - safe to call once per terrain stage, no FPS impact.
 static const char* activeTerrainJpegPath() {
   return terrainUsesNightLayerForUtc(time(nullptr)) ? ZOOM_TERRAIN_NIGHT_FILE : ZOOM_TERRAIN_DAY_FILE;
 }
@@ -8297,7 +8297,7 @@ static bool downloadTerrainSnapshotToPathAtBbox(HTTPClient& http,
       clearRadarMeta();
       Serial.println("radar clear -> base");
     } else {
-      // Download itself failed — HTTP error or service unreachable (outside coverage).
+      // Download itself failed - HTTP error or service unreachable (outside coverage).
       s_radarNoSignatures = false;
       s_radarDownloadFailed = true;
       SD.remove(ZOOM_TERRAIN_RADAR_FILE);
@@ -8362,7 +8362,7 @@ static bool showZoomSnapshotFrame(const char* path, int newestIdx) {
     appendDiagLog("zoom: blk-corr %s\n", path);
     return false;
   }
-  // IMPORTANT: save/restore — no early return between set and restore
+  // IMPORTANT: save/restore - no early return between set and restore
   bool prevTopBarRadarMode = s_topBarUseRadarScanTime;
   if (isTerrainStage) s_topBarUseRadarScanTime = true;
   updateBarBufs(newestIdx);
@@ -8638,7 +8638,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
 
   uint32_t consumedMs = 0;
 
-  // dit: zoom1 bbox — quick flash
+  // dit: zoom1 bbox - quick flash
   if (z1.valid) {
     drawScaledOutlineRect(s_frameDisplayBuf, z1.x, z1.y, z1.w, z1.h, 0xF800);
     presentScaledBuf(s_frameDisplayBuf);
@@ -8648,7 +8648,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
     consumedMs += ditMs + gapMs;
   }
 
-  // dit: zoom2 bbox — quick flash (no trailing gap before zoom3)
+  // dit: zoom2 bbox - quick flash (no trailing gap before zoom3)
   if (z2.valid) {
     drawScaledOutlineRect(s_frameDisplayBuf, z2.x, z2.y, z2.w, z2.h, 0xF800);
     presentScaledBuf(s_frameDisplayBuf);
@@ -8656,7 +8656,7 @@ static void runFreezeZoom3LocatorCue(uint32_t holdMs) {
     consumedMs += ditMs;
   }
 
-  // dah dah: zoom3 bbox — two longer flashes
+  // dah dah: zoom3 bbox - two longer flashes
   for (int i = 0; i < 4; ++i) {
     restoreFrame();
     if ((i & 1) == 0) {
@@ -9036,7 +9036,7 @@ static time_t parseIso8601ToEpoch(const char* s) {
   if (n < 3) return 0;  // need at least YYYY-MM-DD
   t.tm_year -= 1900;
   t.tm_mon -= 1;
-  // Find timezone part — scan for +/- or Z after the time portion
+  // Find timezone part - scan for +/- or Z after the time portion
   const char* p = s;
   // Skip past the date-time portion to find timezone
   while (*p && *p != 'Z' && *p != 'z') {
@@ -9416,12 +9416,12 @@ static bool fetchOpenMeteoFallback(WiFiClientSecure& client, HTTPClient& http) {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Forecast orchestrator — called during sync after weather frames
+//  Forecast orchestrator - called during sync after weather frames
 // ─────────────────────────────────────────────────────────────
 static void fetchForecastData() {
   if (!s_forecastEnabled || !s_weatherGeoValid) return;
   Serial.println("forecast: fetching...");
-  // Reset forecast state before fetching — prevents stale RTC_DATA_ATTR values
+  // Reset forecast state before fetching - prevents stale RTC_DATA_ATTR values
   s_forecast.rainEtaMinutes = -1;
   s_forecast.rainUncertaintyMin = 0;
   s_forecast.nowcastCount = 0;
@@ -9467,12 +9467,12 @@ static void fetchForecastData() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Download phase — sequential with connection reuse.
+//  Download phase - sequential with connection reuse.
 //  One SSL handshake for the full weather window (frame count derives from
 //  HOURS_BACK and active cadence, clamped to MAX_FRAMES).
 // ─────────────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────
-//  Unified weather frame sync — one function replaces downloadFrames
+//  Unified weather frame sync - one function replaces downloadFrames
 //  + syncFramesRolling + all branch logic.
 // ─────────────────────────────────────────────────────────────
 static void syncWeatherFrames() {
@@ -9578,7 +9578,7 @@ static void syncWeatherFrames() {
       int oldSlot = shift + i;
       if (oldSlot >= 0 && oldSlot < (int)s_idx.count && i < oldUsable &&
           s_idx.times[oldSlot] == t && s_idx.jpegValid[oldSlot]) {
-        // Reuse this slot — physical slot is the same (circular)
+        // Reuse this slot - physical slot is the same (circular)
         newIdx.jpegLen[i] = s_idx.jpegLen[oldSlot];
         newIdx.jpegValid[i] = 1;
         newIdx.rawValid[i] = s_idx.rawValid[oldSlot];
@@ -9768,7 +9768,7 @@ static void syncWeatherFrames() {
       continue;
     }
 
-    // Semantic outlier check — compare candidate sprite signature with neighbors.
+    // Semantic outlier check - compare candidate sprite signature with neighbors.
     // Candidate sprite is still in the sprite buffer from validateBufferedWeatherFrameJpeg.
     // Neighbor reads will clobber s_dlBuf and sprite, but the candidate JPEG is
     // already safe in frames.bin.
@@ -10036,7 +10036,7 @@ static void goToSleep(bool buttonOnly = false) {
     Wire.endTransmission();
   }
 
-  // Release I2C bus — disables internal pullups on SDA/SCL (~150µA saved).
+  // Release I2C bus - disables internal pullups on SDA/SCL (~150µA saved).
   // External board pullups maintain bus integrity for connected devices.
   Wire.end();
 #else
@@ -10062,18 +10062,18 @@ static void goToSleep(bool buttonOnly = false) {
   gpio_pullup_en(bootPin);
   gpio_wakeup_enable(bootPin, GPIO_INTR_LOW_LEVEL);
   if (s_shakeToWakeEnabled && s_qmiInitialized && s_sleepModeEnabled) {
-    // QMI8658 WoM interrupt TOGGLES on each event — it does not latch high or low.
+    // QMI8658 WoM interrupt TOGGLES on each event - it does not latch high or low.
     // Level is arbitrary ("jump transition state" per the official example).
     // Strategy: read current INT1 level, arm the OPPOSITE level.
     // The next wrist flick toggles INT1 to the armed level → ESP32 wakes.
     gpio_num_t imuPin = (gpio_num_t)QMI8658_INT1;
     // GPIO21 is shared with AMOLED_PWR_EN. Firmware holds it OUTPUT HIGH for
-    // display power — QMI8658 push-pull output cannot toggle an actively-driven
+    // display power - QMI8658 push-pull output cannot toggle an actively-driven
     // output pin, and digitalRead() on an output returns the ESP32's own register,
     // not the physical level. Release the driver so QMI8658 can freely drive the
     // pin and digitalRead() reflects the actual state.
     gpio_reset_pin(imuPin);
-    pinMode(QMI8658_INT1, INPUT);  // no pullup — IMU push-pull drives actively; pullup would partially power AMOLED
+    pinMode(QMI8658_INT1, INPUT);  // no pullup - IMU push-pull drives actively; pullup would partially power AMOLED
     int int1Level = digitalRead(QMI8658_INT1);
     gpio_int_type_t wakeOn = (int1Level == LOW) ? GPIO_INTR_HIGH_LEVEL : GPIO_INTR_LOW_LEVEL;
     gpio_wakeup_enable(imuPin, wakeOn);
@@ -10148,12 +10148,12 @@ static void goToSleep(bool buttonOnly = false) {
           }
         }
       }
-      break;  // real wake — exit inner loop
+      break;  // real wake - exit inner loop
     } while (true);
 
     // ── Timer wake: silent background sync, then re-sleep ──
     if (s_autoUpdateInSleep && wake == ESP_SLEEP_WAKEUP_TIMER) {
-      // Silent background sync — mount SD, sync, unmount, re-sleep
+      // Silent background sync - mount SD, sync, unmount, re-sleep
       bool sdOk = false;
       for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
         if (sdTry > 0) delay(200);
@@ -10199,14 +10199,14 @@ static void goToSleep(bool buttonOnly = false) {
         }
         SD_MMC.end();
       } else {
-        // SD mount failed — just re-arm and re-sleep
+        // SD mount failed - just re-arm and re-sleep
         int nextSec = secondsUntilNextUpdate();
         if (nextSec > 0) esp_sleep_enable_timer_wakeup((uint64_t)nextSec * 1000000ULL);
       }
       continue;  // re-enter outer loop → sleep again
     }
 
-    break;  // button/shake wake — exit outer loop for full wake
+    break;  // button/shake wake - exit outer loop for full wake
   } while (true);
 
   // ── Full wake path (button/shake only) ──
@@ -10240,7 +10240,7 @@ static void goToSleep(bool buttonOnly = false) {
       }
     }
     if (!sdOk) {
-      Serial.println("SD remount failed after 5 attempts — re-sleeping");
+      Serial.println("SD remount failed after 5 attempts - re-sleeping");
       goToSleep();
       return;
     }
@@ -10252,7 +10252,7 @@ static void goToSleep(bool buttonOnly = false) {
   s_touchInitialized = false;   // force touch re-init (was hibernated before sleep)
   s_serviceButtonsWakeReset = true;
   s_buttonSleepTransition = false;
-  s_moonDrawn = false;          // border was cleared — redraw moon
+  s_moonDrawn = false;          // border was cleared - redraw moon
   return;
 #endif
 
@@ -10468,7 +10468,7 @@ void setup() {
              (unsigned long)(mac % 1000000000ULL));
   }
 
-  Wire.begin(SDA, SCL);  // SDA=15, SCL=14 — shared I2C bus (AXP2101/touch/RTC/IMU)
+  Wire.begin(SDA, SCL);  // SDA=15, SCL=14 - shared I2C bus (AXP2101/touch/RTC/IMU)
   loadWifiPortalConfig();  // needed before QMI decision below
   if (s_shakeToWakeEnabled && s_sleepModeEnabled) {
     initQmiShakeToWake();
@@ -10531,7 +10531,7 @@ void setup() {
   bool sdOk = false;
 #if BOARD_IS_AMOLED_206
   SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
-  // Try 40MHz (SDMMC_FREQ_HIGHSPEED) first — doubles read throughput
+  // Try 40MHz (SDMMC_FREQ_HIGHSPEED) first - doubles read throughput
   for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
     if (sdTry > 0) delay(200);
     sdOk = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
@@ -10539,7 +10539,7 @@ void setup() {
   if (sdOk) {
     Serial.println("SD mounted at 40MHz");
   } else {
-    // Card doesn't support 40MHz — fall back to 20MHz
+    // Card doesn't support 40MHz - fall back to 20MHz
     SD_MMC.end();
     for (int sdTry = 0; sdTry < 5 && !sdOk; sdTry++) {
       if (sdTry > 0) delay(200);
@@ -10630,7 +10630,7 @@ void setup() {
         if (hwact[0] != '\0') {
           suppressStorm(hwact);
           hprefs.putString("hwact", "");
-          Serial.printf("hurricane: hard boot — suppressed %s\n", hwact);
+          Serial.printf("hurricane: hard boot - suppressed %s\n", hwact);
         }
         hprefs.end();
       }
@@ -10749,7 +10749,7 @@ void setup() {
         }
         syncProgressCompletePhase();
       } else {
-        // Skip noaa budget — just advance past it
+        // Skip noaa budget - just advance past it
         syncProgressBeginPhase("sync", 10U);
         syncProgressCompletePhase();
       }
@@ -10847,7 +10847,7 @@ void setup() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Timestamp overlay — drawn on top of each decoded frame
+//  Timestamp overlay - drawn on top of each decoded frame
 // ─────────────────────────────────────────────────────────────
 // Load frame timestamps from SD (needed after wake-from-sleep when RTC is intact
 // but the s_frameTimes array in RAM has been cleared)
@@ -11175,16 +11175,16 @@ static bool starlinkGeoLocate(float* outLat, float* outLon) {
   tcp.setTimeout(2000);
   if (!tcp.connect(IPAddress(192, 168, 100, 1), 9200)) return false;
   tcp.stop();
-  // kReq[] not yet computed — stub returns false so BSSID path is used.
+  // kReq[] not yet computed - stub returns false so BSSID path is used.
   // To enable: compute kReq[], send via tcp, parse HTTP/2 DATA frame response,
   // strip 5-byte gRPC length prefix, parse protobuf location.lla.lat / .lon (sint64 ×1e-8).
-  Serial.println("starlink-geo: dish reachable but kReq[] not yet embedded — skipping");
+  Serial.println("starlink-geo: dish reachable but kReq[] not yet embedded - skipping");
   return false;
 }
 
 // Scans visible WiFi APs and queries Apple's BSSID geo API.
 // Returns true and sets *outLat/*outLon if successful.
-// Works on home WiFi, iPhone hotspot, or Starlink — scans RF environment, not WAN IP.
+// Works on home WiFi, iPhone hotspot, or Starlink - scans RF environment, not WAN IP.
 static bool bssidGeoLocate(float* outLat, float* outLon) {
   // 1. Scan visible APs
   int n = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/true);
@@ -11279,7 +11279,7 @@ static bool bssidGeoLocate(float* outLat, float* outLon) {
     return false;
   }
 
-  // 5. Read response (Apple returns many APs — we only need the first valid one)
+  // 5. Read response (Apple returns many APs - we only need the first valid one)
   // Response: 10-byte header + protobuf with field2 repeated AP entries
   int rlen = http.getSize();
   if (rlen <= 10) { http.end(); return false; }
@@ -11420,7 +11420,7 @@ static void reverseGeocode(float lat, float lon) {
   if (!city[0]) extractField("town", city, sizeof(city));
   if (!city[0]) extractField("village", city, sizeof(city));
   extractField("country_code", country, sizeof(country));
-  // ISO3166-2-lvl4 gives "CA-BC" — extract the part after the dash
+  // ISO3166-2-lvl4 gives "CA-BC" - extract the part after the dash
   char iso[12] = {};
   extractField("ISO3166-2-lvl4", iso, sizeof(iso));
   if (iso[0]) {
@@ -11471,11 +11471,11 @@ static void refreshDisplayLocationTimeFromIpInfo() {
   }
   if (syncProgressIsActive()) syncProgressTick(2);
 
-  // Apply geo position — skip in hurricane mode to preserve storm-centered bbox
+  // Apply geo position - skip in hurricane mode to preserve storm-centered bbox
   if (s_hurricaneMode) {
     // Still extract timezone offset above, but don't override center/satellite
   } else if (gotGeo) {
-    // BSSID is high-confidence — always accept it.
+    // BSSID is high-confidence - always accept it.
     // NVS is just a fallback for when BSSID fails, not a lock.
     float stableLat = roundf(lat * 100.0f) * 0.01f;
     float stableLon = roundf(lon * 100.0f) * 0.01f;
@@ -11492,7 +11492,7 @@ static void refreshDisplayLocationTimeFromIpInfo() {
     if (syncProgressIsActive()) syncProgressTick(3);
     selectSatelliteForLon(s_weatherCenterLon);
   } else if (!s_weatherGeoValid) {
-    // BSSID failed and we have no prior location — stay invalid
+    // BSSID failed and we have no prior location - stay invalid
     selectSatelliteForLon(s_weatherCenterLon, true);
   }
 
@@ -11582,7 +11582,7 @@ static ClockOverlayLayout makeClockOverlayLayout() {
 }
 
 static bool saveSpriteRegionToDlBuf(const ClockOverlayLayout& l) {
-  // Read from s_frameDisplayBuf (SCALED_W stride, always correct-format RGB565 —
+  // Read from s_frameDisplayBuf (SCALED_W stride, always correct-format RGB565 -
   // the scaler already de-byteswapped sprite pixels when filling this buffer).
   const uint16_t* px = s_frameDisplayBuf;
   if (!px || l.bgW <= 0 || l.bgH <= 0) return false;
@@ -11660,7 +11660,7 @@ static void copyClockFxSpriteToMainSprite(const ClockOverlayLayout& l) {
 }
 
 // Stamp the current time onto s_frameDisplayBuf at full opacity (time-always-on mode).
-// Reuses the clock overlay layout/sprite infrastructure — reads bg from buf, draws
+// Reuses the clock overlay layout/sprite infrastructure - reads bg from buf, draws
 // shadow + text, copies result back. ~2-3ms per call, well within 31ms frame budget.
 static void drawAlwaysOnClockOverlay(uint16_t* buf) {
   if (!isTimeAlwaysOn() || !buf) return;
@@ -11834,7 +11834,7 @@ static bool runTerrainCrossfadeSegment(int newestIdx, bool baseAlreadyShown) {
   }
 
   // Terrain wipe should show radar scan time + minutes-old in the top bar.
-  // IMPORTANT: save/restore — no early return between set and restore
+  // IMPORTANT: save/restore - no early return between set and restore
   bool prevTopBarRadarMode = s_topBarUseRadarScanTime;
   s_topBarUseRadarScanTime = true;
   updateBarBufs(newestIdx);
@@ -11842,9 +11842,9 @@ static bool runTerrainCrossfadeSegment(int newestIdx, bool baseAlreadyShown) {
 
   // s_frameDisplayBuf holds ZOOM3+timestamp from the preceding showZoomSnapshotFrame() call.
   // Wipe terrain rows progressively from top (startY) into s_frameDisplayBuf.
-  // Both buffers are canonical little-endian RGB565 — no bswap needed.
+  // Both buffers are canonical little-endian RGB565 - no bswap needed.
   const int startY = 14;
-  // Zero rows 0–13 so fullscreen scaler doesn't sample residual garbage.
+  // Zero rows 0-13 so fullscreen scaler doesn't sample residual garbage.
   memset(s_frameDisplayBuf, 0, (size_t)startY * SCALED_W * 2U);
   const int usableRows = SCALED_H - startY;
   const int steps = 18;
@@ -11982,7 +11982,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
   const uint32_t totalMs = inMs + holdMs + outMs;
   if (segElapsedMs > totalMs) segElapsedMs = totalMs;
 
-  // Opacity progress — fade in, hold, fade out.
+  // Opacity progress - fade in, hold, fade out.
   uint8_t alphaProgress;
   bool fadeInPhase = false;
   bool fadeOutPhase = false;
@@ -12011,7 +12011,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
   if (textLocalX < 0) textLocalX = 0;
   const int textLocalY = l.textY - l.bgY;
 
-  // Drop shadow — dimmed version of clock color for consistent depth.
+  // Drop shadow - dimmed version of clock color for consistent depth.
   {
     uint8_t sr = ((s_clockColorRGB >> 16) & 0xFF) * 160 / 255;
     uint8_t sg = ((s_clockColorRGB >>  8) & 0xFF) * 160 / 255;
@@ -12020,7 +12020,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
   }
   s_clockFxSprite.drawString(clockBuf, textLocalX + 1, textLocalY + 1);
 
-  // Main text — user-selected color.
+  // Main text - user-selected color.
   s_clockFxSprite.setTextColor(rgb565(s_clockColorRGB));
   s_clockFxSprite.drawString(clockBuf, textLocalX, textLocalY);
 
@@ -12051,7 +12051,7 @@ static void drawCurrentTimeSweepOverlayFrame(const ClockOverlayLayout& l,
             pxAlpha = directionalFadeAlphaForColumn(col, regionW, alphaProgress, false);
           }
 
-          // bg[] comes from s_dlBuf saved from s_frameDisplayBuf — always
+          // bg[] comes from s_dlBuf saved from s_frameDisplayBuf - always
           // correct-format (non-byteswapped) RGB565. fx[] is in clockFxSprite
           // which may store pixels byteswapped. Unify before blending.
           if (pxAlpha == 0) {
@@ -12438,7 +12438,7 @@ static bool spriteLooksBlackSlabCorrupted() {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  loop() — animate frames, sleep after LOOPS_BEFORE_SLEEP
+//  loop() - animate frames, sleep after LOOPS_BEFORE_SLEEP
 // ─────────────────────────────────────────────────────────────
 void loop() {
   serviceWifiPortalServer();
@@ -12457,7 +12457,7 @@ void loop() {
   }
 
   if (!s_streamReady || !s_streamFile) {
-    // Stream failed to open — show each variable on its own large line
+    // Stream failed to open - show each variable on its own large line
     char l1[32], l2[32];
     snprintf(l1, sizeof(l1), "NO STREAM fc=%d", frameCount);
     snprintf(l2, sizeof(l2), "rdy=%d meta=%d", (int)s_streamReady, s_idx.count);
@@ -12498,7 +12498,7 @@ void loop() {
   }
 
   // Loop timing: animation + 2s hold + 3×1s zoom + ~1s terrain + clock ≈ 17-28s.
-  // animationDurationMs is enforced with a break — frames that run long don't overrun.
+  // animationDurationMs is enforced with a break - frames that run long don't overrun.
   static const uint32_t animDurations[] = { 7000U, 10000U, 15000U };
   static const uint32_t clockDurations[] = { 4000U, 7000U, 10000U };
   const uint32_t animationDurationMs = animDurations[s_animSpeedIdx < 3 ? s_animSpeedIdx : 1];
@@ -12507,7 +12507,7 @@ void loop() {
   const uint32_t terrainTransitionMs = 1000U;
   const uint32_t clockOverlayMs      = clockDurations[s_clockDurIdx < 3 ? s_clockDurIdx : 1];
   uint32_t targetFrameDelayMs = (FRAME_DELAY_MS > 0) ? (uint32_t)FRAME_DELAY_MS : 1U;
-  // No slots cap — time-based frame selection self-paces with pre-scaled reads (~120ms/frame)
+  // No slots cap - time-based frame selection self-paces with pre-scaled reads (~120ms/frame)
   bool startCueArmed = s_startCuePending;
 
   static bool s_animStartLogged = false;
@@ -12516,7 +12516,7 @@ void loop() {
     appendDiagLog("anim-start: millis=%lu ms\n", millis());
   }
 
-  // Pre-render bottom bar once — it doesn't depend on frameIdx, only on
+  // Pre-render bottom bar once - it doesn't depend on frameIdx, only on
   // s_forecast and time(nullptr).  During animation we skip re-rendering it.
   updateBarBufs(newestIdx);
 
@@ -12572,7 +12572,7 @@ void loop() {
                   appendDiagLog("loop: freeze-back=%d idx=%d\n", back, backIdx);
                   break;
                 }
-                // Also corrupt — evict this one too.
+                // Also corrupt - evict this one too.
                 appendDiagLog("raw-evict: idx=%d freeze-corrupt\n", backIdx);
                 if (backIdx < MAX_FRAMES) {
                   s_streamValid[backIdx] = 0;
@@ -12581,7 +12581,7 @@ void loop() {
               }
             }
             if (!foundClean) {
-              // No clean alternative — re-show the original freeze frame.
+              // No clean alternative - re-show the original freeze frame.
               showFrame(freezeFrameIdx, true);
               appendDiagLog("loop: freeze-back-fail\n");
             }
@@ -12625,7 +12625,7 @@ void loop() {
   }
   runFreezeZoom3LocatorCue(latestFrameHoldMs);
 
-  // Zoom + terrain stages — each step is wall-clock governed so decode time is
+  // Zoom + terrain stages - each step is wall-clock governed so decode time is
   // included in the step budget, keeping the total loop time predictable.
   bool baseForClockOverlay = true;
   {
@@ -12649,7 +12649,7 @@ void loop() {
 
           bool terrainShownForClock = false;
           if (s_hurricaneMode) {
-            // Skip terrain crossfade in hurricane mode — not relevant
+            // Skip terrain crossfade in hurricane mode - not relevant
             baseForClockOverlay = true;
           } else if (runTerrainCrossfadeSegment(newestIdx, true)) {
             terrainShownForClock = true;
@@ -12676,14 +12676,14 @@ void loop() {
   }
 
   if (!baseForClockOverlay) {
-    Serial.println("zoom/terrain/clock stages skipped — holding weather frame");
+    Serial.println("zoom/terrain/clock stages skipped - holding weather frame");
   }
 
   pollCleanModeToggle();
   if (!isTimeAlwaysOn()) {
     runCurrentTimeSweepOverlaySegment(newestIdx, baseForClockOverlay);
   } else {
-    // Clock is already stamped on every frame by drawAlwaysOnClockOverlay —
+    // Clock is already stamped on every frame by drawAlwaysOnClockOverlay -
     // request pin overlay so it's rendered into the buffer on top of the clock,
     // then pushed to AMOLED as part of the normal pixel stream (no tearing).
     s_pinOverlayRequested = true;

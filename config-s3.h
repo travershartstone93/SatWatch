@@ -1,7 +1,7 @@
 #pragma once
 
 // =============================================================
-//  WiFi — edit these
+//  WiFi - edit these
 // =============================================================
 #define WIFI_SSID          ""
 #define WIFI_PASS          ""
@@ -29,7 +29,7 @@
 // =============================================================
 //  Display local time (set for installation location)
 // =============================================================
-// POSIX TZ string — overridden at runtime by user location
+// POSIX TZ string - overridden at runtime by user location
 #define DISPLAY_TZ_POSIX    "AST4"
 #define DISPLAY_TZ_LABEL    ""
 
